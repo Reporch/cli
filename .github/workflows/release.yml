@@ -140,8 +140,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          find dist/tarballs -type f -name '*.tgz' -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS
-          sha256sum --check dist/SHA256SUMS
+          (cd dist/tarballs && sha256sum ./*.tgz) > dist/SHA256SUMS
+          (cd dist/tarballs && sha256sum --check ../SHA256SUMS)
       - name: Attest immutable npm tarballs
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
@@ -152,6 +152,7 @@ jobs:
           set -euo pipefail
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+            gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA"
           else
             gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" \
               --title "Reporch CLI $VERSION" \
