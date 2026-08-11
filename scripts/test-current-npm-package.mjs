@@ -23,22 +23,30 @@ checksums[target.packageName] = staged.sha256;
 const root = stageRootPackage(checksums, packages);
 
 function run(command, args, cwd = temporary) {
+  const commandString = String(command);
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf8",
+    shell: process.platform === "win32" && commandString.toLowerCase().endsWith(".cmd"),
+    windowsHide: true,
     env: { ...process.env, npm_config_audit: "false", npm_config_fund: "false" }
   });
-  assert.equal(result.status, 0, `${command} ${args.join(" ")}\n${result.stdout}\n${result.stderr}`);
+  const diagnostics = [result.stdout, result.stderr, result.error?.stack]
+    .filter(Boolean)
+    .join("\n");
+  assert.equal(result.status, 0, `${commandString} ${args.join(" ")}\n${diagnostics}`);
   return result.stdout.trim();
 }
 
-const platformPack = JSON.parse(run("npm", ["pack", staged.destination, "--json"]))[0].filename;
-const rootPack = JSON.parse(run("npm", ["pack", root, "--json"]))[0].filename;
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const platformPack = JSON.parse(run(npmCommand, ["pack", staged.destination, "--json"]))[0]
+  .filename;
+const rootPack = JSON.parse(run(npmCommand, ["pack", root, "--json"]))[0].filename;
 writeFileSync(
   join(temporary, "package.json"),
   `${JSON.stringify({ name: "reporch-cli-install-test", version: "1.0.0", private: true })}\n`
 );
-run("npm", ["install", "--ignore-scripts", `./${platformPack}`, `./${rootPack}`]);
+run(npmCommand, ["install", "--ignore-scripts", `./${platformPack}`, `./${rootPack}`]);
 const executable = process.platform === "win32" ? "reporch.cmd" : "reporch";
 const output = run(join(temporary, "node_modules/.bin", executable), ["--version"]);
 const expectedVersion = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
