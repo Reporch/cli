@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+*.exe binary
+*.rpkg binary
+*.tgz binary
+*.zip binary

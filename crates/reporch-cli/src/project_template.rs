@@ -504,6 +504,8 @@ fn write_new_file(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     }
+    #[cfg(not(unix))]
+    let _ = executable;
     Ok(())
 }
 

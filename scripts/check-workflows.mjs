@@ -24,6 +24,10 @@ assert.match(
   /node scripts\/publish-npm-release\.mjs dist/,
   "release must invoke the reviewed npm OIDC publisher"
 );
+const ci = readFileSync(".github/workflows/ci.yml", "utf8");
+assert.match(ci, /actionlint_1\.7\.12_linux_amd64\.tar\.gz/);
+assert.match(ci, /ACTIONLINT_SHA256:\s*[a-f0-9]{64}/);
+assert.match(ci, /sha256sum --check --strict/);
 const publisher = readFileSync("scripts/publish-npm-release.mjs", "utf8");
 assert.match(publisher, /\["publish", tarball, "--access", "public"\]/);
 console.log(`workflow contract passed for ${workflows.length} workflows`);
