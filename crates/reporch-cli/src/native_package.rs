@@ -16,7 +16,7 @@ use studio_core::{
 };
 use tempfile::Builder;
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::{CompressionMethod, System, ZipArchive, ZipWriter};
 
 const SOURCE_METADATA_PATH: &str = "META-INF/reporch-source.json";
 const RELEASE_METADATA_PATH: &str = "META-INF/reporch-release.json";
@@ -630,6 +630,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 fn options(executable: bool, size: u64) -> SimpleFileOptions {
     SimpleFileOptions::DEFAULT
         .compression_method(CompressionMethod::Stored)
+        .system(System::Unix)
         .unix_permissions(if executable { 0o755 } else { 0o644 })
         .large_file(size >= u32::MAX as u64)
 }

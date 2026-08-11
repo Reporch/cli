@@ -15,7 +15,7 @@ use studio_core::{
 };
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::{CompressionMethod, System, ZipArchive, ZipWriter};
 
 use crate::icpc_import::{extract_archive, scan_archive};
 use crate::statement_tex::{escape_latex, markdown_to_tex};
@@ -1474,6 +1474,7 @@ fn set_executable(path: &Path, executable: bool) -> Result<()> {
 fn zip_options(executable: bool) -> SimpleFileOptions {
     SimpleFileOptions::DEFAULT
         .compression_method(CompressionMethod::Stored)
+        .system(System::Unix)
         .unix_permissions(if executable { 0o755 } else { 0o644 })
 }
 
