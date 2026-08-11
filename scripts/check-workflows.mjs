@@ -29,6 +29,11 @@ assert.match(
   /gh release edit "\$RELEASE_TAG" --target "\$GITHUB_SHA"/,
   "a retried draft release must target the current verified source revision"
 );
+assert.match(
+  release,
+  /\(cd dist\/tarballs && sha256sum \*\.tgz\) > dist\/SHA256SUMS/,
+  "release checksums must remain verifiable after downloading flat release assets"
+);
 const ci = readFileSync(".github/workflows/ci.yml", "utf8");
 assert.match(ci, /actionlint_1\.7\.12_linux_amd64\.tar\.gz/);
 assert.match(ci, /ACTIONLINT_SHA256:\s*[a-f0-9]{64}/);
