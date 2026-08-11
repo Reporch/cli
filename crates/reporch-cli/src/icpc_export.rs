@@ -10,7 +10,7 @@ use studio_core::{
     compatibility_report, validate_manifest,
 };
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, System, ZipWriter};
 
 use crate::icpc_submit_answer::{
     SIDECAR_PATH, SIDECAR_SCHEMA_V1, SubmitAnswerOutputV1, SubmitAnswerSidecarV1,
@@ -694,6 +694,7 @@ fn verify_entry(entry: &ExportEntry) -> Result<()> {
 fn options(executable: bool) -> SimpleFileOptions {
     SimpleFileOptions::DEFAULT
         .compression_method(CompressionMethod::Stored)
+        .system(System::Unix)
         .unix_permissions(if executable { 0o755 } else { 0o644 })
 }
 

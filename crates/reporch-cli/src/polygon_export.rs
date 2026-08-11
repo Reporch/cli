@@ -12,7 +12,7 @@ use studio_core::{
     compatibility_report, validate_manifest,
 };
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, System, ZipWriter};
 
 pub const POLYGON_SIDECAR_PATH: &str = "-reporch-polygon/sidecar-v1.json";
 pub const POLYGON_REPORT_PATH: &str = "-reporch-polygon/compatibility-v1.json";
@@ -447,6 +447,7 @@ fn sanitize_component(value: &str) -> String {
 fn zip_options(executable: bool) -> SimpleFileOptions {
     SimpleFileOptions::DEFAULT
         .compression_method(CompressionMethod::Stored)
+        .system(System::Unix)
         .unix_permissions(if executable { 0o755 } else { 0o644 })
 }
 
