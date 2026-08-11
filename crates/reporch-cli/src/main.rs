@@ -5,6 +5,7 @@ mod icpc_export;
 mod icpc_import;
 mod icpc_legacy;
 mod icpc_submit_answer;
+mod local_manifest;
 mod native_package;
 mod polygon_export;
 mod polygon_import;
@@ -537,6 +538,7 @@ fn validate(path: &Path, print_digest: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&issues)?);
         bail!("manifest validation failed with {} issue(s)", issues.len());
     }
+    local_manifest::verify_files(path, &manifest)?;
     if print_digest {
         println!("{}", manifest.digest()?);
     } else {
