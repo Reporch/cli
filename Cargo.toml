@@ -1,0 +1,54 @@
+[workspace]
+members = [
+  "crates/studio-core",
+  "crates/studio-contracts",
+  "crates/studio-native-auth",
+  "crates/reporch-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96.0"
+license = "Apache-2.0"
+repository = "https://github.com/Reporch/cli"
+homepage = "https://studio.reporch.com"
+authors = ["Reporch Contributors"]
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+keyring = "4.1.5"
+minisign-verify = "0.2.5"
+open = "5.3"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
+rand = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sha2 = "0.11"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+unicode-normalization = "0.1"
+url = { version = "2", features = ["serde"] }
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zeroize = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

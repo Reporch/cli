@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<problem revision="42" short-name="advanced-corpus" name="Advanced Corpus">
+  <names>
+    <name language="english" value="Advanced Polygon Corpus" />
+    <name language="korean" value="고급 폴리곤 코퍼스" />
+  </names>
+  <judging>
+    <testset name="tests">
+      <time-limit>1500</time-limit>
+      <memory-limit>268435456</memory-limit>
+      <test-count>3</test-count>
+      <input-path-pattern>tests/%02d</input-path-pattern>
+      <answer-path-pattern>tests/%02d.a</answer-path-pattern>
+      <tests>
+        <test method="manual" sample="true" description="sample" group="pretests" />
+        <test method="generated" sample="false" description="generated-boundary" group="full" />
+        <test method="manual" sample="false" description="manual-boundary" group="full" />
+      </tests>
+      <groups>
+        <group name="pretests" points="30" />
+        <group name="full" points="70"><dependency group="pretests" /></group>
+      </groups>
+    </testset>
+  </judging>
+  <files>
+    <validator name="validator" path="validators/validator.cpp" language="cpp17">
+      <testset>
+        <test-count>2</test-count>
+        <input-path-pattern>validator-tests/%02d.in</input-path-pattern>
+        <tests><test verdict="valid" /><test verdict="invalid" /></tests>
+      </testset>
+    </validator>
+    <extra-validator name="extra-validator" path="validators/extra.py" language="python3" />
+    <generator name="boundary-generator" path="generators/gen.py" language="python3" />
+    <checker name="advanced-checker" path="checkers/checker.cpp" language="cpp17">
+      <testset>
+        <test-count>2</test-count>
+        <input-path-pattern>checker-tests/%02d.in</input-path-pattern>
+        <output-path-pattern>checker-tests/%02d.out</output-path-pattern>
+        <answer-path-pattern>checker-tests/%02d.ans</answer-path-pattern>
+        <tests><test verdict="ok" /><test verdict="wrong-answer" /></tests>
+      </testset>
+    </checker>
+  </files>
+  <solutions>
+    <solution name="accepted-cpp" tag="MA" path="solutions/accepted.cpp" language="cpp17" />
+    <solution name="accepted-python" tag="OK" path="solutions/accepted.py" language="python3" />
+    <solution name="slow" tag="TL" path="solutions/slow.cpp" language="cpp17" />
+    <solution name="memory" tag="ML" path="solutions/memory.cpp" language="cpp17" />
+    <solution name="crash" tag="RE" path="solutions/crash.cpp" language="cpp17" />
+  </solutions>
+  <statements>
+    <statement language="english" path="statements/en.md" />
+    <statement language="korean" path="statements/ko.tex" />
+  </statements>
+</problem>

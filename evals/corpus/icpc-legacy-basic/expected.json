@@ -1,0 +1,7 @@
+{
+  "schema": "reporch.icpc-legacy-corpus.v1",
+  "native_manifest_sha256": "fbbb21d4ef63770c6aa47b5095ff8192206eb1d4ac3b0ddd88defdf662b3ac6f",
+  "legacy_zip_sha256": "964cd2b2911e941481dd9790bc7f703dd16cd67085ee37a60542b64633d153c4",
+  "legacy_zip_file_count": 21,
+  "external_project_id": "019f0000-0000-7000-8000-000000000101"
+}

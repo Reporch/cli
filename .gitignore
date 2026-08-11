@@ -1,0 +1,11 @@
+/target/
+/node_modules/
+*.log
+*.tmp
+.DS_Store
+.env
+.env.*
+!.env.example
+/dist/
+/artifacts/
+/.gstack/

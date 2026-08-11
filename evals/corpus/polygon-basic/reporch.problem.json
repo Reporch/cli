@@ -1,0 +1,151 @@
+{
+  "schema": "reporch.release-manifest.v1",
+  "project_id": "019f0000-0000-7000-8000-000000000001",
+  "commit_id": "019f0000-0000-7000-8000-000000000002",
+  "problem_type": "standard",
+  "package_profile": "reporch_native",
+  "default_locale": "en",
+  "title": {
+    "en": "Echo"
+  },
+  "statements": {
+    "en": "statements/en.md"
+  },
+  "files": [
+    {
+      "path": "statements/en.md",
+      "sha256": "c84235dc9c2623c54048d3226735c5235d740fff8b11fb85c29232a6c4528e0e",
+      "size_bytes": 39,
+      "media_type": "text/markdown",
+      "executable": false
+    },
+    {
+      "path": "tests/1.in",
+      "sha256": "10159baf262b43a92d95db59dae1f72c645127301661e0a3ce4e38b295a97c58",
+      "size_bytes": 2,
+      "media_type": "text/plain",
+      "executable": false
+    },
+    {
+      "path": "tests/1.ans",
+      "sha256": "10159baf262b43a92d95db59dae1f72c645127301661e0a3ce4e38b295a97c58",
+      "size_bytes": 2,
+      "media_type": "text/plain",
+      "executable": false
+    },
+    {
+      "path": "validators/main.py",
+      "sha256": "27e955874a8f12caca201d9704f5e5949d2e5f51e85c73322511c6a079e45300",
+      "size_bytes": 91,
+      "media_type": "text/x-python",
+      "executable": true
+    },
+    {
+      "path": "validators/invalid.in",
+      "sha256": "73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac",
+      "size_bytes": 2,
+      "media_type": "text/plain",
+      "executable": false
+    },
+    {
+      "path": "solutions/accepted.py",
+      "sha256": "bf55a402946a1dd72ae02d1553632995ad2087c986f2b4143d62599669081d4d",
+      "size_bytes": 20,
+      "media_type": "text/x-python",
+      "executable": false
+    },
+    {
+      "path": "solutions/accepted-alt.py",
+      "sha256": "a454a43c4422283698927ad3103c5a15dc278490f0150f2e5867aeb93b0ea403",
+      "size_bytes": 68,
+      "media_type": "text/x-python",
+      "executable": false
+    },
+    {
+      "path": "solutions/wrong.py",
+      "sha256": "0b4a82039ef0f6758ebe01370e28afd40c737a3bd15ba9bdc368ec08da60082d",
+      "size_bytes": 9,
+      "media_type": "text/x-python",
+      "executable": false
+    }
+  ],
+  "toolchains": {},
+  "judging": {
+    "limits": {
+      "time_ms": 1000,
+      "memory_mib": 256,
+      "output_kib": 1024
+    },
+    "checker": {
+      "kind": "token"
+    },
+    "tests": [
+      {
+        "id": "019f0000-0000-7000-8000-000000000003",
+        "name": "sample",
+        "input_file": "tests/1.in",
+        "answer_file": "tests/1.ans",
+        "groups": []
+      }
+    ],
+    "groups": [],
+    "generators": [],
+    "validator_path": "validators/main.py",
+    "validator_language": "python3",
+    "validator_tests": [
+      {
+        "name": "valid sample",
+        "input_file": "tests/1.in",
+        "expected_valid": true
+      },
+      {
+        "name": "invalid token",
+        "input_file": "validators/invalid.in",
+        "expected_valid": false
+      }
+    ]
+  },
+  "sources": [],
+  "solutions": [
+    {
+      "name": "accepted",
+      "source_path": "solutions/accepted.py",
+      "language": "python3",
+      "expected_verdict": "accepted"
+    },
+    {
+      "name": "accepted-alt",
+      "source_path": "solutions/accepted-alt.py",
+      "language": "python3",
+      "expected_verdict": "accepted"
+    },
+    {
+      "name": "known-wrong",
+      "source_path": "solutions/wrong.py",
+      "language": "python3",
+      "expected_verdict": "wrong_answer"
+    }
+  ],
+  "publication": {
+    "category": "Algorithm",
+    "difficulty": "Bronze 5",
+    "grading_category": "algorithmic",
+    "tags": ["implementation"],
+    "allowed_languages": ["python3"],
+    "statement_sections": {
+      "en": {
+        "input_format": "One integer.",
+        "output_format": "The same integer.",
+        "note": ""
+      }
+    },
+    "samples": [
+      {
+        "name": "sample",
+        "input_file": "tests/1.in",
+        "output_file": "tests/1.ans"
+      }
+    ]
+  },
+  "policy_version": "studio-policy-v1"
+}

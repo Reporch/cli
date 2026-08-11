@@ -1,0 +1,13 @@
+problem_format_version: legacy-icpc
+name: Echo
+uuid: 019f0000-0000-7000-8000-000000000101
+source: Reporch compatibility corpus
+source_url: https://reporch.com
+license: educational
+rights_owner: Reporch
+limits:
+  time_multiplier: 1.0
+  memory: 256
+  output: 1
+validation: default
+keywords: implementation io

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
+        with:
+          tool: actionlint@1.7.12,cargo-deny@0.20.2,cargo-audit@0.22.2
+          fallback: none
+      - run: actionlint
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-targets
+      - run: cargo deny check
+      - run: cargo audit
+      - run: npm test
+      - run: npm run check:versions
+      - run: npm run check:workflows
+      - run: git diff --exit-code
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/reporch
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/reporch
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/reporch
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: target/aarch64-unknown-linux-gnu/release/reporch
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/reporch.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --locked --workspace --all-targets
+      - run: cargo build --locked --release -p reporch-cli --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p 'require("./npm/cli/package.json").version')
+          test "$("${{ matrix.binary }}" --version)" = "reporch $VERSION"
+          node scripts/test-current-npm-package.mjs "${{ matrix.target }}" "${{ matrix.binary }}"

@@ -1,0 +1,40 @@
+{
+  "name": "@reporch/cli",
+  "version": "0.1.0",
+  "description": "Official command-line client for Reporch Studio",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Reporch/cli.git"
+  },
+  "homepage": "https://studio.reporch.com",
+  "bugs": {
+    "url": "https://github.com/Reporch/cli/issues"
+  },
+  "type": "module",
+  "bin": {
+    "reporch": "bin/reporch.mjs",
+    "reporch-studio": "bin/reporch.mjs"
+  },
+  "files": [
+    "bin",
+    "checksums.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "optionalDependencies": {
+    "@reporch/cli-darwin-arm64": "0.1.0",
+    "@reporch/cli-darwin-x64": "0.1.0",
+    "@reporch/cli-linux-arm64-gnu": "0.1.0",
+    "@reporch/cli-linux-x64-gnu": "0.1.0",
+    "@reporch/cli-win32-x64-msvc": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

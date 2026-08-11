@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<problem revision="9" short-name="interactive-corpus" name="Interactive Corpus">
+  <names><name language="english" value="Interactive Polygon Corpus" /></names>
+  <judging>
+    <testset name="tests">
+      <time-limit>2000</time-limit>
+      <memory-limit>134217728</memory-limit>
+      <test-count>1</test-count>
+      <input-path-pattern>tests/%02d</input-path-pattern>
+      <answer-path-pattern>tests/%02d.a</answer-path-pattern>
+      <tests><test method="manual" sample="true" description="secret-seven" /></tests>
+    </testset>
+  </judging>
+  <files>
+    <validator name="validator" path="validators/validator.cpp" language="cpp17">
+      <testset>
+        <test-count>2</test-count>
+        <input-path-pattern>validator-tests/%02d.in</input-path-pattern>
+        <tests><test verdict="valid" /><test verdict="invalid" /></tests>
+      </testset>
+    </validator>
+    <interactor name="interactor" path="interactors/interactor.cpp" language="cpp17" />
+  </files>
+  <solutions>
+    <solution name="accepted" tag="MA" path="solutions/accepted.cpp" language="cpp17" />
+    <solution name="accepted-alt" tag="OK" path="solutions/accepted-alt.cpp" language="cpp17" />
+    <solution name="wrong" tag="WA" path="solutions/wrong.cpp" language="cpp17" />
+  </solutions>
+  <statements><statement language="english" path="statements/en.md" /></statements>
+</problem>
