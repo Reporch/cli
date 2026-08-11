@@ -152,6 +152,7 @@ jobs:
           set -euo pipefail
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+            gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA"
           else
             gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" \
               --title "Reporch CLI $VERSION" \
