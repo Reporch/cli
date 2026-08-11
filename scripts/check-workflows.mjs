@@ -31,7 +31,7 @@ assert.match(
 );
 assert.match(
   release,
-  /\(cd dist\/tarballs && sha256sum \*\.tgz\) > dist\/SHA256SUMS/,
+  /\(cd dist\/tarballs && sha256sum \.\/\*\.tgz\) > dist\/SHA256SUMS/,
   "release checksums must remain verifiable after downloading flat release assets"
 );
 const ci = readFileSync(".github/workflows/ci.yml", "utf8");
