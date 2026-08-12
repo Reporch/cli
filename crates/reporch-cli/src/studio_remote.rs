@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,7 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use clap::{ArgAction, Args as ClapArgs, ValueEnum};
 use futures_util::StreamExt;
 use reqwest::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
-use reqwest::{RequestBuilder, Response, Url};
+use reqwest::{RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -25,6 +26,7 @@ use studio_contracts::{
 use studio_core::{ManifestFile, ProblemType, ReleaseManifestV1, Sha256Digest, validate_manifest};
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use tempfile::NamedTempFile;
+use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use url::Host;
@@ -38,6 +40,40 @@ const MAX_JSON_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_WAIT_SECONDS: u64 = 30 * 60;
+const MAX_TRANSIENT_POLL_RETRIES: u32 = 8;
+
+#[derive(Debug, Error)]
+enum StudioApiRequestError {
+    #[error("Studio API {error_code}: {message} (trace {trace_id})")]
+    Api {
+        status: StatusCode,
+        error_code: String,
+        message: String,
+        retryable: bool,
+        trace_id: String,
+    },
+    #[error("Studio API request failed with HTTP {status}")]
+    Http { status: StatusCode },
+    #[error("Studio API transport failed: {source}")]
+    Transport {
+        #[source]
+        source: reqwest::Error,
+    },
+}
+
+impl StudioApiRequestError {
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Api {
+                status, retryable, ..
+            } => *retryable || is_transient_http_status(*status),
+            Self::Http { status } => is_transient_http_status(*status),
+            Self::Transport { source } => {
+                source.is_timeout() || source.is_connect() || source.is_request()
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct RemoteConnectionOptions {
@@ -205,7 +241,7 @@ impl StudioApiClient {
             .authenticated(request)
             .send()
             .await
-            .map_err(redact_reqwest_error)?;
+            .map_err(studio_api_transport_error)?;
         decode_api_response(response).await
     }
 
@@ -988,7 +1024,10 @@ async fn wait_for_upload(
             "timed out waiting for file verification"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-        status = client.get_upload(project_id, status.id).await?;
+        status = retry_transient_poll(deadline, "file verification status", || {
+            client.get_upload(project_id, status.id)
+        })
+        .await?;
     }
 }
 
@@ -1000,7 +1039,10 @@ async fn wait_for_validation(
 ) -> Result<ValidationRunDetailResponse> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
     loop {
-        let status = client.get_validation(project_id, validation_id).await?;
+        let status = retry_transient_poll(deadline, "validation status", || {
+            client.get_validation(project_id, validation_id)
+        })
+        .await?;
         if matches!(
             status.status,
             ValidationRunStatus::Passed
@@ -1034,8 +1076,68 @@ async fn wait_for_release(
             "timed out waiting for release package"
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
-        release = client.get_release(project_id, release.id).await?;
+        release = retry_transient_poll(deadline, "release status", || {
+            client.get_release(project_id, release.id)
+        })
+        .await?;
     }
+}
+
+async fn retry_transient_poll<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    operation: &str,
+    mut request: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        match request().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_transient_api_error(&error) && attempt < MAX_TRANSIENT_POLL_RETRIES =>
+            {
+                attempt += 1;
+                let delay = transient_poll_delay(attempt);
+                ensure!(
+                    tokio::time::Instant::now() + delay < deadline,
+                    "timed out while retrying {operation}"
+                );
+                eprintln!(
+                    "temporary {operation} error; retrying in {} ms ({attempt}/{MAX_TRANSIENT_POLL_RETRIES})",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error).with_context(|| format!("poll {operation}")),
+        }
+    }
+}
+
+fn transient_poll_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(5);
+    Duration::from_millis((250_u64 << exponent).min(5_000))
+}
+
+fn is_transient_api_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<StudioApiRequestError>()
+        .is_some_and(StudioApiRequestError::is_transient)
+}
+
+fn is_transient_http_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_EARLY
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 fn operation_key(prefix: &str, provided: Option<&str>) -> Result<String> {
@@ -1212,20 +1314,29 @@ async fn decode_api_response<T: DeserializeOwned>(response: Response) -> Result<
     let bytes = read_response_bounded(response, limit).await?;
     if !status.is_success() {
         if let Ok(error) = serde_json::from_slice::<ApiErrorResponse>(&bytes) {
-            bail!(
-                "Studio API {}: {} (trace {})",
-                error.error_code,
-                error.message,
-                error.trace_id
-            );
+            return Err(StudioApiRequestError::Api {
+                status,
+                error_code: error.error_code,
+                message: error.message,
+                retryable: error.retryable,
+                trace_id: error.trace_id,
+            }
+            .into());
         }
-        bail!("Studio API request failed with HTTP {status}");
+        return Err(StudioApiRequestError::Http { status }.into());
     }
     serde_json::from_slice(&bytes).context("decode Studio API response")
 }
 
 fn redact_reqwest_error(error: reqwest::Error) -> anyhow::Error {
     anyhow::Error::new(error.without_url())
+}
+
+fn studio_api_transport_error(error: reqwest::Error) -> anyhow::Error {
+    StudioApiRequestError::Transport {
+        source: error.without_url(),
+    }
+    .into()
 }
 
 async fn read_response_bounded(response: Response, limit: usize) -> Result<Vec<u8>> {
@@ -1260,6 +1371,8 @@ async fn expect_object_success(response: Response) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn studio_api_url_is_https_or_explicit_loopback_only() {
@@ -1296,5 +1409,78 @@ mod tests {
         );
         assert!(operation_key("unused", Some("short")).is_err());
         assert!(operation_key("unused", Some("contains whitespace")).is_err());
+    }
+
+    #[test]
+    fn only_safe_transient_api_failures_are_retried() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let error = anyhow::Error::new(StudioApiRequestError::Http { status });
+            assert!(is_transient_api_error(&error), "{status} should retry");
+        }
+
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+        ] {
+            let error = anyhow::Error::new(StudioApiRequestError::Http { status });
+            assert!(!is_transient_api_error(&error), "{status} must not retry");
+        }
+    }
+
+    #[test]
+    fn structured_retryable_errors_override_the_http_classification() {
+        let error = anyhow::Error::new(StudioApiRequestError::Api {
+            status: StatusCode::CONFLICT,
+            error_code: "temporary".into(),
+            message: "try again".into(),
+            retryable: true,
+            trace_id: "trace".into(),
+        });
+        assert!(is_transient_api_error(&error));
+    }
+
+    #[test]
+    fn transient_poll_backoff_is_bounded() {
+        assert_eq!(transient_poll_delay(1), Duration::from_millis(250));
+        assert_eq!(transient_poll_delay(2), Duration::from_millis(500));
+        assert_eq!(transient_poll_delay(8), Duration::from_secs(5));
+        assert_eq!(transient_poll_delay(u32::MAX), Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn transient_poll_recovers_without_restarting_the_operation() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let value = retry_transient_poll(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            "test status",
+            move || {
+                let observed = Arc::clone(&observed);
+                async move {
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 2 {
+                        Err(anyhow::Error::new(StudioApiRequestError::Http {
+                            status: StatusCode::BAD_GATEWAY,
+                        }))
+                    } else {
+                        Ok("ready")
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, "ready");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 }
