@@ -53,6 +53,11 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Submit and decide digest-bound Studio reviews.
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
     Manifest {
         #[command(subcommand)]
         command: ManifestCommand,
@@ -202,6 +207,18 @@ enum ProjectCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ReviewCommand {
+    /// Submit a passed validation for review.
+    Submit(studio_remote::SubmitReviewOptions),
+    /// List reviews for a project, newest first.
+    List(studio_remote::ListReviewsOptions),
+    /// Approve a review as an independent reviewer.
+    Approve(studio_remote::ApproveReviewOptions),
+    /// Request changes with an explanatory comment.
+    RequestChanges(studio_remote::RequestChangesOptions),
+}
+
+#[derive(Debug, Subcommand)]
 enum ManifestCommand {
     Validate {
         path: PathBuf,
@@ -273,6 +290,14 @@ async fn main() -> Result<()> {
             ProjectCommand::Push(options) => studio_remote::push(&options).await,
             ProjectCommand::Validate(options) => studio_remote::validate(&options).await,
             ProjectCommand::Package(options) => studio_remote::package(&options).await,
+        },
+        Command::Review { command } => match command {
+            ReviewCommand::Submit(options) => studio_remote::submit_review(&options).await,
+            ReviewCommand::List(options) => studio_remote::list_reviews(&options).await,
+            ReviewCommand::Approve(options) => studio_remote::approve_review(&options).await,
+            ReviewCommand::RequestChanges(options) => {
+                studio_remote::request_review_changes(&options).await
+            }
         },
         Command::Manifest { command } => match command {
             ManifestCommand::Validate { path } => validate(&path, false),

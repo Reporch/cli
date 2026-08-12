@@ -18,12 +18,15 @@ use sha2::{Digest, Sha256};
 use studio_contracts::{
     ApiErrorResponse, BeginFileUploadRequest, BeginFileUploadResponse, CommitDetailResponse,
     CommitPage, CommitResponse, CreateCommitRequest, CreateProjectRequest, CreateReleaseRequest,
-    EnqueueValidationRequest, FileDownloadResponse, FileEntryPage, FileUploadResponse,
-    FileUploadStatus, FileUploadStrategyV1, ProjectPage, ProjectResponse, ReleaseDownloadResponse,
-    ReleaseResponse, ReleaseStatus, ValidationRunDetailResponse, ValidationRunResponse,
-    ValidationRunStatus,
+    CreateReviewDecisionRequest, EnqueueValidationRequest, FileDownloadResponse, FileEntryPage,
+    FileUploadResponse, FileUploadStatus, FileUploadStrategyV1, ProjectPage, ProjectResponse,
+    ReleaseDownloadResponse, ReleaseResponse, ReleaseStatus, ReviewPage, ReviewResponse,
+    SubmitReviewRequest, ValidationRunDetailResponse, ValidationRunResponse, ValidationRunStatus,
 };
-use studio_core::{ManifestFile, ProblemType, ReleaseManifestV1, Sha256Digest, validate_manifest};
+use studio_core::{
+    ManifestFile, ProblemType, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
+    validate_manifest,
+};
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -190,6 +193,60 @@ pub struct PackageOptions {
     pub idempotency_key: Option<String>,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
     pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct SubmitReviewOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Uuid,
+    #[arg(long)]
+    pub commit_id: Uuid,
+    #[arg(long)]
+    pub validation_run_id: Uuid,
+    /// Reuse this value after an ambiguous network failure.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ListReviewsOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Uuid,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ApproveReviewOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Uuid,
+    #[arg(long)]
+    pub review_id: Uuid,
+    #[arg(long)]
+    pub comment: Option<String>,
+    /// Reuse this value after an ambiguous network failure.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RequestChangesOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Uuid,
+    #[arg(long)]
+    pub review_id: Uuid,
+    /// Explain the changes needed. Empty comments are rejected locally.
+    #[arg(long)]
+    pub comment: String,
+    /// Reuse this value after an ambiguous network failure.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 struct StudioApiClient {
@@ -378,6 +435,48 @@ impl StudioApiClient {
         self.json(
             self.http
                 .post(self.endpoint(&format!("projects/{project_id}/releases"))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn submit_review(
+        &self,
+        project_id: Uuid,
+        request: &SubmitReviewRequest,
+        idempotency_key: &str,
+    ) -> Result<ReviewResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("projects/{project_id}/reviews"))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn list_reviews(&self, project_id: Uuid, cursor: Option<&str>) -> Result<ReviewPage> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/reviews"))?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        self.json(self.http.get(url)).await
+    }
+
+    async fn decide_review(
+        &self,
+        project_id: Uuid,
+        review_id: Uuid,
+        request: &CreateReviewDecisionRequest,
+        idempotency_key: &str,
+    ) -> Result<ReviewResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/reviews/{review_id}/decisions"
+                ))?)
                 .header("idempotency-key", idempotency_key)
                 .json(request),
         )
@@ -1036,6 +1135,154 @@ pub async fn package(options: &PackageOptions) -> Result<()> {
     Ok(())
 }
 
+pub async fn submit_review(options: &SubmitReviewOptions) -> Result<()> {
+    let key = operation_key("cli-review-submit", options.idempotency_key.as_deref())?;
+    eprintln!("Idempotency-Key: {key}");
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let review = client
+        .submit_review(
+            options.project_id,
+            &SubmitReviewRequest {
+                commit_id: options.commit_id,
+                validation_run_id: options.validation_run_id,
+            },
+            &key,
+        )
+        .await?;
+    ensure_review_scope(&review, options.project_id, Some(options.commit_id))?;
+    ensure!(
+        review.validation_run_id == options.validation_run_id,
+        "Studio returned a review for another validation"
+    );
+    println!("{}", serde_json::to_string_pretty(&review)?);
+    Ok(())
+}
+
+pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client
+            .list_reviews(options.project_id, cursor.as_deref())
+            .await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|review| review.project_id == options.project_id),
+            "Studio returned a review from another project"
+        );
+        items.extend(page.items);
+        let Some(next_cursor) = page.next_cursor else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ReviewPage {
+                    items,
+                    next_cursor: None,
+                })?
+            );
+            return Ok(());
+        };
+        ensure!(
+            seen_cursors.insert(next_cursor.clone()),
+            "Studio returned a repeated review cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio review listing exceeded the 10,000-item native client bound")
+}
+
+pub async fn approve_review(options: &ApproveReviewOptions) -> Result<()> {
+    let comment = normalize_optional_review_comment(options.comment.as_deref())?;
+    decide_review(
+        &options.connection,
+        options.project_id,
+        options.review_id,
+        ReviewDecisionKindV1::Approve,
+        comment,
+        options.idempotency_key.as_deref(),
+    )
+    .await
+}
+
+pub async fn request_review_changes(options: &RequestChangesOptions) -> Result<()> {
+    let comment = normalize_required_review_comment(&options.comment)?;
+    decide_review(
+        &options.connection,
+        options.project_id,
+        options.review_id,
+        ReviewDecisionKindV1::RequestChanges,
+        Some(comment),
+        options.idempotency_key.as_deref(),
+    )
+    .await
+}
+
+async fn decide_review(
+    connection: &RemoteConnectionOptions,
+    project_id: Uuid,
+    review_id: Uuid,
+    decision: ReviewDecisionKindV1,
+    comment: Option<String>,
+    provided_key: Option<&str>,
+) -> Result<()> {
+    let key = operation_key("cli-review-decision", provided_key)?;
+    eprintln!("Idempotency-Key: {key}");
+    let client = StudioApiClient::connect(connection).await?;
+    let review = client
+        .decide_review(
+            project_id,
+            review_id,
+            &CreateReviewDecisionRequest { decision, comment },
+            &key,
+        )
+        .await?;
+    ensure_review_scope(&review, project_id, None)?;
+    ensure!(review.id == review_id, "Studio returned a different review");
+    ensure!(
+        review
+            .decision
+            .as_ref()
+            .is_some_and(|record| record.decision == decision),
+        "Studio returned a mismatched review decision"
+    );
+    println!("{}", serde_json::to_string_pretty(&review)?);
+    Ok(())
+}
+
+fn ensure_review_scope(
+    review: &ReviewResponse,
+    project_id: Uuid,
+    commit_id: Option<Uuid>,
+) -> Result<()> {
+    ensure!(
+        review.project_id == project_id,
+        "Studio returned a review from another project"
+    );
+    if let Some(commit_id) = commit_id {
+        ensure!(
+            review.commit_id == commit_id,
+            "Studio returned a review for another commit"
+        );
+    }
+    Ok(())
+}
+
+fn normalize_optional_review_comment(comment: Option<&str>) -> Result<Option<String>> {
+    comment.map(normalize_required_review_comment).transpose()
+}
+
+fn normalize_required_review_comment(comment: &str) -> Result<String> {
+    let comment = comment.trim();
+    ensure!(!comment.is_empty(), "review comment must not be empty");
+    ensure!(
+        comment.len() <= 4_000,
+        "review comment must not exceed 4000 bytes"
+    );
+    Ok(comment.to_owned())
+}
+
 async fn wait_for_upload(
     client: &StudioApiClient,
     project_id: Uuid,
@@ -1443,6 +1690,41 @@ mod tests {
         );
         assert!(operation_key("unused", Some("short")).is_err());
         assert!(operation_key("unused", Some("contains whitespace")).is_err());
+    }
+
+    #[test]
+    fn review_comments_are_trimmed_and_bounded() {
+        assert_eq!(
+            normalize_optional_review_comment(Some("  approved  ")).unwrap(),
+            Some("approved".into())
+        );
+        assert_eq!(normalize_optional_review_comment(None).unwrap(), None);
+        assert!(normalize_required_review_comment("   ").is_err());
+        assert!(normalize_required_review_comment(&"x".repeat(4_001)).is_err());
+    }
+
+    #[test]
+    fn review_scope_rejects_cross_project_and_cross_commit_responses() {
+        let project_id = Uuid::now_v7();
+        let commit_id = Uuid::now_v7();
+        let review = ReviewResponse {
+            id: Uuid::now_v7(),
+            project_id,
+            commit_id,
+            validation_run_id: Uuid::now_v7(),
+            manifest_digest: "a".repeat(64).parse().unwrap(),
+            status: studio_core::ReviewStatusV1::InReview,
+            submitted_by: studio_core::SubjectRef {
+                issuer: "https://reporch.com/oauth".into(),
+                subject: "author".into(),
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            decision: None,
+        };
+        assert!(ensure_review_scope(&review, project_id, Some(commit_id)).is_ok());
+        assert!(ensure_review_scope(&review, Uuid::now_v7(), Some(commit_id)).is_err());
+        assert!(ensure_review_scope(&review, project_id, Some(Uuid::now_v7())).is_err());
     }
 
     #[test]
