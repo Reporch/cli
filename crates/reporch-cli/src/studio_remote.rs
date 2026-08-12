@@ -842,6 +842,30 @@ pub async fn push_operation(options: &PushOptions) -> Result<PushOperationResult
         .await?;
         uploaded += 1;
     }
+    let manifest_digest = manifest.digest()?;
+    if uploaded == 0 {
+        let commits = client.list_commits(manifest.project_id).await?;
+        if let Some(head) = commits.items.first()
+            && is_unchanged_remote_head(
+                uploaded,
+                manifest.commit_id,
+                &manifest_digest,
+                head.id,
+                &head.manifest_digest,
+            )
+        {
+            return Ok(PushOperationResult {
+                uploaded_files: 0,
+                commit: CommitResponse {
+                    id: head.id,
+                    project_id: head.project_id,
+                    sequence: head.sequence,
+                    manifest_digest: head.manifest_digest.clone(),
+                    created_at: head.created_at,
+                },
+            });
+        }
+    }
     let commit = client
         .create_commit(
             manifest.project_id,
@@ -856,13 +880,23 @@ pub async fn push_operation(options: &PushOptions) -> Result<PushOperationResult
         "Studio returned a mismatched commit ID"
     );
     ensure!(
-        commit.manifest_digest == manifest.digest()?,
+        commit.manifest_digest == manifest_digest,
         "Studio returned a mismatched manifest digest"
     );
     Ok(PushOperationResult {
         uploaded_files: uploaded,
         commit,
     })
+}
+
+fn is_unchanged_remote_head(
+    uploaded_files: usize,
+    local_commit_id: Uuid,
+    local_digest: &Sha256Digest,
+    remote_commit_id: Uuid,
+    remote_digest: &Sha256Digest,
+) -> bool {
+    uploaded_files == 0 && local_commit_id == remote_commit_id && local_digest == remote_digest
 }
 
 pub async fn push(options: &PushOptions) -> Result<()> {
@@ -1409,6 +1443,35 @@ mod tests {
         );
         assert!(operation_key("unused", Some("short")).is_err());
         assert!(operation_key("unused", Some("contains whitespace")).is_err());
+    }
+
+    #[test]
+    fn unchanged_remote_head_makes_push_idempotent() {
+        let commit_id = Uuid::now_v7();
+        let other_commit_id = Uuid::now_v7();
+        let digest: Sha256Digest = "a".repeat(64).parse().unwrap();
+        let other_digest: Sha256Digest = "b".repeat(64).parse().unwrap();
+
+        assert!(is_unchanged_remote_head(
+            0, commit_id, &digest, commit_id, &digest,
+        ));
+        assert!(!is_unchanged_remote_head(
+            1, commit_id, &digest, commit_id, &digest,
+        ));
+        assert!(!is_unchanged_remote_head(
+            0,
+            commit_id,
+            &digest,
+            other_commit_id,
+            &digest,
+        ));
+        assert!(!is_unchanged_remote_head(
+            0,
+            commit_id,
+            &digest,
+            commit_id,
+            &other_digest,
+        ));
     }
 
     #[test]
