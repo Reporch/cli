@@ -1,6 +1,6 @@
 [package]
 name = "reporch-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -33,6 +33,7 @@ studio-core = { path = "../studio-core" }
 studio-contracts = { path = "../studio-contracts" }
 studio-native-auth = { path = "../studio-native-auth" }
 tempfile.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
