@@ -7,9 +7,7 @@ use sha2::{Digest, Sha256};
 use studio_core::ReleaseManifestV1;
 
 pub(crate) fn verify_files(manifest_path: &Path, manifest: &ReleaseManifestV1) -> Result<()> {
-    let source_root = manifest_path
-        .parent()
-        .context("manifest path has no parent directory")?;
+    let source_root = manifest_directory(manifest_path)?;
     let source_root = fs::canonicalize(source_root)
         .with_context(|| format!("resolve manifest directory {}", source_root.display()))?;
     ensure!(
@@ -26,6 +24,17 @@ pub(crate) fn verify_files(manifest_path: &Path, manifest: &ReleaseManifestV1) -
         )?;
     }
     Ok(())
+}
+
+fn manifest_directory(manifest_path: &Path) -> Result<&Path> {
+    let parent = manifest_path
+        .parent()
+        .context("manifest path has no parent directory")?;
+    if parent.as_os_str().is_empty() {
+        Ok(Path::new("."))
+    } else {
+        Ok(parent)
+    }
 }
 
 fn verify_file(
@@ -111,6 +120,14 @@ mod tests {
     fn accepts_files_that_match_the_manifest() {
         let (_temporary, manifest_path, manifest) = generated_project();
         verify_files(&manifest_path, &manifest).unwrap();
+    }
+
+    #[test]
+    fn resolves_a_bare_manifest_filename_from_the_current_directory() {
+        assert_eq!(
+            manifest_directory(Path::new("reporch.problem.json")).unwrap(),
+            Path::new(".")
+        );
     }
 
     #[test]
