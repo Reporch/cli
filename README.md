@@ -31,7 +31,29 @@ reporch project create --title "My problem" --directory ./my-problem
 cd my-problem
 reporch manifest validate reporch.problem.json
 reporch project push --manifest reporch.problem.json --message "Initial version"
+reporch project validate --project-id <project-id> --commit-id <commit-id>
+reporch review submit \
+  --project-id <project-id> \
+  --commit-id <commit-id> \
+  --validation-run-id <validation-run-id>
 ```
+
+An independent project reviewer completes the digest-bound approval before a
+release package can be built:
+
+```bash
+reporch review list --project-id <project-id>
+reporch review approve --project-id <project-id> --review-id <review-id>
+reporch project package \
+  --project-id <project-id> \
+  --commit-id <commit-id> \
+  --validation-run-id <validation-run-id> \
+  --output problem.zip
+```
+
+The server rejects self-approval: the commit author and final reviewer must be
+different Reporch subjects, and every approval is bound to the exact commit,
+validation run, manifest digest, and reviewer entitlement version.
 
 Create a completely local project without signing in:
 
