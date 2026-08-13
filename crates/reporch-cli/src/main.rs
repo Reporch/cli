@@ -11,6 +11,7 @@ mod local_manifest;
 mod native_package;
 mod polygon_export;
 mod polygon_import;
+mod profile_config;
 mod statement_tex;
 
 use std::fs;
@@ -521,6 +522,28 @@ impl From<CompletionShell> for clap_complete::Shell {
 
 #[tokio::main]
 async fn main() {
+    match profile_config::bootstrap() {
+        Ok(Some(exit_code)) => std::process::exit(exit_code),
+        Ok(None) => {}
+        Err(error) => {
+            if raw_arguments_request_json() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": "reporch.cli-error.v1",
+                        "command": "configuration",
+                        "error_code": "configuration.invalid",
+                        "message": format!("{error:#}"),
+                        "retryable": false,
+                        "trace_id": Uuid::now_v7(),
+                    })
+                );
+            } else {
+                eprintln!("configuration.invalid: {error:#}");
+            }
+            std::process::exit(2);
+        }
+    }
     let arguments = match Args::try_parse() {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -823,10 +846,13 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Doctor(connection) => {
             let capabilities = studio_remote::capabilities_operation(&connection).await?;
             let quota = studio_remote::quota_operation(&connection).await?;
-            let local = reporch_cli::local_project::discover_project(Path::new("."))
-                .ok()
-                .and_then(|root| reporch_cli::local_project::project_status(&root).ok());
+            let local = match reporch_cli::local_project::discover_project(Path::new(".")) {
+                Ok(root) => Some(reporch_cli::local_project::project_status(&root)?),
+                Err(_) => None,
+            };
             let data = serde_json::json!({
+                "schema": "reporch.doctor.v1",
+                "status": "healthy",
                 "capabilities": capabilities,
                 "quota": quota,
                 "local_project": local,

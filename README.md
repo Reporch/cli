@@ -57,6 +57,10 @@ invalid input (`2`), revision conflict (`3`), authentication (`4`), policy or
 quota denial (`5`), retryable infrastructure failure (`6`), and cancellation
 (`7`).
 
+The complete 1.x automation compatibility promise is documented in
+[`docs/cli-contract-v1.md`](docs/cli-contract-v1.md) and enforced by executable
+command-surface regression tests.
+
 The server rejects self-approval: the commit author and final reviewer must be
 different Reporch subjects, and every approval is bound to the exact commit,
 validation run, manifest digest, and reviewer entitlement version.
@@ -201,6 +205,27 @@ rejected except for an explicitly enabled loopback development issuer.
 
 The CLI sends requests only when you run authentication or remote project
 commands. It has no analytics or telemetry.
+
+For separate production and development endpoints, create the user-only
+`config.toml` under `$REPORCH_CONFIG_HOME`, macOS Application Support,
+`$XDG_CONFIG_HOME/reporch`, or Windows AppData:
+
+```toml
+version = 1
+
+[profiles.production]
+studio_api_url = "https://studio.reporch.com"
+oidc_issuer = "https://reporch.com/oauth"
+cli_client_id = "reporch-studio-cli"
+studio_web_url = "https://studio.reporch.com"
+allow_insecure_http = false
+```
+
+Select it with `reporch --profile production doctor`. Explicit flags override
+environment variables, and environment variables override profile values. The
+file must be regular, bounded, and neither it nor its directory may be group-
+or world-writable. Project files cannot override API or OAuth endpoints, and
+profiles never contain tokens.
 
 ## Local sandbox
 

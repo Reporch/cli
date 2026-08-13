@@ -6,7 +6,7 @@ members = [
   "crates/studio-native-auth",
   "crates/reporch-cli",
 ]
-exclude = ["tools/toolchain-index-signer"]
+exclude = ["fuzz", "tools/toolchain-index-signer"]
 resolver = "2"
 
 [workspace.package]
@@ -32,6 +32,7 @@ keyring = "4.1.5"
 minisign-verify = "0.2.5"
 open = "5.3"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+proptest = "1"
 quick-xml = { version = "0.41", features = ["serialize"] }
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls", "stream"] }
@@ -43,6 +44,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
+toml = "1.1.4"
 unicode-normalization = "0.1"
 url = { version = "2", features = ["serde"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }

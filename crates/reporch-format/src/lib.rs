@@ -391,6 +391,7 @@ pub enum AuthoringSpecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use studio_core::{CheckerSpec, ResourceLimits};
 
     fn minimal_spec() -> AuthoringSpecV1 {
@@ -470,5 +471,25 @@ mod tests {
         let spec = minimal_spec();
         let error = spec.materialize(Uuid::now_v7(), vec![]).unwrap_err();
         assert!(matches!(error, AuthoringSpecError::InventoryMismatch));
+    }
+
+    #[test]
+    fn oversized_documents_are_rejected_before_yaml_parsing() {
+        let document = vec![b'a'; MAX_AUTHORING_SPEC_BYTES + 1];
+        assert!(matches!(
+            parse_authoring_spec(&document),
+            Err(AuthoringSpecError::TooLarge { .. })
+        ));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn arbitrary_bounded_input_never_panics(
+            document in prop::collection::vec(any::<u8>(), 0..=65_536)
+        ) {
+            let _ = parse_authoring_spec(&document);
+        }
     }
 }

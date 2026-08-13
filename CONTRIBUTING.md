@@ -6,6 +6,9 @@ Thank you for improving Reporch CLI.
 2. Keep changes scoped and add tests for observable behavior.
 3. Run `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features
    -- -D warnings`, `cargo test --workspace --all-targets`, and `npm test`.
+   Changes to YAML parsing or path handling must also pass
+   `cargo +nightly fuzz run authoring_yaml` and
+   `cargo +nightly fuzz run relative_path` from the repository root.
 4. Do not commit credentials, private problem data, or generated release
    artifacts.
 5. By submitting a contribution, you agree that it is licensed under

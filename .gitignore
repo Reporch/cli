@@ -1,5 +1,16 @@
 /target/
 /tools/toolchain-index-signer/target/
+/fuzz/artifacts/
+/fuzz/corpus/*
+!/fuzz/corpus/authoring_yaml/
+/fuzz/corpus/authoring_yaml/*
+!/fuzz/corpus/authoring_yaml/minimal.yaml
+!/fuzz/corpus/relative_path/
+/fuzz/corpus/relative_path/*
+!/fuzz/corpus/relative_path/safe.txt
+!/fuzz/corpus/relative_path/traversal.txt
+/fuzz/coverage/
+/fuzz/target/
 /node_modules/
 *.log
 *.tmp

@@ -7,6 +7,26 @@ fn reporch() -> Command {
     Command::new(env!("CARGO_BIN_EXE_reporch"))
 }
 
+fn assert_help_commands(arguments: &[&str], expected: &[&str]) {
+    let output = reporch().args(arguments).arg("--help").output().unwrap();
+    assert!(output.status.success(), "{arguments:?}: {output:?}");
+    assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+    let help = String::from_utf8(output.stdout).unwrap();
+    for command in expected {
+        assert!(
+            help.lines().any(|line| {
+                let line = line.trim_start();
+                line == *command
+                    || line
+                        .strip_prefix(command)
+                        .and_then(|suffix| suffix.chars().next())
+                        .is_some_and(char::is_whitespace)
+            }),
+            "missing stable command {arguments:?} {command}:\n{help}"
+        );
+    }
+}
+
 #[test]
 fn json_mode_emits_one_stable_success_envelope() {
     let temporary = tempfile::tempdir().unwrap();
@@ -59,6 +79,129 @@ fn help_is_successful_and_never_emits_an_error_envelope() {
             "{output:?}"
         );
     }
+}
+
+#[test]
+fn the_documented_1_x_command_surface_cannot_be_removed_accidentally() {
+    assert_help_commands(
+        &[],
+        &[
+            "migrate",
+            "check",
+            "statement",
+            "test",
+            "generator",
+            "validator",
+            "checker",
+            "solution",
+            "interactor",
+            "grader",
+            "output",
+            "verify",
+            "submit",
+            "auth",
+            "project",
+            "member",
+            "doctor",
+            "completion",
+            "quota",
+            "release",
+            "publication",
+            "validation",
+            "events",
+            "waiver",
+            "revision",
+            "review",
+            "manifest",
+            "package",
+            "sandbox",
+            "toolchain",
+            "desktop",
+            "artifact",
+        ],
+    );
+    for (arguments, expected) in [
+        (&["auth"][..], &["login", "status", "logout"][..]),
+        (
+            &["project"][..],
+            &[
+                "init", "link", "list", "show", "open", "status", "diff", "create", "pull", "push",
+                "validate", "package",
+            ][..],
+        ),
+        (
+            &["member"][..],
+            &["search", "list", "add", "update", "remove"][..],
+        ),
+        (
+            &["review"][..],
+            &[
+                "submit",
+                "list",
+                "request",
+                "inbox",
+                "status",
+                "claim",
+                "cancel",
+                "approve",
+                "request-changes",
+            ][..],
+        ),
+        (&["waiver"][..], &["list", "create", "revoke"][..]),
+        (&["validation"][..], &["list", "show", "watch"][..]),
+        (&["events"][..], &["watch"][..]),
+        (&["release"][..], &["build", "list", "show", "download"][..]),
+        (&["publication"][..], &["publish", "status"][..]),
+        (&["revision"][..], &["list", "show", "diff", "restore"][..]),
+        (
+            &["manifest"][..],
+            &["validate", "digest", "compatibility"][..],
+        ),
+        (&["package"][..], &["export", "import"][..]),
+        (&["sandbox"][..], &["plan", "run"][..]),
+        (&["toolchain"][..], &["list", "inspect", "install"][..]),
+        (&["quota"][..], &["show"][..]),
+    ] {
+        assert_help_commands(arguments, expected);
+    }
+}
+
+#[test]
+fn named_profiles_reexec_safely_and_unknown_profiles_use_the_error_contract() {
+    let config_home = tempfile::tempdir().unwrap();
+    fs::write(
+        config_home.path().join("config.toml"),
+        r#"version = 1
+[profiles.production]
+studio_api_url = "https://studio.reporch.com"
+oidc_issuer = "https://reporch.com/oauth"
+cli_client_id = "reporch-studio-cli"
+allow_insecure_http = false
+"#,
+    )
+    .unwrap();
+
+    let help = reporch()
+        .args(["--profile", "production", "--help"])
+        .env("REPORCH_CONFIG_HOME", config_home.path())
+        .output()
+        .unwrap();
+    assert!(help.status.success(), "{help:?}");
+    assert!(help.stderr.is_empty(), "{help:?}");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: reporch"));
+
+    let missing = reporch()
+        .args(["--format", "json", "--profile", "missing", "--help"])
+        .env("REPORCH_CONFIG_HOME", config_home.path())
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+    assert!(missing.stdout.is_empty(), "{missing:?}");
+    let error: Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(error["schema"], "reporch.cli-error.v1");
+    assert_eq!(error["command"], "configuration");
+    assert_eq!(error["error_code"], "configuration.invalid");
+    assert_eq!(error["retryable"], false);
 }
 
 #[test]
