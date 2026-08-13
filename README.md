@@ -126,6 +126,24 @@ silently discarding them. After an approved release is built, publication is
 always explicit: `reporch publication publish` asks for confirmation, or
 requires `--yes` in CI.
 
+Immutable releases have a separate, scriptable lifecycle:
+
+```bash
+reporch release build
+reporch release list --format json
+reporch release show --release-id <uuid>
+reporch release download --release-id <uuid> --output problem.zip
+```
+
+Downloads never overwrite an existing path and are installed only after the
+declared size and SHA-256 both match. Progress events can be resumed by durable
+cursor. Use JSONL for an unbounded stream, or bound JSON output for CI:
+
+```bash
+reporch --format jsonl events watch --cursor 42
+reporch --format json events watch --max-events 10
+```
+
 ## Authentication and privacy
 
 The CLI is an OAuth public client. It opens Reporch's Device Authorization flow

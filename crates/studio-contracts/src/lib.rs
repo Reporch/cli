@@ -905,6 +905,13 @@ pub struct ReleaseResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReleasePage {
+    pub items: Vec<ReleaseResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReleaseDownloadResponse {
     pub release_id: Uuid,
     pub package_digest: Sha256Digest,

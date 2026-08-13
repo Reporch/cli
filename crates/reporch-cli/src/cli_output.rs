@@ -126,6 +126,14 @@ impl CliOutput {
             ColorMode::Auto => std::io::stdout().is_terminal(),
         }
     }
+
+    pub fn ensure_streaming_format(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.format != OutputFormat::Json,
+            "unbounded streaming requires --format jsonl or human output; use --max-events with --format json"
+        );
+        Ok(())
+    }
 }
 
 struct ClassifiedError {
@@ -266,5 +274,19 @@ mod tests {
         assert_eq!(classified.exit_code, ExitCode::Conflict);
         assert_eq!(classified.error_code, "working_copy.revision_conflict");
         assert_eq!(classified.trace_id.as_deref(), Some("server-trace-id"));
+    }
+
+    #[test]
+    fn unbounded_streams_require_human_or_jsonl_output() {
+        assert!(
+            CliOutput::new(OutputFormat::Json, false, ColorMode::Never)
+                .ensure_streaming_format()
+                .is_err()
+        );
+        assert!(
+            CliOutput::new(OutputFormat::Jsonl, false, ColorMode::Never)
+                .ensure_streaming_format()
+                .is_ok()
+        );
     }
 }

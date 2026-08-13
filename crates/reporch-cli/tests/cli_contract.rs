@@ -93,6 +93,41 @@ fn review_pool_commands_are_explicit_and_parse_without_membership_fields() {
 }
 
 #[test]
+fn immutable_release_commands_are_first_class_and_non_destructive_by_default() {
+    for arguments in [
+        vec!["release", "build", "--help"],
+        vec!["release", "list", "--help"],
+        vec!["release", "show", "--help"],
+        vec!["release", "download", "--help"],
+    ] {
+        let output = reporch().args(arguments).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    let help = reporch()
+        .args(["release", "download", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--output"), "{help}");
+    assert!(!help.contains("--force"), "{help}");
+}
+
+#[test]
+fn events_watch_documents_bounded_json_and_cursor_resume() {
+    let output = reporch()
+        .args(["events", "watch", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+    for option in ["--cursor", "--project-id", "--max-events"] {
+        assert!(help.contains(option), "missing {option}: {help}");
+    }
+}
+
+#[test]
 fn check_is_networkless_and_finds_the_project_from_a_child_directory() {
     let temporary = tempfile::tempdir().unwrap();
     let init = reporch()

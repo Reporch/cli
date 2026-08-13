@@ -112,6 +112,11 @@ enum Command {
         #[command(subcommand)]
         command: QuotaCommand,
     },
+    /// Build, inspect, list, or download immutable Studio releases.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
     /// Publish a verified immutable release or inspect publication status.
     Publication {
         #[command(subcommand)]
@@ -121,6 +126,11 @@ enum Command {
     Validation {
         #[command(subcommand)]
         command: ValidationCommand,
+    },
+    /// Follow reconnectable Studio project and validation progress events.
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
     },
     /// Manage evidence-bound validation waivers.
     Waiver {
@@ -369,6 +379,18 @@ enum QuotaCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ReleaseCommand {
+    /// Build an immutable release from passed official validation evidence.
+    Build(studio_remote::ReleaseBuildOptions),
+    /// List immutable releases for the linked project.
+    List(studio_remote::ReleaseScopeOptions),
+    /// Show one immutable release.
+    Show(studio_remote::ReleaseShowOptions),
+    /// Download a ready release with size and SHA-256 verification.
+    Download(studio_remote::ReleaseDownloadOptions),
+}
+
+#[derive(Debug, Subcommand)]
 enum PublicationCommand {
     Publish(studio_remote::PublishOptions),
     Status(studio_remote::PublicationOptions),
@@ -378,6 +400,12 @@ enum PublicationCommand {
 enum ValidationCommand {
     Show(studio_remote::ValidationInspectOptions),
     Watch(studio_remote::ValidationInspectOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum EventsCommand {
+    /// Follow authorized events, resuming from the last durable cursor.
+    Watch(studio_remote::EventsWatchOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -765,6 +793,44 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 )
             }
         },
+        Command::Release { command } => match command {
+            ReleaseCommand::Build(options) => {
+                let release = studio_remote::build_release_operation(&options).await?;
+                output.emit(
+                    "release build",
+                    &release,
+                    &format!("Release {} · {:?}", release.id, release.status),
+                )
+            }
+            ReleaseCommand::List(options) => {
+                let releases = studio_remote::list_releases_operation(&options).await?;
+                output.emit(
+                    "release list",
+                    &releases,
+                    &format!("{} release(s)", releases.items.len()),
+                )
+            }
+            ReleaseCommand::Show(options) => {
+                let release = studio_remote::show_release_operation(&options).await?;
+                output.emit(
+                    "release show",
+                    &release,
+                    &format!("Release {} · {:?}", release.id, release.status),
+                )
+            }
+            ReleaseCommand::Download(options) => {
+                let package = studio_remote::download_release_operation(&options).await?;
+                output.emit(
+                    "release download",
+                    &package,
+                    &format!(
+                        "Downloaded release {} to {}",
+                        package.release.id,
+                        package.output.display()
+                    ),
+                )
+            }
+        },
         Command::Publication { command } => match command {
             PublicationCommand::Publish(options) => {
                 confirm_publication(yes, no_input)?;
@@ -803,6 +869,37 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     &validation,
                     &format!("Validation {} passed", validation.id),
                 )
+            }
+        },
+        Command::Events { command } => match command {
+            EventsCommand::Watch(options) => {
+                if options.max_events.is_none() {
+                    output.ensure_streaming_format()?;
+                }
+                let bounded = options.max_events.is_some();
+                let watched = studio_remote::watch_events_operation(&options, |item| {
+                    output.emit(
+                        "events watch",
+                        item,
+                        &format!(
+                            "{} · {}",
+                            item.event.event_type,
+                            item.event
+                                .project_id
+                                .map_or_else(|| "global".into(), |id| id.to_string())
+                        ),
+                    )
+                })
+                .await?;
+                if bounded {
+                    output.emit(
+                        "events watch",
+                        &watched,
+                        &format!("Received {} event(s)", watched.events.len()),
+                    )
+                } else {
+                    output.emit("events watch", &watched, "Event stream stopped")
+                }
             }
         },
         Command::Waiver { command } => match command {
@@ -1106,6 +1203,12 @@ fn command_name(command: &Command) -> &'static str {
         },
         Command::Doctor(_) => "doctor",
         Command::Quota { .. } => "quota show",
+        Command::Release { command } => match command {
+            ReleaseCommand::Build(_) => "release build",
+            ReleaseCommand::List(_) => "release list",
+            ReleaseCommand::Show(_) => "release show",
+            ReleaseCommand::Download(_) => "release download",
+        },
         Command::Publication { command } => match command {
             PublicationCommand::Publish(_) => "publication publish",
             PublicationCommand::Status(_) => "publication status",
@@ -1114,6 +1217,7 @@ fn command_name(command: &Command) -> &'static str {
             ValidationCommand::Show(_) => "validation show",
             ValidationCommand::Watch(_) => "validation watch",
         },
+        Command::Events { .. } => "events watch",
         Command::Waiver { command } => match command {
             WaiverCommand::List(_) => "waiver list",
             WaiverCommand::Create(_) => "waiver create",

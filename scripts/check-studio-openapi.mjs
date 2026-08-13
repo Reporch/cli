@@ -33,7 +33,8 @@ for (const schema of [
   "ReviewPoolRequestResponseV1",
   "ReviewPoolPageV1",
   "ReviewPoolStatusV1",
-  "ReviewApprovalSourceV1"
+  "ReviewApprovalSourceV1",
+  "ReleasePage"
 ]) {
   assert.ok(schemas?.[schema], `Studio OpenAPI is missing schema ${schema}`);
 }
@@ -41,5 +42,8 @@ for (const schema of [
 const decision = schemas?.ReviewDecisionResponse;
 assert.ok(decision?.properties?.approval_source, "review decision lacks approval_source");
 assert.ok(decision?.properties?.pool_assignment_id, "review decision lacks pool_assignment_id");
+const releases = document.paths?.["/api/v1/projects/{project_id}/releases"];
+assert.ok(releases?.get, "Studio OpenAPI lacks release listing");
+assert.ok(releases?.post, "Studio OpenAPI lacks release creation");
 
 console.log(`Studio OpenAPI lock passed: ${actualChecksum}`);

@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Utc};
 use clap::{ArgAction, Args as ClapArgs, ValueEnum};
 use futures_util::StreamExt;
-use reqwest::header::{CONTENT_LENGTH, HeaderName, HeaderValue, IF_MATCH};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, IF_MATCH};
 use reqwest::{RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -20,11 +20,12 @@ use studio_contracts::{
     ApiErrorResponse, BeginFileUploadRequest, BeginFileUploadResponse, CommitDetailResponse,
     CommitPage, CommitResponse, CommitWorkingCopyRequestV1, CreateCommitRequest,
     CreateProjectRequest, CreateReleaseRequest, CreateReviewDecisionRequest, CreateWaiverRequest,
-    EnqueueValidationRequest, FileDownloadResponse, FileEntryPage, FileUploadResponse,
-    FileUploadStatus, FileUploadStrategyV1, IdentityDirectoryPageV1, ProjectMembershipPage,
-    ProjectMembershipResponse, ProjectPage, ProjectResponse, PublicationResponse,
-    PublicationStatus, QuotaStatusV1, ReleaseDownloadResponse, ReleaseResponse, ReleaseStatus,
-    ReviewPage, ReviewPoolPageV1, ReviewPoolRequestResponseV1, ReviewResponse, RevokeWaiverRequest,
+    EVENT_SCHEMA_V1, EnqueueValidationRequest, EventEnvelopeV1, FileDownloadResponse,
+    FileEntryPage, FileUploadResponse, FileUploadStatus, FileUploadStrategyV1,
+    IdentityDirectoryPageV1, ProjectMembershipPage, ProjectMembershipResponse, ProjectPage,
+    ProjectResponse, PublicationResponse, PublicationStatus, QuotaStatusV1,
+    ReleaseDownloadResponse, ReleasePage, ReleaseResponse, ReleaseStatus, ReviewPage,
+    ReviewPoolPageV1, ReviewPoolRequestResponseV1, ReviewResponse, RevokeWaiverRequest,
     StudioCapabilitiesV1, SubmitReviewRequest, UpdateWorkingCopyRequestV1,
     UpsertProjectMembershipRequest, ValidationRunDetailResponse, ValidationRunResponse,
     ValidationRunStatus, WaiverPage, WaiverResponse, WorkingCopyReadinessV1, WorkingCopyV1,
@@ -50,6 +51,8 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_WAIT_SECONDS: u64 = 30 * 60;
 const MAX_TRANSIENT_POLL_RETRIES: u32 = 8;
+const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_SSE_DATA_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 #[doc(hidden)]
@@ -254,6 +257,63 @@ pub struct PackageOptions {
     pub idempotency_key: Option<String>,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
     pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReleaseBuildOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub commit_id: Option<Uuid>,
+    #[arg(long)]
+    pub validation_run_id: Option<Uuid>,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub wait: bool,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReleaseScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReleaseShowOptions {
+    #[command(flatten)]
+    pub scope: ReleaseScopeOptions,
+    #[arg(long)]
+    pub release_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReleaseDownloadOptions {
+    #[command(flatten)]
+    pub target: ReleaseShowOptions,
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct EventsWatchOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    /// Resume after this durable Studio event sequence.
+    #[arg(long)]
+    pub cursor: Option<u64>,
+    /// Emit only events for this project. Studio still authorizes every event server-side.
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    /// Exit successfully after this many events. Omit to follow until interrupted.
+    #[arg(long)]
+    pub max_events: Option<usize>,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -687,6 +747,37 @@ impl StudioApiClient {
         self.json(self.http.get(self.endpoint("quota")?)).await
     }
 
+    async fn events_response(&self, cursor: Option<u64>) -> Result<Response> {
+        let mut url = self.endpoint("events")?;
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        let response = self
+            .authenticated(self.http.get(url).header(ACCEPT, "text/event-stream"))
+            .timeout(Duration::from_secs(30 * 60))
+            .send()
+            .await
+            .map_err(studio_api_transport_error)?;
+        if !response.status().is_success() {
+            let _: serde_json::Value = decode_api_response(response).await?;
+            unreachable!("a successful error response cannot be decoded")
+        }
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        ensure!(
+            content_type
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim() == "text/event-stream"),
+            "Studio events endpoint returned an unexpected Content-Type"
+        );
+        Ok(response)
+    }
+
     async fn get_working_copy(&self, project_id: Uuid) -> Result<WorkingCopyV1> {
         self.json(
             self.http
@@ -882,6 +973,16 @@ impl StudioApiClient {
                 .json(request),
         )
         .await
+    }
+
+    async fn list_releases(&self, project_id: Uuid, cursor: Option<Uuid>) -> Result<ReleasePage> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/releases"))?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        self.json(self.http.get(url)).await
     }
 
     async fn submit_review(
@@ -1226,6 +1327,96 @@ pub struct PackageOperationResult {
     pub package_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EventWatchItem {
+    pub cursor: u64,
+    pub event: EventEnvelopeV1,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EventWatchResult {
+    pub events: Vec<EventWatchItem>,
+    pub last_cursor: Option<u64>,
+    pub interrupted: bool,
+}
+
+#[derive(Debug, Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+    id: Option<String>,
+    event: Option<String>,
+    data_lines: Vec<String>,
+    data_bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SseFrame {
+    id: Option<String>,
+    event: Option<String>,
+    data: Option<String>,
+}
+
+impl SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>> {
+        self.buffer.extend_from_slice(chunk);
+        ensure!(
+            self.buffer.len() <= MAX_SSE_BUFFER_BYTES,
+            "Studio SSE line exceeded the 1 MiB client bound"
+        );
+        let mut frames = Vec::new();
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut raw = self.buffer.drain(..=newline).collect::<Vec<_>>();
+            raw.pop();
+            if raw.last() == Some(&b'\r') {
+                raw.pop();
+            }
+            let line = std::str::from_utf8(&raw).context("Studio SSE was not UTF-8")?;
+            if let Some(frame) = self.line(line)? {
+                frames.push(frame);
+            }
+        }
+        Ok(frames)
+    }
+
+    fn line(&mut self, line: &str) -> Result<Option<SseFrame>> {
+        if line.is_empty() {
+            if self.id.is_none() && self.event.is_none() && self.data_lines.is_empty() {
+                return Ok(None);
+            }
+            let frame = SseFrame {
+                id: self.id.take(),
+                event: self.event.take(),
+                data: (!self.data_lines.is_empty()).then(|| self.data_lines.join("\n")),
+            };
+            self.data_lines.clear();
+            self.data_bytes = 0;
+            return Ok(Some(frame));
+        }
+        if line.starts_with(':') {
+            return Ok(None);
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "id" if !value.contains('\0') => self.id = Some(value.to_owned()),
+            "event" => self.event = Some(value.to_owned()),
+            "data" => {
+                self.data_bytes = self
+                    .data_bytes
+                    .checked_add(value.len() + usize::from(!self.data_lines.is_empty()))
+                    .context("Studio SSE data size overflow")?;
+                ensure!(
+                    self.data_bytes <= MAX_SSE_DATA_BYTES,
+                    "Studio SSE event exceeded the 1 MiB client bound"
+                );
+                self.data_lines.push(value.to_owned());
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+}
+
 pub async fn list_projects_operation(connection: &RemoteConnectionOptions) -> Result<ProjectPage> {
     let client = StudioApiClient::connect(connection).await?;
     let mut items = Vec::new();
@@ -1262,6 +1453,138 @@ pub async fn capabilities_operation(
 
 pub async fn quota_operation(connection: &RemoteConnectionOptions) -> Result<QuotaStatusV1> {
     StudioApiClient::connect(connection).await?.quota().await
+}
+
+pub async fn watch_events_operation<F>(
+    options: &EventsWatchOptions,
+    mut emit: F,
+) -> Result<EventWatchResult>
+where
+    F: FnMut(&EventWatchItem) -> Result<()>,
+{
+    ensure!(
+        options
+            .max_events
+            .is_none_or(|max_events| (1..=10_000).contains(&max_events)),
+        "--max-events must be between 1 and 10000"
+    );
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut cursor = options.cursor;
+    let mut events = Vec::new();
+    let mut reconnect_attempt = 0_u32;
+    loop {
+        let response = match client.events_response(cursor).await {
+            Ok(response) => response,
+            Err(error)
+                if is_transient_api_error(&error)
+                    && reconnect_attempt < MAX_TRANSIENT_POLL_RETRIES =>
+            {
+                reconnect_attempt += 1;
+                tokio::time::sleep(transient_poll_delay(reconnect_attempt)).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("connect Studio event stream"),
+        };
+        let mut stream = response.bytes_stream();
+        let mut decoder = SseDecoder::default();
+        let mut reconnect_requested = false;
+        loop {
+            let next = tokio::select! {
+                interrupted = tokio::signal::ctrl_c() => {
+                    interrupted.context("listen for interrupt")?;
+                    return Ok(EventWatchResult {
+                        events,
+                        last_cursor: cursor,
+                        interrupted: true,
+                    });
+                }
+                next = stream.next() => next,
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let error = studio_api_transport_error(error);
+                    if is_transient_api_error(&error) {
+                        break;
+                    }
+                    return Err(error).context("read Studio event stream");
+                }
+            };
+            for frame in decoder.push(&chunk)? {
+                if let Some(id) = frame.id {
+                    cursor = Some(parse_event_cursor(&id)?);
+                }
+                if frame.event.as_deref() == Some("studio.stream.error.v1") {
+                    reconnect_requested = true;
+                    break;
+                }
+                let Some(data) = frame.data else {
+                    continue;
+                };
+                let event: EventEnvelopeV1 =
+                    serde_json::from_str(&data).context("decode Studio event envelope")?;
+                ensure!(
+                    event.schema == EVENT_SCHEMA_V1 && event.event_version == 1,
+                    "Studio returned an unsupported event envelope"
+                );
+                if let Some(sse_type) = frame.event.as_deref() {
+                    ensure!(
+                        sse_type == event.event_type,
+                        "Studio SSE type did not match its event envelope"
+                    );
+                }
+                let event_cursor = cursor.context("Studio event was missing a durable cursor")?;
+                reconnect_attempt = 0;
+                if options
+                    .project_id
+                    .is_some_and(|project_id| event.project_id != Some(project_id))
+                {
+                    continue;
+                }
+                let item = EventWatchItem {
+                    cursor: event_cursor,
+                    event,
+                };
+                if let Some(max_events) = options.max_events {
+                    events.push(item);
+                    if events.len() == max_events {
+                        return Ok(EventWatchResult {
+                            events,
+                            last_cursor: cursor,
+                            interrupted: false,
+                        });
+                    }
+                } else {
+                    emit(&item)?;
+                }
+            }
+            if reconnect_requested {
+                break;
+            }
+        }
+        reconnect_attempt += 1;
+        ensure!(
+            reconnect_attempt <= MAX_TRANSIENT_POLL_RETRIES,
+            "Studio event stream disconnected repeatedly"
+        );
+        tokio::time::sleep(transient_poll_delay(reconnect_attempt)).await;
+    }
+}
+
+fn parse_event_cursor(value: &str) -> Result<u64> {
+    ensure!(
+        !value.is_empty() && value.len() <= 19 && value.bytes().all(|byte| byte.is_ascii_digit()),
+        "Studio returned an invalid event cursor"
+    );
+    let cursor = value.parse::<u64>()?;
+    ensure!(
+        cursor < i64::MAX as u64,
+        "Studio event cursor exceeded the supported range"
+    );
+    Ok(cursor)
 }
 
 pub async fn list_revisions_operation(options: &RevisionScopeOptions) -> Result<CommitPage> {
@@ -2020,6 +2343,113 @@ pub async fn validate(options: &ValidateOptions) -> Result<()> {
     Ok(())
 }
 
+pub async fn build_release_operation(options: &ReleaseBuildOptions) -> Result<ReleaseResponse> {
+    validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, commit_id, local_root) =
+        resolve_local_candidate(options.project_id, options.commit_id)?;
+    let validation_run_id = match options.validation_run_id {
+        Some(id) => id,
+        None => {
+            let root = local_root
+                .as_ref()
+                .context("--validation-run-id is required outside a local project")?;
+            crate::local_project::read_local_state(root)?
+                .last_validation_run_id
+                .context("no validation is recorded; run reporch verify first")?
+        }
+    };
+    let key = operation_key("cli-release", options.idempotency_key.as_deref())?;
+    eprintln!("Idempotency-Key: {key}");
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let release = client
+        .create_release(
+            project_id,
+            &CreateReleaseRequest {
+                commit_id,
+                validation_run_id,
+            },
+            &key,
+        )
+        .await?;
+    let release = if options.wait {
+        wait_for_release(&client, project_id, release, options.timeout_seconds).await?
+    } else {
+        release
+    };
+    if options.wait {
+        ensure!(
+            release.status == ReleaseStatus::Ready,
+            "release build failed: {}",
+            release.error_code.as_deref().unwrap_or("unknown")
+        );
+    }
+    if let Some(root) = local_root {
+        let mut state = crate::local_project::read_local_state(&root)?;
+        state.last_release_id = Some(release.id);
+        crate::local_project::write_local_state(&root, &state)?;
+    }
+    Ok(release)
+}
+
+pub async fn list_releases_operation(options: &ReleaseScopeOptions) -> Result<ReleasePage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_releases(project_id, cursor).await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|release| release.project_id == project_id),
+            "Studio returned a release from another project"
+        );
+        items.extend(page.items);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(ReleasePage {
+                items,
+                next_cursor: None,
+            });
+        };
+        ensure!(
+            seen.insert(next_cursor),
+            "Studio returned a repeated release cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio release listing exceeded the 10,000-item native client bound")
+}
+
+pub async fn show_release_operation(options: &ReleaseShowOptions) -> Result<ReleaseResponse> {
+    let (project_id, release_id) =
+        resolve_local_release(options.scope.project_id, options.release_id)?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .get_release(project_id, release_id)
+        .await
+}
+
+pub async fn download_release_operation(
+    options: &ReleaseDownloadOptions,
+) -> Result<PackageOperationResult> {
+    ensure!(
+        !options.output.exists(),
+        "refusing to overwrite {}",
+        options.output.display()
+    );
+    let (project_id, release_id) =
+        resolve_local_release(options.target.scope.project_id, options.target.release_id)?;
+    let client = StudioApiClient::connect(&options.target.scope.connection).await?;
+    let release = client.get_release(project_id, release_id).await?;
+    ensure!(
+        release.status == ReleaseStatus::Ready,
+        "release is not ready: {:?}",
+        release.status
+    );
+    download_release_to(&client, project_id, release, &options.output).await
+}
+
 pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperationResult> {
     validate_wait_timeout(options.timeout_seconds)?;
     let (project_id, commit_id, local_root) =
@@ -2059,6 +2489,21 @@ pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperat
         "release build failed: {:?}",
         release.error_code
     );
+    let result = download_release_to(&client, project_id, release, &options.output).await?;
+    if let Some(root) = local_root {
+        let mut state = crate::local_project::read_local_state(&root)?;
+        state.last_release_id = Some(result.release.id);
+        crate::local_project::write_local_state(&root, &state)?;
+    }
+    Ok(result)
+}
+
+async fn download_release_to(
+    client: &StudioApiClient,
+    project_id: Uuid,
+    release: ReleaseResponse,
+    output: &Path,
+) -> Result<PackageOperationResult> {
     let download = client.release_download(project_id, release.id).await?;
     ensure!(
         download.release_id == release.id,
@@ -2077,21 +2522,15 @@ pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperat
             &download.download_url,
             download.package_size_bytes,
             &download.package_digest,
-            &options.output,
+            output,
         )
         .await?;
-    let result = PackageOperationResult {
+    Ok(PackageOperationResult {
         release,
-        output: options.output.clone(),
+        output: output.to_owned(),
         package_digest: download.package_digest,
         package_size_bytes: download.package_size_bytes,
-    };
-    if let Some(root) = local_root {
-        let mut state = crate::local_project::read_local_state(&root)?;
-        state.last_release_id = Some(result.release.id);
-        crate::local_project::write_local_state(&root, &state)?;
-    }
-    Ok(result)
+    })
 }
 
 pub async fn package(options: &PackageOptions) -> Result<()> {
@@ -3161,6 +3600,48 @@ mod tests {
         assert_eq!(transient_poll_delay(2), Duration::from_millis(500));
         assert_eq!(transient_poll_delay(8), Duration::from_secs(5));
         assert_eq!(transient_poll_delay(u32::MAX), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn sse_decoder_handles_chunk_boundaries_checkpoints_and_multiline_data() {
+        let mut decoder = SseDecoder::default();
+        assert!(
+            decoder
+                .push(b"id: 41\nevent: studio.progress")
+                .unwrap()
+                .is_empty()
+        );
+        let frames = decoder
+            .push(b".validation.v1\ndata: {\"first\":1,\ndata: \"second\":2}\n\n")
+            .unwrap();
+        assert_eq!(
+            frames,
+            vec![SseFrame {
+                id: Some("41".into()),
+                event: Some("studio.progress.validation.v1".into()),
+                data: Some("{\"first\":1,\n\"second\":2}".into()),
+            }]
+        );
+
+        let checkpoint = decoder.push(b"id: 42\n: cursor-checkpoint\n\n").unwrap();
+        assert_eq!(
+            checkpoint,
+            vec![SseFrame {
+                id: Some("42".into()),
+                event: None,
+                data: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn sse_decoder_and_cursor_fail_closed_on_oversized_or_ambiguous_input() {
+        let mut decoder = SseDecoder::default();
+        assert!(decoder.push(&vec![b'x'; MAX_SSE_BUFFER_BYTES + 1]).is_err());
+        for invalid in ["", "-1", "+1", " 1", "1x", "9223372036854775807"] {
+            assert!(parse_event_cursor(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert_eq!(parse_event_cursor("42").unwrap(), 42);
     }
 
     #[tokio::test]
