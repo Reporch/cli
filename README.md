@@ -23,6 +23,12 @@ Supported systems:
 - Windows x64
 - Linux glibc arm64 and x64
 
+The same five binaries are also published as standalone `.tar.gz` or `.zip`
+archives on the [GitHub Releases](https://github.com/Reporch/cli/releases)
+page. Download the archive and `SHA256SUMS` from the same release, verify the
+checksum before extraction, then place `reporch` (or `reporch.exe`) on your
+`PATH`. Each archive also carries `LICENSE`, `NOTICE`, and this README.
+
 ## Start a problem
 
 ```bash
@@ -258,10 +264,13 @@ release can be packaged.
 
 ## Release integrity
 
-Official npm releases are built on GitHub-hosted runners for each supported OS.
-The release workflow creates npm provenance, GitHub artifact attestations,
-SHA-256 checksums, and an SPDX SBOM. npm packages contain no `preinstall`,
-`install`, or `postinstall` scripts.
+Official npm packages and standalone native archives are built on
+GitHub-hosted runners for each supported OS. Every uploaded asset is covered by
+`SHA256SUMS` and GitHub artifact provenance; the release also includes an SPDX
+SBOM and machine-readable npm and native manifests. Unix archives normalize
+ordering, timestamps, ownership, and gzip metadata so rebuilds are byte-for-byte
+comparable. npm packages contain no `preinstall`, `install`, or `postinstall`
+scripts.
 
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 

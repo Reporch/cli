@@ -162,7 +162,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" \
               --title "Reporch CLI $VERSION" \
-              --notes "Official Apache-2.0 Reporch CLI release. Install with npm install --global @reporch/cli."
+              --notes $'Official Apache-2.0 Reporch CLI release.\n\nInstall with `npm install --global @reporch/cli`, or download the standalone archive for your target and verify it with `SHA256SUMS`. Every release asset has GitHub artifact provenance; manifests and an SPDX SBOM are included.'
           fi
           gh release upload "$RELEASE_TAG" dist/release-assets/* dist/SHA256SUMS --clobber
       - name: Publish exact npm tarballs with OIDC and provenance
