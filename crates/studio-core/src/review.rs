@@ -12,6 +12,7 @@ pub enum ReviewStatusV1 {
     InReview,
     ChangesRequested,
     Approved,
+    Invalidated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -19,6 +20,34 @@ pub enum ReviewStatusV1 {
 pub enum ReviewDecisionKindV1 {
     Approve,
     RequestChanges,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewApprovalSourceV1 {
+    ProjectMembership,
+    ReviewPool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecisionAuthorityV1 {
+    ProjectMembership {
+        entitlement_version: i64,
+    },
+    ReviewPool {
+        entitlement_version: i64,
+        assignment_id: Uuid,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewPoolStatusV1 {
+    Requested,
+    Claimed,
+    Cancelled,
+    Invalidated,
+    Completed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +112,8 @@ pub struct ReviewDecisionRecord {
     pub decision: ReviewDecisionKindV1,
     pub decided_by: SubjectRef,
     pub entitlement_version: i64,
+    pub approval_source: ReviewApprovalSourceV1,
+    pub pool_assignment_id: Option<Uuid>,
     pub comment: Option<String>,
     pub idempotency_key: String,
     pub created_at: DateTime<Utc>,
@@ -93,7 +124,7 @@ impl ReviewDecisionRecord {
         review_id: Uuid,
         decision: ReviewDecisionKindV1,
         decided_by: SubjectRef,
-        entitlement_version: i64,
+        authority: ReviewDecisionAuthorityV1,
         comment: Option<String>,
         idempotency_key: String,
         now: DateTime<Utc>,
@@ -101,6 +132,23 @@ impl ReviewDecisionRecord {
         let comment = comment
             .map(|comment| comment.trim().to_owned())
             .filter(|comment| !comment.is_empty());
+        let (entitlement_version, approval_source, pool_assignment_id) = match authority {
+            ReviewDecisionAuthorityV1::ProjectMembership {
+                entitlement_version,
+            } => (
+                entitlement_version,
+                ReviewApprovalSourceV1::ProjectMembership,
+                None,
+            ),
+            ReviewDecisionAuthorityV1::ReviewPool {
+                entitlement_version,
+                assignment_id,
+            } => (
+                entitlement_version,
+                ReviewApprovalSourceV1::ReviewPool,
+                Some(assignment_id),
+            ),
+        };
         if entitlement_version < 0
             || comment
                 .as_ref()
@@ -117,6 +165,8 @@ impl ReviewDecisionRecord {
             decision,
             decided_by,
             entitlement_version,
+            approval_source,
+            pool_assignment_id,
             comment,
             idempotency_key,
             created_at: now,
@@ -163,7 +213,9 @@ mod tests {
                 review.id,
                 ReviewDecisionKindV1::RequestChanges,
                 actor(),
-                1,
+                ReviewDecisionAuthorityV1::ProjectMembership {
+                    entitlement_version: 1,
+                },
                 None,
                 "decision-key".into(),
                 now,

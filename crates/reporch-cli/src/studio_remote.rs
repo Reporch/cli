@@ -24,10 +24,10 @@ use studio_contracts::{
     FileUploadStatus, FileUploadStrategyV1, IdentityDirectoryPageV1, ProjectMembershipPage,
     ProjectMembershipResponse, ProjectPage, ProjectResponse, PublicationResponse,
     PublicationStatus, QuotaStatusV1, ReleaseDownloadResponse, ReleaseResponse, ReleaseStatus,
-    ReviewPage, ReviewResponse, RevokeWaiverRequest, StudioCapabilitiesV1, SubmitReviewRequest,
-    UpdateWorkingCopyRequestV1, UpsertProjectMembershipRequest, ValidationRunDetailResponse,
-    ValidationRunResponse, ValidationRunStatus, WaiverPage, WaiverResponse, WorkingCopyReadinessV1,
-    WorkingCopyV1,
+    ReviewPage, ReviewPoolPageV1, ReviewPoolRequestResponseV1, ReviewResponse, RevokeWaiverRequest,
+    StudioCapabilitiesV1, SubmitReviewRequest, UpdateWorkingCopyRequestV1,
+    UpsertProjectMembershipRequest, ValidationRunDetailResponse, ValidationRunResponse,
+    ValidationRunStatus, WaiverPage, WaiverResponse, WorkingCopyReadinessV1, WorkingCopyV1,
 };
 use studio_core::{
     ManifestFile, ProblemType, ProjectRole, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
@@ -284,9 +284,12 @@ pub struct ApproveReviewOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub review_id: Uuid,
+    pub review_id: Option<Uuid>,
+    /// Decide an assignment claimed from the Reporch review pool.
+    #[arg(long, conflicts_with_all = ["project_id", "review_id"])]
+    pub pool_request_id: Option<Uuid>,
     #[arg(long)]
     pub comment: Option<String>,
     /// Reuse this value after an ambiguous network failure.
@@ -299,15 +302,47 @@ pub struct RequestChangesOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub review_id: Uuid,
+    pub review_id: Option<Uuid>,
+    /// Decide an assignment claimed from the Reporch review pool.
+    #[arg(long, conflicts_with_all = ["project_id", "review_id"])]
+    pub pool_request_id: Option<Uuid>,
     /// Explain the changes needed. Empty comments are rejected locally.
     #[arg(long)]
     pub comment: String,
     /// Reuse this value after an ambiguous network failure.
     #[arg(long)]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReviewPoolRequestOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub review_id: Uuid,
+    /// Route this review through the independent Reporch reviewer pool.
+    #[arg(long, required = true, action = ArgAction::SetTrue)]
+    pub pool: bool,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReviewPoolTargetOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub pool_request_id: Uuid,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReviewPoolInboxOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -885,6 +920,80 @@ impl StudioApiClient {
                 .post(self.endpoint(&format!(
                     "projects/{project_id}/reviews/{review_id}/decisions"
                 ))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn request_review_pool(
+        &self,
+        project_id: Uuid,
+        review_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<ReviewPoolRequestResponseV1> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/reviews/{review_id}/pool-request"
+                ))?)
+                .header("idempotency-key", idempotency_key),
+        )
+        .await
+    }
+
+    async fn get_review_pool_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<ReviewPoolRequestResponseV1> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("review-pool/{request_id}"))?),
+        )
+        .await
+    }
+
+    async fn list_review_pool_inbox(&self, cursor: Option<Uuid>) -> Result<ReviewPoolPageV1> {
+        let mut url = self.endpoint("review-pool/inbox")?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        self.json(self.http.get(url)).await
+    }
+
+    async fn claim_review_pool_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<ReviewPoolRequestResponseV1> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("review-pool/{request_id}/claim"))?),
+        )
+        .await
+    }
+
+    async fn cancel_review_pool_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<ReviewPoolRequestResponseV1> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("review-pool/{request_id}/cancel"))?),
+        )
+        .await
+    }
+
+    async fn decide_pool_review(
+        &self,
+        request_id: Uuid,
+        request: &CreateReviewDecisionRequest,
+        idempotency_key: &str,
+    ) -> Result<ReviewResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("review-pool/{request_id}/decision"))?)
                 .header("idempotency-key", idempotency_key)
                 .json(request),
         )
@@ -2078,12 +2187,101 @@ pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
     Ok(())
 }
 
+pub async fn request_review_pool_operation(
+    options: &ReviewPoolRequestOptions,
+) -> Result<ReviewPoolRequestResponseV1> {
+    ensure!(options.pool, "review request requires --pool");
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let key = operation_key(
+        "cli-review-pool-request",
+        options.idempotency_key.as_deref(),
+    )?;
+    eprintln!("Idempotency-Key: {key}");
+    let response = StudioApiClient::connect(&options.connection)
+        .await?
+        .request_review_pool(project_id, options.review_id, &key)
+        .await?;
+    ensure!(
+        response.project_id == project_id && response.review_id == options.review_id,
+        "Studio returned a review pool request outside the requested candidate"
+    );
+    Ok(response)
+}
+
+pub async fn review_pool_status_operation(
+    options: &ReviewPoolTargetOptions,
+) -> Result<ReviewPoolRequestResponseV1> {
+    let response = StudioApiClient::connect(&options.connection)
+        .await?
+        .get_review_pool_request(options.pool_request_id)
+        .await?;
+    ensure!(
+        response.id == options.pool_request_id,
+        "Studio returned a different review pool request"
+    );
+    Ok(response)
+}
+
+pub async fn list_review_pool_inbox_operation(
+    options: &ReviewPoolInboxOptions,
+) -> Result<ReviewPoolPageV1> {
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_review_pool_inbox(cursor).await?;
+        items.extend(page.items);
+        let Some(next) = page.next_cursor else {
+            return Ok(ReviewPoolPageV1 {
+                items,
+                next_cursor: None,
+            });
+        };
+        ensure!(
+            seen.insert(next),
+            "Studio returned a repeated review pool cursor"
+        );
+        cursor = Some(next);
+    }
+    bail!("Studio review pool inbox exceeded the 10,000-item native client bound")
+}
+
+pub async fn claim_review_pool_operation(
+    options: &ReviewPoolTargetOptions,
+) -> Result<ReviewPoolRequestResponseV1> {
+    let response = StudioApiClient::connect(&options.connection)
+        .await?
+        .claim_review_pool_request(options.pool_request_id)
+        .await?;
+    ensure!(
+        response.id == options.pool_request_id && response.assignment_id.is_some(),
+        "Studio returned an invalid review pool assignment"
+    );
+    Ok(response)
+}
+
+pub async fn cancel_review_pool_operation(
+    options: &ReviewPoolTargetOptions,
+) -> Result<ReviewPoolRequestResponseV1> {
+    let response = StudioApiClient::connect(&options.connection)
+        .await?
+        .cancel_review_pool_request(options.pool_request_id)
+        .await?;
+    ensure!(
+        response.id == options.pool_request_id,
+        "Studio returned a different review pool request"
+    );
+    Ok(response)
+}
+
 pub async fn approve_review_operation(options: &ApproveReviewOptions) -> Result<ReviewResponse> {
     let comment = normalize_optional_review_comment(options.comment.as_deref())?;
-    decide_review(
+    decide_review_target(
         &options.connection,
         options.project_id,
         options.review_id,
+        options.pool_request_id,
         ReviewDecisionKindV1::Approve,
         comment,
         options.idempotency_key.as_deref(),
@@ -2164,10 +2362,11 @@ pub async fn request_review_changes_operation(
     options: &RequestChangesOptions,
 ) -> Result<ReviewResponse> {
     let comment = normalize_required_review_comment(&options.comment)?;
-    decide_review(
+    decide_review_target(
         &options.connection,
         options.project_id,
         options.review_id,
+        options.pool_request_id,
         ReviewDecisionKindV1::RequestChanges,
         Some(comment),
         options.idempotency_key.as_deref(),
@@ -2189,6 +2388,55 @@ pub async fn request_review_changes(options: &RequestChangesOptions) -> Result<(
         serde_json::to_string_pretty(&request_review_changes_operation(options).await?)?
     );
     Ok(())
+}
+
+async fn decide_review_target(
+    connection: &RemoteConnectionOptions,
+    project_id: Option<Uuid>,
+    review_id: Option<Uuid>,
+    pool_request_id: Option<Uuid>,
+    decision: ReviewDecisionKindV1,
+    comment: Option<String>,
+    provided_key: Option<&str>,
+) -> Result<ReviewResponse> {
+    match pool_request_id {
+        Some(request_id) => {
+            ensure!(
+                project_id.is_none() && review_id.is_none(),
+                "--pool-request-id cannot be combined with --project-id or --review-id"
+            );
+            let key = operation_key("cli-review-pool-decision", provided_key)?;
+            eprintln!("Idempotency-Key: {key}");
+            let review = StudioApiClient::connect(connection)
+                .await?
+                .decide_pool_review(
+                    request_id,
+                    &CreateReviewDecisionRequest { decision, comment },
+                    &key,
+                )
+                .await?;
+            ensure!(
+                review.decision.as_ref().is_some_and(|record| {
+                    record.decision == decision
+                        && record.pool_assignment_id.is_some()
+                        && record.approval_source == studio_core::ReviewApprovalSourceV1::ReviewPool
+                }),
+                "Studio returned a mismatched review pool decision"
+            );
+            Ok(review)
+        }
+        None => {
+            decide_review(
+                connection,
+                project_id.context("--project-id is required without --pool-request-id")?,
+                review_id.context("--review-id is required without --pool-request-id")?,
+                decision,
+                comment,
+                provided_key,
+            )
+            .await
+        }
+    }
 }
 
 async fn decide_review(

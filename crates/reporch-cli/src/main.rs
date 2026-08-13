@@ -333,6 +333,16 @@ enum ReviewCommand {
     Submit(studio_remote::SubmitReviewOptions),
     /// List reviews for a project, newest first.
     List(studio_remote::ListReviewsOptions),
+    /// Request an independent reviewer from the Reporch review pool.
+    Request(studio_remote::ReviewPoolRequestOptions),
+    /// List claimable assignments. Requires the review-pool entitlement.
+    Inbox(studio_remote::ReviewPoolInboxOptions),
+    /// Show a review-pool request or assignment.
+    Status(studio_remote::ReviewPoolTargetOptions),
+    /// Atomically claim a review-pool request.
+    Claim(studio_remote::ReviewPoolTargetOptions),
+    /// Cancel a review-pool request created by the current account.
+    Cancel(studio_remote::ReviewPoolTargetOptions),
     /// Approve a review as an independent reviewer.
     Approve(studio_remote::ApproveReviewOptions),
     /// Request changes with an explanatory comment.
@@ -864,6 +874,46 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     &format!("{} review(s)", reviews.items.len()),
                 )
             }
+            ReviewCommand::Request(options) => {
+                let request = studio_remote::request_review_pool_operation(&options).await?;
+                output.emit(
+                    "review request",
+                    &request,
+                    &format!("Requested independent review {}", request.id),
+                )
+            }
+            ReviewCommand::Inbox(options) => {
+                let inbox = studio_remote::list_review_pool_inbox_operation(&options).await?;
+                output.emit(
+                    "review inbox",
+                    &inbox,
+                    &format!("{} claimable review(s)", inbox.items.len()),
+                )
+            }
+            ReviewCommand::Status(options) => {
+                let request = studio_remote::review_pool_status_operation(&options).await?;
+                output.emit(
+                    "review status",
+                    &request,
+                    &format!("Review request {} · {:?}", request.id, request.status),
+                )
+            }
+            ReviewCommand::Claim(options) => {
+                let request = studio_remote::claim_review_pool_operation(&options).await?;
+                output.emit(
+                    "review claim",
+                    &request,
+                    &format!("Claimed review request {}", request.id),
+                )
+            }
+            ReviewCommand::Cancel(options) => {
+                let request = studio_remote::cancel_review_pool_operation(&options).await?;
+                output.emit(
+                    "review cancel",
+                    &request,
+                    &format!("Cancelled review request {}", request.id),
+                )
+            }
             ReviewCommand::Approve(options) => {
                 let review = studio_remote::approve_review_operation(&options).await?;
                 output.emit(
@@ -1077,6 +1127,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::Review { command } => match command {
             ReviewCommand::Submit(_) => "review submit",
             ReviewCommand::List(_) => "review list",
+            ReviewCommand::Request(_) => "review request",
+            ReviewCommand::Inbox(_) => "review inbox",
+            ReviewCommand::Status(_) => "review status",
+            ReviewCommand::Claim(_) => "review claim",
+            ReviewCommand::Cancel(_) => "review cancel",
             ReviewCommand::Approve(_) => "review approve",
             ReviewCommand::RequestChanges(_) => "review request-changes",
         },

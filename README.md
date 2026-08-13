@@ -61,6 +61,25 @@ The server rejects self-approval: the commit author and final reviewer must be
 different Reporch subjects, and every approval is bound to the exact commit,
 validation run, manifest digest, and reviewer entitlement version.
 
+If a project has no independent reviewer, request the Reporch review pool:
+
+```bash
+reporch review request --review-id <REVIEW_ID> --pool
+reporch review status --pool-request-id <POOL_REQUEST_ID>
+
+# Accounts with the dedicated reviewer entitlement:
+reporch review inbox
+reporch review claim --pool-request-id <POOL_REQUEST_ID>
+reporch review approve --pool-request-id <POOL_REQUEST_ID> \
+  --comment "Checked statement, tests, and expected verdicts"
+```
+
+A pool claim is a candidate-bound read/comment/review capability, not project
+membership. It disappears after a decision or cancellation. A new commit
+invalidates the request, assignment, and approval; concurrent claims are
+accepted only once. Removing the reviewer's entitlement also makes the approval
+unusable for release.
+
 Create a completely local project without signing in:
 
 ```bash
@@ -142,6 +161,10 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 npm test
 ```
+
+`npm test` also verifies the checksum and required review-pool surface of the
+pinned Studio OpenAPI artifact. Contract drift therefore fails before a CLI
+release can be packaged.
 
 ## Release integrity
 

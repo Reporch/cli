@@ -62,6 +62,37 @@ fn help_is_successful_and_never_emits_an_error_envelope() {
 }
 
 #[test]
+fn review_pool_commands_are_explicit_and_parse_without_membership_fields() {
+    let review_id = "019f8fc9-cff3-7421-8cf8-0661a7a484dd";
+    let missing_pool = reporch()
+        .args([
+            "--format",
+            "json",
+            "review",
+            "request",
+            "--review-id",
+            review_id,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(missing_pool.status.code(), Some(2), "{missing_pool:?}");
+    let error: Value = serde_json::from_slice(&missing_pool.stderr).unwrap();
+    assert_eq!(error["error_code"], "input.invalid");
+
+    for arguments in [
+        vec!["review", "request", "--help"],
+        vec!["review", "inbox", "--help"],
+        vec!["review", "claim", "--help"],
+        vec!["review", "approve", "--help"],
+    ] {
+        let output = reporch().args(arguments).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.contains("review"), "{output:?}");
+    }
+}
+
+#[test]
 fn check_is_networkless_and_finds_the_project_from_a_child_directory() {
     let temporary = tempfile::tempdir().unwrap();
     let init = reporch()

@@ -7,5 +7,7 @@
 .env.*
 !.env.example
 /dist/
-/artifacts/
+/artifacts/*
+!/artifacts/studio-openapi.json.gz.b64
+!/artifacts/studio-openapi.sha256
 /.gstack/

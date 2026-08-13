@@ -7,9 +7,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use studio_core::{
     AuthoringSettingsV1, ManifestFile, PackageProfile, ProblemType, Project, ProjectMembership,
-    ProjectRole, ReleaseManifestV1, ReviewDecisionKindV1, ReviewDecisionRecord, ReviewRecord,
-    ReviewState, ReviewStatusV1, Sha256Digest, SubjectRef, TestLabCheckerV1, TestLabDraftV1,
-    ValidationIssue, ValidationStagePlanV1, WaiverRecord, WaiverRevocationRecord, WaiverStatusV1,
+    ProjectRole, ReleaseManifestV1, ReviewApprovalSourceV1, ReviewDecisionKindV1,
+    ReviewDecisionRecord, ReviewPoolStatusV1, ReviewRecord, ReviewState, ReviewStatusV1,
+    Sha256Digest, SubjectRef, TestLabCheckerV1, TestLabDraftV1, ValidationIssue,
+    ValidationStagePlanV1, WaiverRecord, WaiverRevocationRecord, WaiverStatusV1,
 };
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -478,6 +479,9 @@ pub struct ReviewDecisionResponse {
     pub decision: ReviewDecisionKindV1,
     pub decided_by: SubjectRef,
     pub entitlement_version: i64,
+    pub approval_source: ReviewApprovalSourceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_assignment_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -490,6 +494,8 @@ impl From<ReviewDecisionRecord> for ReviewDecisionResponse {
             decision: record.decision,
             decided_by: record.decided_by,
             entitlement_version: record.entitlement_version,
+            approval_source: record.approval_source,
+            pool_assignment_id: record.pool_assignment_id,
             comment: record.comment,
             created_at: record.created_at,
         }
@@ -516,6 +522,33 @@ pub struct ReviewPage {
     pub items: Vec<ReviewResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReviewPoolRequestResponseV1 {
+    pub id: Uuid,
+    pub review_id: Uuid,
+    pub project_id: Uuid,
+    pub commit_id: Uuid,
+    pub validation_run_id: Uuid,
+    pub manifest_digest: Sha256Digest,
+    pub requested_by: SubjectRef,
+    pub status: ReviewPoolStatusV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<SubjectRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_entitlement_version: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReviewPoolPageV1 {
+    pub items: Vec<ReviewPoolRequestResponseV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1124,4 +1157,38 @@ pub struct PublicationRequestedV1 {
     pub release_id: Uuid,
     pub project_id: Uuid,
     pub requested_by: SubjectRef,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_pool_response_matches_the_studio_v1_wire_contract() {
+        let value = serde_json::json!({
+            "id": "019ffa58-1000-7000-8000-000000000003",
+            "review_id": "019ffa58-1000-7000-8000-000000000002",
+            "project_id": "019ffa57-39c6-74d1-8b38-61dd782c22ff",
+            "commit_id": "019ffa57-f916-7500-8db2-9006ec779a39",
+            "validation_run_id": "019ffa58-1000-7000-8000-000000000001",
+            "manifest_digest": "92914fe2395158e38da08b6dbe257d4f60a592980d3f9c06dc28a78a019ba07b",
+            "requested_by": {
+                "issuer": "https://reporch.com/oauth",
+                "subject": "author"
+            },
+            "status": "claimed",
+            "claimed_by": {
+                "issuer": "https://reporch.com/oauth",
+                "subject": "reviewer"
+            },
+            "assignment_id": "019ffa58-ca85-71b1-8aa7-5dcd38619851",
+            "reviewer_entitlement_version": 9,
+            "created_at": "2026-08-13T08:58:00Z",
+            "updated_at": "2026-08-13T08:59:00Z"
+        });
+        let response: ReviewPoolRequestResponseV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(response.status, ReviewPoolStatusV1::Claimed);
+        assert_eq!(response.reviewer_entitlement_version, Some(9));
+        assert!(response.assignment_id.is_some());
+    }
 }
