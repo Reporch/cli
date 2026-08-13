@@ -127,6 +127,11 @@ enum Command {
         #[command(subcommand)]
         command: WaiverCommand,
     },
+    /// Inspect immutable project revisions.
+    Revision {
+        #[command(subcommand)]
+        command: RevisionCommand,
+    },
     /// Submit and decide digest-bound Studio reviews.
     Review {
         #[command(subcommand)]
@@ -370,6 +375,13 @@ enum WaiverCommand {
     List(studio_remote::WaiverScopeOptions),
     Create(studio_remote::CreateWaiverOptions),
     Revoke(studio_remote::RevokeWaiverOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum RevisionCommand {
+    List(studio_remote::RevisionScopeOptions),
+    Show(studio_remote::RevisionShowOptions),
+    Diff(studio_remote::RevisionDiffOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -809,6 +821,32 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 )
             }
         },
+        Command::Revision { command } => match command {
+            RevisionCommand::List(options) => {
+                let revisions = studio_remote::list_revisions_operation(&options).await?;
+                output.emit(
+                    "revision list",
+                    &revisions,
+                    &format!("{} revision(s)", revisions.items.len()),
+                )
+            }
+            RevisionCommand::Show(options) => {
+                let revision = studio_remote::show_revision_operation(&options).await?;
+                output.emit(
+                    "revision show",
+                    &revision,
+                    &format!("Revision {} · sequence {}", revision.id, revision.sequence),
+                )
+            }
+            RevisionCommand::Diff(options) => {
+                let diff = studio_remote::diff_revisions_operation(&options).await?;
+                let changes = diff.metadata_changed.len()
+                    + diff.files_added.len()
+                    + diff.files_modified.len()
+                    + diff.files_removed.len();
+                output.emit("revision diff", &diff, &format!("{changes} change(s)"))
+            }
+        },
         Command::Review { command } => match command {
             ReviewCommand::Submit(options) => {
                 let review = studio_remote::submit_review_operation(&options).await?;
@@ -1030,6 +1068,11 @@ fn command_name(command: &Command) -> &'static str {
             WaiverCommand::List(_) => "waiver list",
             WaiverCommand::Create(_) => "waiver create",
             WaiverCommand::Revoke(_) => "waiver revoke",
+        },
+        Command::Revision { command } => match command {
+            RevisionCommand::List(_) => "revision list",
+            RevisionCommand::Show(_) => "revision show",
+            RevisionCommand::Diff(_) => "revision diff",
         },
         Command::Review { command } => match command {
             ReviewCommand::Submit(_) => "review submit",

@@ -403,6 +403,42 @@ pub struct WaiverScopeOptions {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+pub struct RevisionScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevisionShowOptions {
+    #[command(flatten)]
+    pub scope: RevisionScopeOptions,
+    #[arg(long)]
+    pub commit_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevisionDiffOptions {
+    #[command(flatten)]
+    pub scope: RevisionScopeOptions,
+    pub from: Uuid,
+    pub to: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevisionDiffV1 {
+    pub schema: &'static str,
+    pub project_id: Uuid,
+    pub from_commit_id: Uuid,
+    pub to_commit_id: Uuid,
+    pub metadata_changed: Vec<String>,
+    pub files_added: Vec<String>,
+    pub files_modified: Vec<String>,
+    pub files_removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
 pub struct CreateWaiverOptions {
     #[command(flatten)]
     pub scope: WaiverScopeOptions,
@@ -524,6 +560,20 @@ impl StudioApiClient {
                 .get(self.endpoint(&format!("projects/{project_id}/commits?limit=1"))?),
         )
         .await
+    }
+
+    async fn list_commits_page(
+        &self,
+        project_id: Uuid,
+        cursor: Option<Uuid>,
+    ) -> Result<CommitPage> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/commits"))?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        self.json(self.http.get(url)).await
     }
 
     async fn get_commit(&self, project_id: Uuid, commit_id: Uuid) -> Result<CommitDetailResponse> {
@@ -1103,6 +1153,123 @@ pub async fn capabilities_operation(
 
 pub async fn quota_operation(connection: &RemoteConnectionOptions) -> Result<QuotaStatusV1> {
     StudioApiClient::connect(connection).await?.quota().await
+}
+
+pub async fn list_revisions_operation(options: &RevisionScopeOptions) -> Result<CommitPage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_commits_page(project_id, cursor).await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|commit| commit.project_id == project_id),
+            "Studio returned a revision from another project"
+        );
+        items.extend(page.items);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(CommitPage {
+                items,
+                next_cursor: None,
+            });
+        };
+        ensure!(
+            seen.insert(next_cursor),
+            "Studio returned a repeated revision cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio revision listing exceeded the 10,000-item client bound")
+}
+
+pub async fn show_revision_operation(
+    options: &RevisionShowOptions,
+) -> Result<CommitDetailResponse> {
+    let (project_id, commit_id, _) =
+        resolve_local_candidate(options.scope.project_id, options.commit_id)?;
+    let commit = StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .get_commit(project_id, commit_id)
+        .await?;
+    ensure!(
+        commit.project_id == project_id,
+        "Studio returned a revision from another project"
+    );
+    Ok(commit)
+}
+
+pub async fn diff_revisions_operation(options: &RevisionDiffOptions) -> Result<RevisionDiffV1> {
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    ensure!(options.from != options.to, "revision IDs must be different");
+    let client = StudioApiClient::connect(&options.scope.connection).await?;
+    let from = client.get_commit(project_id, options.from).await?;
+    let to = client.get_commit(project_id, options.to).await?;
+    ensure!(
+        from.project_id == project_id && to.project_id == project_id,
+        "Studio returned a revision from another project"
+    );
+    Ok(diff_revisions(&from, &to))
+}
+
+fn diff_revisions(from: &CommitDetailResponse, to: &CommitDetailResponse) -> RevisionDiffV1 {
+    let from_spec = reporch_format::AuthoringSpecV1::from_manifest(&from.manifest);
+    let to_spec = reporch_format::AuthoringSpecV1::from_manifest(&to.manifest);
+    let from_json = serde_json::to_value(&from_spec).expect("AuthoringSpec serializes");
+    let to_json = serde_json::to_value(&to_spec).expect("AuthoringSpec serializes");
+    let mut metadata_changed = Vec::new();
+    let empty = serde_json::Map::new();
+    let from_object = from_json.as_object().unwrap_or(&empty);
+    let to_object = to_json.as_object().unwrap_or(&empty);
+    for key in from_object.keys().chain(to_object.keys()) {
+        if key != "files"
+            && from_object.get(key) != to_object.get(key)
+            && !metadata_changed.iter().any(|existing| existing == key)
+        {
+            metadata_changed.push(key.clone());
+        }
+    }
+    metadata_changed.sort();
+
+    let from_files = from
+        .manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let to_files = to
+        .manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let files_added = to_files
+        .keys()
+        .filter(|path| !from_files.contains_key(**path))
+        .map(|path| (*path).to_owned())
+        .collect();
+    let files_removed = from_files
+        .keys()
+        .filter(|path| !to_files.contains_key(**path))
+        .map(|path| (*path).to_owned())
+        .collect();
+    let files_modified = to_files
+        .iter()
+        .filter(|(path, file)| from_files.get(**path).is_some_and(|old| *old != **file))
+        .map(|(path, _)| (*path).to_owned())
+        .collect();
+    RevisionDiffV1 {
+        schema: "reporch.revision-diff.v1",
+        project_id: from.project_id,
+        from_commit_id: from.id,
+        to_commit_id: to.id,
+        metadata_changed,
+        files_added,
+        files_modified,
+        files_removed,
+    }
 }
 
 pub async fn list_members_operation(options: &MemberScopeOptions) -> Result<ProjectMembershipPage> {
