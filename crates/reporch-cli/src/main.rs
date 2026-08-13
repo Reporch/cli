@@ -606,13 +606,13 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Check => check_project(output),
         Command::Statement(options) => authoring::statement(options, output),
         Command::Test(options) => authoring::tests(options, output, no_input),
-        Command::Generator(options) => authoring::generator(options, output),
-        Command::Validator(options) => authoring::validator(options, output),
-        Command::Checker(options) => authoring::checker(options, output),
+        Command::Generator(options) => authoring::generator(options, output).await,
+        Command::Validator(options) => authoring::validator(options, output).await,
+        Command::Checker(options) => authoring::checker(options, output).await,
         Command::Solution(options) => authoring::solution(options, output),
-        Command::Interactor(options) => authoring::interactor(options, output),
-        Command::Grader(options) => authoring::grader(options, output),
-        Command::Output(options) => authoring::output_submission(options, output),
+        Command::Interactor(options) => authoring::interactor(options, output).await,
+        Command::Grader(options) => authoring::grader(options, output).await,
+        Command::Output(options) => authoring::output_submission(options, output).await,
         Command::Verify(options) => {
             let validation = studio_remote::validate_operation(&options).await?;
             if validation.detail.as_ref().is_some_and(|detail| {

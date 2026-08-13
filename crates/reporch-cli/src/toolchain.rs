@@ -105,6 +105,51 @@ pub async fn install(id: &str, runtime: OciRuntime) -> Result<ToolchainInspectio
     Ok(installed)
 }
 
+/// Resolve a language to one exact entry from the signed embedded catalog.
+/// An explicit ID is still checked against the requested language so a project
+/// cannot silently run source code with an unrelated image.
+pub fn resolve_for_language(explicit_id: Option<&str>, language: &str) -> Result<ToolchainEntryV1> {
+    let language = normalize_language(language)?;
+    let index = verified_index()?;
+    let entry = match explicit_id {
+        Some(id) => index
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id.trim())
+            .with_context(|| format!("unknown signed toolchain: {}", id.trim()))?,
+        None => index
+            .entries
+            .into_iter()
+            .find(|entry| entry.language == language)
+            .with_context(|| format!("no signed toolchain is available for {language}"))?,
+    };
+    ensure!(
+        entry.language == language,
+        "signed toolchain {} is for {}, not {language}",
+        entry.id,
+        entry.language
+    );
+    Ok(entry)
+}
+
+fn normalize_language(language: &str) -> Result<&'static str> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "python" | "python3" | "py" => Ok("python"),
+        "pypy" | "pypy3" => Ok("pypy"),
+        "c" | "c11" | "gnu11" | "gnu17" => Ok("c"),
+        "cpp" | "c++" | "cpp17" | "cpp20" | "gnu++17" | "gnu++20" => Ok("cpp"),
+        "java" => Ok("java"),
+        "rust" | "rust2021" | "rust2024" => Ok("rust"),
+        "javascript" | "js" | "node" | "nodejs" => Ok("javascript"),
+        "csharp" | "c#" | "cs" | "dotnet" => Ok("csharp"),
+        "php" => Ok("php"),
+        "r" => Ok("r"),
+        "bash" | "sh" | "shell" => Ok("bash"),
+        "swift" => Ok("swift"),
+        _ => bail!("unsupported local toolchain language: {language}"),
+    }
+}
+
 fn verified_index() -> Result<ToolchainIndexV1> {
     ensure!(
         !INDEX_BYTES.is_empty() && INDEX_BYTES.len() <= MAX_INDEX_BYTES,

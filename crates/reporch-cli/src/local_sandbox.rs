@@ -48,6 +48,8 @@ pub struct LocalSandboxResult {
     pub duration_ms: u128,
     pub stdout: String,
     pub stderr: String,
+    #[serde(skip)]
+    pub stdout_bytes: Vec<u8>,
 }
 
 pub async fn plan(options: &LocalSandboxOptions) -> Result<LocalSandboxPlan> {
@@ -105,14 +107,16 @@ pub async fn execute(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
             output_limit
         );
     }
+    let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
     Ok(LocalSandboxResult {
         schema: "reporch.local-sandbox-result.v1",
         runtime: plan.runtime.clone(),
         image: plan.image.clone(),
         exit_code: status.code().unwrap_or(128),
         duration_ms: started.elapsed().as_millis(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stdout: stdout_text,
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_bytes: stdout,
     })
 }
 
@@ -204,6 +208,8 @@ fn container_arguments(
         mount,
         "--tmpfs".into(),
         "/tmp:rw,noexec,nosuid,nodev,size=67108864".into(),
+        "--tmpfs".into(),
+        "/run/reporch:rw,exec,nosuid,nodev,size=268435456".into(),
         options.image.clone(),
     ];
     arguments.extend(options.command.iter().cloned());
