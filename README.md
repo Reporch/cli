@@ -144,6 +144,15 @@ reporch validation show --validation-run-id <uuid>
 reporch validation watch --validation-run-id <uuid>
 ```
 
+Immutable revisions can be compared or restored without overwriting the current
+working tree. Restore always creates a new checkout and downloads bytes from the
+commit-bound CAS descriptors, not from the mutable project file view:
+
+```bash
+reporch revision diff <from-commit> <to-commit>
+reporch revision restore <commit> --directory ../restored-problem
+```
+
 Downloads never overwrite an existing path and are installed only after the
 declared size and SHA-256 both match. Progress events can be resumed by durable
 cursor. Use JSONL for an unbounded stream, or bound JSON output for CI:

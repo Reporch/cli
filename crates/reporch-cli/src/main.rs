@@ -422,6 +422,8 @@ enum RevisionCommand {
     List(studio_remote::RevisionScopeOptions),
     Show(studio_remote::RevisionShowOptions),
     Diff(studio_remote::RevisionDiffOptions),
+    /// Restore an immutable revision into a new or empty checkout directory.
+    Restore(studio_remote::RevisionRestoreOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -963,6 +965,18 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     + diff.files_removed.len();
                 output.emit("revision diff", &diff, &format!("{changes} change(s)"))
             }
+            RevisionCommand::Restore(options) => {
+                let restored = studio_remote::restore_revision_operation(&options).await?;
+                output.emit(
+                    "revision restore",
+                    &restored,
+                    &format!(
+                        "Restored revision {} into {}",
+                        restored.commit_id,
+                        restored.directory.display()
+                    ),
+                )
+            }
         },
         Command::Review { command } => match command {
             ReviewCommand::Submit(options) => {
@@ -1238,6 +1252,7 @@ fn command_name(command: &Command) -> &'static str {
             RevisionCommand::List(_) => "revision list",
             RevisionCommand::Show(_) => "revision show",
             RevisionCommand::Diff(_) => "revision diff",
+            RevisionCommand::Restore(_) => "revision restore",
         },
         Command::Review { command } => match command {
             ReviewCommand::Submit(_) => "review submit",

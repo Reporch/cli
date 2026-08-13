@@ -18,18 +18,17 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use studio_contracts::{
     ApiErrorResponse, BeginFileUploadRequest, BeginFileUploadResponse, CommitDetailResponse,
-    CommitPage, CommitResponse, CommitWorkingCopyRequestV1, CreateCommitRequest,
-    CreateProjectRequest, CreateReleaseRequest, CreateReviewDecisionRequest, CreateWaiverRequest,
-    EVENT_SCHEMA_V1, EnqueueValidationRequest, EventEnvelopeV1, FileDownloadResponse,
-    FileEntryPage, FileUploadResponse, FileUploadStatus, FileUploadStrategyV1,
-    IdentityDirectoryPageV1, ProjectMembershipPage, ProjectMembershipResponse, ProjectPage,
-    ProjectResponse, PublicationResponse, PublicationStatus, QuotaStatusV1,
-    ReleaseDownloadResponse, ReleasePage, ReleaseResponse, ReleaseStatus, ReviewPage,
-    ReviewPoolPageV1, ReviewPoolRequestResponseV1, ReviewResponse, RevokeWaiverRequest,
-    StudioCapabilitiesV1, SubmitReviewRequest, UpdateWorkingCopyRequestV1,
-    UpsertProjectMembershipRequest, ValidationRunDetailResponse, ValidationRunPage,
-    ValidationRunResponse, ValidationRunStatus, WaiverPage, WaiverResponse, WorkingCopyReadinessV1,
-    WorkingCopyV1,
+    CommitFileDownloadResponse, CommitPage, CommitResponse, CommitWorkingCopyRequestV1,
+    CreateCommitRequest, CreateProjectRequest, CreateReleaseRequest, CreateReviewDecisionRequest,
+    CreateWaiverRequest, EVENT_SCHEMA_V1, EnqueueValidationRequest, EventEnvelopeV1, FileEntryPage,
+    FileUploadResponse, FileUploadStatus, FileUploadStrategyV1, IdentityDirectoryPageV1,
+    ProjectMembershipPage, ProjectMembershipResponse, ProjectPage, ProjectResponse,
+    PublicationResponse, PublicationStatus, QuotaStatusV1, ReleaseDownloadResponse, ReleasePage,
+    ReleaseResponse, ReleaseStatus, ReviewPage, ReviewPoolPageV1, ReviewPoolRequestResponseV1,
+    ReviewResponse, RevokeWaiverRequest, StudioCapabilitiesV1, SubmitReviewRequest,
+    UpdateWorkingCopyRequestV1, UpsertProjectMembershipRequest, ValidationRunDetailResponse,
+    ValidationRunPage, ValidationRunResponse, ValidationRunStatus, WaiverPage, WaiverResponse,
+    WorkingCopyReadinessV1, WorkingCopyV1,
 };
 use studio_core::{
     ManifestFile, ProblemType, ProjectRole, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
@@ -530,6 +529,17 @@ pub struct RevisionDiffOptions {
     pub to: Uuid,
 }
 
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevisionRestoreOptions {
+    #[command(flatten)]
+    pub scope: RevisionScopeOptions,
+    /// Immutable commit to restore.
+    pub commit_id: Uuid,
+    /// New or empty directory for the restored checkout. Existing work is never overwritten.
+    #[arg(long)]
+    pub directory: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RevisionDiffV1 {
     pub schema: &'static str,
@@ -696,8 +706,15 @@ impl StudioApiClient {
         .await
     }
 
-    async fn file_download(&self, project_id: Uuid, path: &str) -> Result<FileDownloadResponse> {
-        let mut url = self.endpoint(&format!("projects/{project_id}/file-download"))?;
+    async fn commit_file_download(
+        &self,
+        project_id: Uuid,
+        commit_id: Uuid,
+        path: &str,
+    ) -> Result<CommitFileDownloadResponse> {
+        let mut url = self.endpoint(&format!(
+            "projects/{project_id}/commits/{commit_id}/file-download"
+        ))?;
         url.query_pairs_mut().append_pair("path", path);
         self.json(self.http.get(url)).await
     }
@@ -1669,6 +1686,19 @@ pub async fn diff_revisions_operation(options: &RevisionDiffOptions) -> Result<R
     Ok(diff_revisions(&from, &to))
 }
 
+pub async fn restore_revision_operation(
+    options: &RevisionRestoreOptions,
+) -> Result<PullOperationResult> {
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    pull_operation(&PullOptions {
+        connection: options.scope.connection.clone(),
+        project_id,
+        commit_id: Some(options.commit_id),
+        directory: options.directory.clone(),
+    })
+    .await
+}
+
 fn diff_revisions(from: &CommitDetailResponse, to: &CommitDetailResponse) -> RevisionDiffV1 {
     let from_spec = reporch_format::AuthoringSpecV1::from_manifest(&from.manifest);
     let to_spec = reporch_format::AuthoringSpecV1::from_manifest(&to.manifest);
@@ -1931,8 +1961,10 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         .prefix(".reporch-pull-")
         .tempdir_in(parent)?;
     for file in &commit.manifest.files {
-        let descriptor = client.file_download(options.project_id, &file.path).await?;
-        verify_file_descriptor(file, &descriptor)?;
+        let descriptor = client
+            .commit_file_download(options.project_id, commit_id, &file.path)
+            .await?;
+        verify_commit_file_descriptor(commit_id, file, &descriptor)?;
         let output = staging.path().join(&file.path);
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
@@ -3327,10 +3359,15 @@ async fn verify_local_file(source: &Path, expected: &ManifestFile) -> Result<()>
     Ok(())
 }
 
-fn verify_file_descriptor(
+fn verify_commit_file_descriptor(
+    commit_id: Uuid,
     expected: &ManifestFile,
-    descriptor: &FileDownloadResponse,
+    descriptor: &CommitFileDownloadResponse,
 ) -> Result<()> {
+    ensure!(
+        descriptor.commit_id == commit_id,
+        "file download commit mismatch"
+    );
     let actual = &descriptor.file;
     ensure!(actual.path == expected.path, "file download path mismatch");
     ensure!(
@@ -3697,6 +3734,32 @@ mod tests {
             assert!(parse_event_cursor(invalid).is_err(), "accepted {invalid:?}");
         }
         assert_eq!(parse_event_cursor("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn immutable_file_download_is_bound_to_the_requested_commit() {
+        let commit_id = Uuid::now_v7();
+        let file = ManifestFile {
+            path: "statement.md".into(),
+            sha256: Sha256Digest::from_bytes(b"statement"),
+            size_bytes: 9,
+            media_type: "text/markdown".into(),
+            executable: false,
+        };
+        let descriptor = CommitFileDownloadResponse {
+            commit_id,
+            file: file.clone(),
+            download_url: "https://storage.example.test/cas".into(),
+            expires_at: Utc::now(),
+        };
+        verify_commit_file_descriptor(commit_id, &file, &descriptor).unwrap();
+        assert!(
+            verify_commit_file_descriptor(Uuid::now_v7(), &file, &descriptor).is_err(),
+            "a descriptor for another immutable commit must fail closed"
+        );
+        let mut changed = descriptor;
+        changed.file.sha256 = Sha256Digest::from_bytes(b"changed");
+        assert!(verify_commit_file_descriptor(commit_id, &file, &changed).is_err());
     }
 
     #[tokio::test]

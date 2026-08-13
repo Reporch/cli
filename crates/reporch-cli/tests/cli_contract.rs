@@ -366,3 +366,16 @@ fn validation_history_is_a_first_class_linked_project_command() {
     assert!(stdout.contains("--project-id"), "{stdout}");
     assert!(!stdout.contains("--validation-run-id"), "{stdout}");
 }
+
+#[test]
+fn revision_restore_requires_a_non_overwriting_checkout_directory() {
+    let output = reporch()
+        .args(["revision", "restore", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--directory"), "{stdout}");
+    assert!(stdout.contains("<COMMIT_ID>"), "{stdout}");
+    assert!(!stdout.contains("--force"), "{stdout}");
+}

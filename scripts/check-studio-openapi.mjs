@@ -50,5 +50,8 @@ assert.ok(releases?.post, "Studio OpenAPI lacks release creation");
 const validations = document.paths?.["/api/v1/projects/{project_id}/validations"];
 assert.ok(validations?.get, "Studio OpenAPI lacks validation listing");
 assert.ok(validations?.post, "Studio OpenAPI lacks validation creation");
+const commitDownload =
+  document.paths?.["/api/v1/projects/{project_id}/commits/{commit_id}/file-download"];
+assert.ok(commitDownload?.get, "Studio OpenAPI lacks immutable commit file download");
 
 console.log(`Studio OpenAPI lock passed: ${actualChecksum}`);
