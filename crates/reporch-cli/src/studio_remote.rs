@@ -27,8 +27,9 @@ use studio_contracts::{
     ReleaseDownloadResponse, ReleasePage, ReleaseResponse, ReleaseStatus, ReviewPage,
     ReviewPoolPageV1, ReviewPoolRequestResponseV1, ReviewResponse, RevokeWaiverRequest,
     StudioCapabilitiesV1, SubmitReviewRequest, UpdateWorkingCopyRequestV1,
-    UpsertProjectMembershipRequest, ValidationRunDetailResponse, ValidationRunResponse,
-    ValidationRunStatus, WaiverPage, WaiverResponse, WorkingCopyReadinessV1, WorkingCopyV1,
+    UpsertProjectMembershipRequest, ValidationRunDetailResponse, ValidationRunPage,
+    ValidationRunResponse, ValidationRunStatus, WaiverPage, WaiverResponse, WorkingCopyReadinessV1,
+    WorkingCopyV1,
 };
 use studio_core::{
     ManifestFile, ProblemType, ProjectRole, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
@@ -238,6 +239,14 @@ pub struct ValidationInspectOptions {
     pub validation_run_id: Option<Uuid>,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
     pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ValidationScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -977,6 +986,20 @@ impl StudioApiClient {
 
     async fn list_releases(&self, project_id: Uuid, cursor: Option<Uuid>) -> Result<ReleasePage> {
         let mut url = self.endpoint(&format!("projects/{project_id}/releases"))?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        self.json(self.http.get(url)).await
+    }
+
+    async fn list_validations(
+        &self,
+        project_id: Uuid,
+        cursor: Option<Uuid>,
+    ) -> Result<ValidationRunPage> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/validations"))?;
         url.query_pairs_mut().append_pair("limit", "100");
         if let Some(cursor) = cursor {
             url.query_pairs_mut()
@@ -2318,6 +2341,38 @@ pub async fn validation_show_operation(
         .await?
         .get_validation(project_id, validation_id)
         .await
+}
+
+pub async fn list_validations_operation(
+    options: &ValidationScopeOptions,
+) -> Result<ValidationRunPage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_validations(project_id, cursor).await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|validation| validation.project_id == project_id),
+            "Studio returned a validation from another project"
+        );
+        items.extend(page.items);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(ValidationRunPage {
+                items,
+                next_cursor: None,
+            });
+        };
+        ensure!(
+            seen.insert(next_cursor),
+            "Studio returned a repeated validation cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio validation listing exceeded the 10,000-item native client bound")
 }
 
 pub async fn validation_watch_operation(

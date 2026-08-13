@@ -135,6 +135,15 @@ reporch release show --release-id <uuid>
 reporch release download --release-id <uuid> --output problem.zip
 ```
 
+Official validation history is available without copying a project UUID from
+Studio when the current directory is linked:
+
+```bash
+reporch validation list
+reporch validation show --validation-run-id <uuid>
+reporch validation watch --validation-run-id <uuid>
+```
+
 Downloads never overwrite an existing path and are installed only after the
 declared size and SHA-256 both match. Progress events can be resumed by durable
 cursor. Use JSONL for an unbounded stream, or bound JSON output for CI:

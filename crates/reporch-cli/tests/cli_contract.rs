@@ -354,3 +354,15 @@ fn publication_is_fail_closed_without_interactive_confirmation() {
     assert_eq!(value["error_code"], "input.invalid");
     assert!(value["message"].as_str().unwrap().contains("--yes"));
 }
+
+#[test]
+fn validation_history_is_a_first_class_linked_project_command() {
+    let output = reporch()
+        .args(["validation", "list", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--project-id"), "{stdout}");
+    assert!(!stdout.contains("--validation-run-id"), "{stdout}");
+}

@@ -398,6 +398,8 @@ enum PublicationCommand {
 
 #[derive(Debug, Subcommand)]
 enum ValidationCommand {
+    /// List official validation runs for the linked project.
+    List(studio_remote::ValidationScopeOptions),
     Show(studio_remote::ValidationInspectOptions),
     Watch(studio_remote::ValidationInspectOptions),
 }
@@ -851,6 +853,14 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
         },
         Command::Validation { command } => match command {
+            ValidationCommand::List(options) => {
+                let validations = studio_remote::list_validations_operation(&options).await?;
+                output.emit(
+                    "validation list",
+                    &validations,
+                    &format!("{} validation(s)", validations.items.len()),
+                )
+            }
             ValidationCommand::Show(options) => {
                 let validation = studio_remote::validation_show_operation(&options).await?;
                 output.emit(
@@ -1214,6 +1224,7 @@ fn command_name(command: &Command) -> &'static str {
             PublicationCommand::Status(_) => "publication status",
         },
         Command::Validation { command } => match command {
+            ValidationCommand::List(_) => "validation list",
             ValidationCommand::Show(_) => "validation show",
             ValidationCommand::Watch(_) => "validation watch",
         },

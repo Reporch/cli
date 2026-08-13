@@ -830,6 +830,25 @@ pub struct ValidationRunResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ValidationRunSummaryResponse {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub commit_id: Uuid,
+    pub status: ValidationRunStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ValidationRunPage {
+    pub items: Vec<ValidationRunSummaryResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ValidationRunDetailResponse {
     pub id: Uuid,
     pub project_id: Uuid,
