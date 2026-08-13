@@ -126,6 +126,19 @@ silently discarding them. After an approved release is built, publication is
 always explicit: `reporch publication publish` asks for confirmation, or
 requires `--yes` in CI.
 
+Shell completion scripts are generated from the exact installed command tree:
+
+```bash
+# zsh
+reporch completion zsh > "${fpath[1]}/_reporch"
+
+# bash
+reporch completion bash > ~/.local/share/bash-completion/completions/reporch
+
+# fish
+reporch completion fish > ~/.config/fish/completions/reporch.fish
+```
+
 Immutable releases have a separate, scriptable lifecycle:
 
 ```bash

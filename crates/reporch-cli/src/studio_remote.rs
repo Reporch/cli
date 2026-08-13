@@ -454,7 +454,7 @@ pub struct UpsertMemberOptions {
     #[command(flatten)]
     pub scope: MemberScopeOptions,
     #[arg(long)]
-    pub issuer: String,
+    pub member_issuer: String,
     #[arg(long)]
     pub subject: String,
     #[arg(long, value_enum)]
@@ -468,7 +468,7 @@ pub struct RemoveMemberOptions {
     #[command(flatten)]
     pub scope: MemberScopeOptions,
     #[arg(long)]
-    pub issuer: String,
+    pub member_issuer: String,
     #[arg(long)]
     pub subject: String,
 }
@@ -1783,7 +1783,10 @@ pub async fn search_members_operation(
 pub async fn upsert_member_operation(
     options: &UpsertMemberOptions,
 ) -> Result<ProjectMembershipResponse> {
-    ensure!(!options.issuer.trim().is_empty(), "issuer cannot be empty");
+    ensure!(
+        !options.member_issuer.trim().is_empty(),
+        "member issuer cannot be empty"
+    );
     ensure!(
         !options.subject.trim().is_empty(),
         "subject cannot be empty"
@@ -1799,7 +1802,7 @@ pub async fn upsert_member_operation(
             project_id,
             &UpsertProjectMembershipRequest {
                 member: SubjectRef {
-                    issuer: options.issuer.trim().into(),
+                    issuer: options.member_issuer.trim().into(),
                     subject: options.subject.trim().into(),
                 },
                 role: options.role.into(),
@@ -1810,7 +1813,10 @@ pub async fn upsert_member_operation(
 }
 
 pub async fn remove_member_operation(options: &RemoveMemberOptions) -> Result<serde_json::Value> {
-    ensure!(!options.issuer.trim().is_empty(), "issuer cannot be empty");
+    ensure!(
+        !options.member_issuer.trim().is_empty(),
+        "member issuer cannot be empty"
+    );
     ensure!(
         !options.subject.trim().is_empty(),
         "subject cannot be empty"
@@ -1818,11 +1824,15 @@ pub async fn remove_member_operation(options: &RemoveMemberOptions) -> Result<se
     let project_id = resolve_local_project_id(options.scope.project_id)?;
     StudioApiClient::connect(&options.scope.connection)
         .await?
-        .remove_member(project_id, options.issuer.trim(), options.subject.trim())
+        .remove_member(
+            project_id,
+            options.member_issuer.trim(),
+            options.subject.trim(),
+        )
         .await?;
     Ok(serde_json::json!({
         "project_id": project_id,
-        "issuer": options.issuer.trim(),
+        "issuer": options.member_issuer.trim(),
         "subject": options.subject.trim(),
         "removed": true,
     }))

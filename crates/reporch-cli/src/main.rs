@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{ArgAction, Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use cli_output::{CliOutput, ColorMode, OutputFormat};
 use reporch_cli::local_sandbox::{LocalSandboxOptions, OciRuntime};
 use reporch_cli::studio_remote;
@@ -107,6 +107,11 @@ enum Command {
     },
     /// Inspect Studio API compatibility and the active account's quota.
     Doctor(studio_remote::RemoteConnectionOptions),
+    /// Generate a shell completion script on stdout.
+    Completion {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
     /// Inspect validation execution quota.
     Quota {
         #[command(subcommand)]
@@ -464,6 +469,27 @@ impl From<CompatibilityProfile> for PackageProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
+    Elvish,
+}
+
+impl From<CompletionShell> for clap_complete::Shell {
+    fn from(value: CompletionShell) -> Self {
+        match value {
+            CompletionShell::Bash => Self::Bash,
+            CompletionShell::Zsh => Self::Zsh,
+            CompletionShell::Fish => Self::Fish,
+            CompletionShell::PowerShell => Self::PowerShell,
+            CompletionShell::Elvish => Self::Elvish,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let arguments = match Args::try_parse() {
@@ -782,6 +808,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 "Authentication, API compatibility, and quota are healthy",
             )
         }
+        Command::Completion { shell } => generate_completion(shell, output),
         Command::Quota { command } => match command {
             QuotaCommand::Show(connection) => {
                 let quota = studio_remote::quota_operation(&connection).await?;
@@ -1153,6 +1180,18 @@ fn check_project(output: &CliOutput) -> Result<()> {
     )
 }
 
+fn generate_completion(shell: CompletionShell, output: &CliOutput) -> Result<()> {
+    output.ensure_human_format("completion")?;
+    let mut command = Args::command();
+    clap_complete::generate(
+        clap_complete::Shell::from(shell),
+        &mut command,
+        "reporch",
+        &mut std::io::stdout(),
+    );
+    Ok(())
+}
+
 fn raw_arguments_request_json() -> bool {
     let arguments: Vec<_> = std::env::args_os().collect();
     arguments.iter().enumerate().any(|(index, argument)| {
@@ -1226,6 +1265,7 @@ fn command_name(command: &Command) -> &'static str {
             MemberCommand::Remove(_) => "member remove",
         },
         Command::Doctor(_) => "doctor",
+        Command::Completion { .. } => "completion",
         Command::Quota { .. } => "quota show",
         Command::Release { command } => match command {
             ReleaseCommand::Build(_) => "release build",

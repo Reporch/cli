@@ -134,6 +134,14 @@ impl CliOutput {
         );
         Ok(())
     }
+
+    pub fn ensure_human_format(&self, command: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.format == OutputFormat::Human,
+            "{command} writes a raw shell script and requires --format human"
+        );
+        Ok(())
+    }
 }
 
 struct ClassifiedError {
@@ -287,6 +295,20 @@ mod tests {
             CliOutput::new(OutputFormat::Jsonl, false, ColorMode::Never)
                 .ensure_streaming_format()
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn raw_artifacts_require_human_output() {
+        assert!(
+            CliOutput::new(OutputFormat::Human, false, ColorMode::Never)
+                .ensure_human_format("completion")
+                .is_ok()
+        );
+        assert!(
+            CliOutput::new(OutputFormat::Json, false, ColorMode::Never)
+                .ensure_human_format("completion")
+                .is_err()
         );
     }
 }

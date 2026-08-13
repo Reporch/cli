@@ -379,3 +379,25 @@ fn revision_restore_requires_a_non_overwriting_checkout_directory() {
     assert!(stdout.contains("<COMMIT_ID>"), "{stdout}");
     assert!(!stdout.contains("--force"), "{stdout}");
 }
+
+#[test]
+fn completion_scripts_cover_every_supported_shell_and_reject_json_wrapping() {
+    for shell in ["bash", "zsh", "fish", "power-shell", "elvish"] {
+        let output = reporch().args(["completion", shell]).output().unwrap();
+        assert!(output.status.success(), "{shell}: {output:?}");
+        assert!(!output.stdout.is_empty(), "{shell}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("reporch"),
+            "{shell}"
+        );
+    }
+
+    let output = reporch()
+        .args(["--format", "json", "completion", "zsh"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error_code"], "input.invalid");
+}
