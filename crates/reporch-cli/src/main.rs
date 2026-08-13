@@ -40,7 +40,7 @@ struct Args {
     /// Resolve relative paths from this directory.
     #[arg(long, global = true, default_value = ".")]
     cwd: PathBuf,
-    /// Named configuration profile.
+    /// Named connection profile, or a package format for package compatibility commands.
     #[arg(long, global = true, env = "REPORCH_PROFILE")]
     profile: Option<String>,
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
@@ -308,16 +308,12 @@ enum PackageCommand {
     Export {
         manifest: PathBuf,
         output: PathBuf,
-        #[arg(long, value_enum)]
-        profile: CompatibilityProfile,
         #[arg(long)]
         source_root: Option<PathBuf>,
     },
     Import {
         input: PathBuf,
         directory: PathBuf,
-        #[arg(long, value_enum)]
-        profile: CompatibilityProfile,
     },
 }
 
@@ -471,8 +467,6 @@ enum ManifestCommand {
     },
     Compatibility {
         path: PathBuf,
-        #[arg(long, value_enum)]
-        profile: CompatibilityProfile,
         #[arg(long)]
         strict: bool,
     },
@@ -597,6 +591,15 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
     std::env::set_current_dir(&cwd)
         .with_context(|| format!("change working directory to {}", cwd.display()))?;
     let _configuration = (profile, no_input, verbose, output.colors_enabled());
+    let package_profile = profile_config::package_profile_argument()
+        .map(|value| {
+            CompatibilityProfile::from_str(&value, true).map_err(|_| {
+                anyhow::anyhow!(
+                    "unsupported package profile {value:?}; expected one of reporch-native, icpc202509, icpc-legacy, polygon-compatible, or domjudge-zip"
+                )
+            })
+        })
+        .transpose()?;
 
     match command {
         Command::Migrate(options) => migrate(&options, yes, output),
@@ -1137,30 +1140,31 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Manifest { command } => match command {
             ManifestCommand::Validate { path } => validate(&path, false, output),
             ManifestCommand::Digest { path } => validate(&path, true, output),
-            ManifestCommand::Compatibility {
-                path,
-                profile,
+            ManifestCommand::Compatibility { path, strict } => compatibility(
+                &path,
+                required_package_profile(package_profile)?,
                 strict,
-            } => compatibility(&path, profile.into(), strict, output),
+                output,
+            ),
         },
         Command::Package { command } => match command {
             PackageCommand::Export {
                 manifest,
                 output: archive,
-                profile,
                 source_root,
             } => export_package(
                 &manifest,
                 &archive,
-                profile.into(),
+                required_package_profile(package_profile)?,
                 source_root.as_deref(),
                 output,
             ),
-            PackageCommand::Import {
-                input,
-                directory,
-                profile,
-            } => import_package(&input, &directory, profile.into(), output),
+            PackageCommand::Import { input, directory } => import_package(
+                &input,
+                &directory,
+                required_package_profile(package_profile)?,
+                output,
+            ),
         },
         Command::Sandbox { command } => match command {
             SandboxCommand::Plan(options) => {
@@ -1214,6 +1218,12 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         },
         Command::QualificationSelfTest => qualification_self_test().await,
     }
+}
+
+fn required_package_profile(profile: Option<CompatibilityProfile>) -> Result<PackageProfile> {
+    profile
+        .map(Into::into)
+        .context("--profile is required for package compatibility, import, and export commands")
 }
 
 fn migrate(options: &MigrateOptions, yes: bool, output: &CliOutput) -> Result<()> {
