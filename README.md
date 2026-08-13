@@ -29,27 +29,33 @@ Supported systems:
 reporch auth login
 reporch project create --title "My problem" --directory ./my-problem
 cd my-problem
-reporch manifest validate reporch.problem.json
-reporch project push --manifest reporch.problem.json --message "Initial version"
-reporch project validate --project-id <project-id> --commit-id <commit-id>
-reporch review submit \
-  --project-id <project-id> \
-  --commit-id <commit-id> \
-  --validation-run-id <validation-run-id>
+reporch statement add --locale ko --path statement.md --title "My problem"
+reporch test                         # interactive, line-oriented guide
+reporch solution add --name reference --source solutions/reference.cpp \
+  --language cpp --expected accepted
+reporch check                        # completely offline
+reporch submit                       # push, Studio verification, review request
 ```
 
-An independent project reviewer completes the digest-bound approval before a
-release package can be built:
+`reporch.yaml` is the human-editable source. `reporch.problem.json` is generated
+only after the server has assigned the immutable commit ID and bound every file
+hash. UUIDs, SHA-256 values, and manifest internals never need to be entered by
+the author.
+
+The same flow is deterministic in CI:
 
 ```bash
-reporch review list --project-id <project-id>
-reporch review approve --project-id <project-id> --review-id <review-id>
-reporch project package \
-  --project-id <project-id> \
-  --commit-id <commit-id> \
-  --validation-run-id <validation-run-id> \
-  --output problem.zip
+reporch --format json --no-input check
+reporch --format json --no-input project push --message "$GIT_SHA"
+reporch --format json --no-input verify
+reporch --format json --no-input review submit
 ```
+
+Every JSON result uses `reporch.cli-result.v1`; every JSON error uses
+`reporch.cli-error.v1`. Stable exit codes distinguish domain failure (`1`),
+invalid input (`2`), revision conflict (`3`), authentication (`4`), policy or
+quota denial (`5`), retryable infrastructure failure (`6`), and cancellation
+(`7`).
 
 The server rejects self-approval: the commit author and final reviewer must be
 different Reporch subjects, and every approval is bound to the exact commit,
@@ -65,7 +71,22 @@ reporch project init \
 ```
 
 The available problem types are `standard`, `scored`, `interactive`,
-`output-only`, `library`, and `grader`.
+`output-only`, `library`, and `grader`. Authoring commands cover statements,
+manual tests and groups, deterministic generators, validator/checker unit
+cases, expected solution verdicts and score ranges, interactors, graders, and
+output-only mappings. Every edit validates and atomically replaces
+`reporch.yaml`.
+
+## Migrate an existing checkout
+
+```bash
+reporch migrate                 # previews and confirms in a TTY
+reporch --no-input --yes migrate # required form in CI
+```
+
+Migration creates `reporch.problem.pre-1.0.json` once, writes `reporch.yaml`
+atomically, and checks that the generated immutable manifest has the same
+meaning and file hashes. The backup is never overwritten.
 
 ## Package compatibility
 
@@ -80,9 +101,11 @@ reporch package import polygon-package.zip ./imported \
   --profile polygon-compatible
 ```
 
-Run `reporch <command> --help` for every option. The native Reporch manifest is
-the source of truth; compatibility commands report unsupported or lossy
-features instead of silently discarding them.
+Run `reporch <command> --help` for every option. `reporch.yaml` is the source of
+truth; compatibility commands report unsupported or lossy features instead of
+silently discarding them. After an approved release is built, publication is
+always explicit: `reporch publication publish` asks for confirmation, or
+requires `--yes` in CI.
 
 ## Authentication and privacy
 

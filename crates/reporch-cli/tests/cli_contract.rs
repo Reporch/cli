@@ -49,6 +49,19 @@ fn json_parse_errors_use_exit_two_and_the_error_envelope() {
 }
 
 #[test]
+fn help_is_successful_and_never_emits_an_error_envelope() {
+    for arguments in [vec!["--help"], vec!["--format", "json", "--help"]] {
+        let output = reporch().args(arguments).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Usage: reporch"),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
 fn check_is_networkless_and_finds_the_project_from_a_child_directory() {
     let temporary = tempfile::tempdir().unwrap();
     let init = reporch()
@@ -133,4 +146,145 @@ fn migrate_requires_yes_in_ci_and_is_idempotent() {
             .join("reporch.problem.pre-1.0.json")
             .is_file()
     );
+}
+
+#[test]
+fn authoring_commands_update_yaml_atomically_and_keep_stable_ids() {
+    let temporary = tempfile::tempdir().unwrap();
+    let init = reporch()
+        .args([
+            "--quiet",
+            "project",
+            "init",
+            "--title",
+            "Authoring",
+            "--directory",
+            temporary.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+
+    let group = reporch()
+        .args([
+            "--cwd",
+            temporary.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "test",
+            "group",
+            "add",
+            "edge",
+            "--points",
+            "25",
+        ])
+        .output()
+        .unwrap();
+    assert!(group.status.success(), "{group:?}");
+
+    fs::write(temporary.path().join("tests/2.in"), b"0 0\n").unwrap();
+    fs::write(temporary.path().join("tests/2.ans"), b"0\n").unwrap();
+    let case = reporch()
+        .args([
+            "--cwd",
+            temporary.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "test",
+            "case",
+            "add",
+            "--name",
+            "zero",
+            "--input",
+            "tests/2.in",
+            "--answer",
+            "tests/2.ans",
+            "--group",
+            "edge",
+        ])
+        .output()
+        .unwrap();
+    assert!(case.status.success(), "{case:?}");
+    let value: Value = serde_json::from_slice(&case.stdout).unwrap();
+    let id = value["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|test| test["name"] == "zero")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let list = reporch()
+        .args([
+            "--cwd",
+            temporary.path().join("tests").to_str().unwrap(),
+            "--format",
+            "json",
+            "test",
+            "case",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{list:?}");
+    let value: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|test| test["id"] == id)
+    );
+
+    let before = fs::read(temporary.path().join("reporch.yaml")).unwrap();
+    let rejected = reporch()
+        .args([
+            "--cwd",
+            temporary.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "test",
+            "case",
+            "add",
+            "--name",
+            "bad-group",
+            "--input",
+            "tests/2.in",
+            "--group",
+            "missing",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(2), "{rejected:?}");
+    assert_eq!(
+        fs::read(temporary.path().join("reporch.yaml")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn publication_is_fail_closed_without_interactive_confirmation() {
+    let project_id = uuid::Uuid::now_v7().to_string();
+    let release_id = uuid::Uuid::now_v7().to_string();
+    let output = reporch()
+        .args([
+            "--format",
+            "json",
+            "--no-input",
+            "publication",
+            "publish",
+            "--project-id",
+            &project_id,
+            "--release-id",
+            &release_id,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error_code"], "input.invalid");
+    assert!(value["message"].as_str().unwrap().contains("--yes"));
 }

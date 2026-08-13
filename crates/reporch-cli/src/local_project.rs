@@ -320,6 +320,42 @@ pub fn write_authoring_spec_atomic(directory: &Path, spec: &AuthoringSpecV1) -> 
     Ok(path)
 }
 
+pub fn update_authoring_spec<F>(directory: &Path, update: F) -> Result<AuthoringSpecV1>
+where
+    F: FnOnce(&Path, &mut AuthoringSpecV1) -> Result<()>,
+{
+    let root = discover_project(directory)?;
+    let mut spec = read_authoring_spec(&root)?;
+    update(&root, &mut spec)?;
+    spec.validate_references()
+        .context("updated authoring spec contains invalid references")?;
+    write_authoring_spec_atomic(&root, &spec)?;
+    Ok(spec)
+}
+
+pub fn declare_project_file(
+    root: &Path,
+    spec: &mut AuthoringSpecV1,
+    path: &str,
+    media_type: &str,
+    executable: bool,
+) -> Result<()> {
+    let normalized = studio_core::normalize_relative_path(path)?;
+    let _ = hash_regular_project_file(root, &normalized)?;
+    if let Some(existing) = spec.files.iter_mut().find(|file| file.path == normalized) {
+        existing.media_type = media_type.to_owned();
+        existing.executable = executable;
+    } else {
+        spec.files.push(reporch_format::AuthoringFileV1 {
+            path: normalized,
+            media_type: media_type.to_owned(),
+            executable,
+        });
+        spec.files.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    Ok(())
+}
+
 pub fn write_generated_manifest_atomic(
     directory: &Path,
     manifest: &ReleaseManifestV1,

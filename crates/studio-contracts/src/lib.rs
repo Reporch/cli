@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
+use reporch_format::AuthoringSpecV1;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -12,6 +13,54 @@ use studio_core::{
 };
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+pub const WORKING_COPY_SCHEMA_V1: &str = "reporch.working-copy.v1";
+pub const STUDIO_CAPABILITIES_SCHEMA_V1: &str = "reporch.studio-capabilities.v1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkingCopyV1 {
+    pub schema: String,
+    pub project_id: Uuid,
+    pub revision: i64,
+    pub spec: AuthoringSpecV1,
+    pub updated_by: SubjectRef,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWorkingCopyRequestV1 {
+    pub spec: AuthoringSpecV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommitWorkingCopyRequestV1 {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkingCopyReadinessV1 {
+    pub schema: String,
+    pub project_id: Uuid,
+    pub working_copy_revision: i64,
+    pub can_commit: bool,
+    pub issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StudioCapabilitiesV1 {
+    pub schema: String,
+    pub api_versions: Vec<String>,
+    pub authoring_spec_versions: Vec<String>,
+    pub release_manifest_versions: Vec<String>,
+    pub minimum_cli_version: String,
+    pub maximum_cli_major: u64,
+}
 
 pub const EVENT_SCHEMA_V1: &str = "reporch.studio-event.v1";
 pub const ENTITLEMENT_EVENT_SCHEMA_V1: &str = "reporch.studio-entitlement-event.v1";

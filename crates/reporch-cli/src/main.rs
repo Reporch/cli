@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod authoring;
 mod cli_output;
 mod desktop_artifact;
 mod icpc_export;
@@ -68,6 +69,28 @@ enum Command {
     Migrate(MigrateOptions),
     /// Validate reporch.yaml and every declared local file without network access.
     Check,
+    /// Edit localized problem statements.
+    Statement(authoring::StatementOptions),
+    /// Add and organize tests. With no subcommand, starts a line-oriented guide.
+    Test(authoring::TestOptions),
+    /// Manage deterministic test generators.
+    Generator(authoring::GeneratorOptions),
+    /// Configure input validators and their unit cases.
+    Validator(authoring::ValidatorOptions),
+    /// Configure standard or custom checkers and unit cases.
+    Checker(authoring::CheckerOptions),
+    /// Manage expected solution verdicts and score ranges.
+    Solution(authoring::SolutionOptions),
+    /// Configure an interactive problem's interactor.
+    Interactor(authoring::InteractorOptions),
+    /// Configure a library or grader problem's grader.
+    Grader(authoring::GraderOptions),
+    /// Manage output-only expected submission mappings.
+    Output(authoring::OutputOptions),
+    /// Run official Studio validation for the current local commit.
+    Verify(studio_remote::ValidateOptions),
+    /// Check, push, validate, and submit the current project for review.
+    Submit(SubmitOptions),
     /// Authenticate this native client with Reporch without storing tokens in files.
     Auth {
         #[command(subcommand)]
@@ -76,6 +99,33 @@ enum Command {
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+    /// Manage project collaborators.
+    Member {
+        #[command(subcommand)]
+        command: MemberCommand,
+    },
+    /// Inspect Studio API compatibility and the active account's quota.
+    Doctor(studio_remote::RemoteConnectionOptions),
+    /// Inspect validation execution quota.
+    Quota {
+        #[command(subcommand)]
+        command: QuotaCommand,
+    },
+    /// Publish a verified immutable release or inspect publication status.
+    Publication {
+        #[command(subcommand)]
+        command: PublicationCommand,
+    },
+    /// Inspect or follow official Studio validation evidence.
+    Validation {
+        #[command(subcommand)]
+        command: ValidationCommand,
+    },
+    /// Manage evidence-bound validation waivers.
+    Waiver {
+        #[command(subcommand)]
+        command: WaiverCommand,
     },
     /// Submit and decide digest-bound Studio reviews.
     Review {
@@ -107,6 +157,16 @@ enum Command {
     },
     #[command(hide = true)]
     QualificationSelfTest,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct SubmitOptions {
+    #[command(flatten)]
+    connection: studio_remote::RemoteConnectionOptions,
+    #[arg(long, default_value = "CLI submit")]
+    message: String,
+    #[arg(long, default_value_t = 30 * 60)]
+    timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -235,6 +295,17 @@ enum ProjectCommand {
     List(studio_remote::RemoteConnectionOptions),
     /// Show the linked Studio project.
     Show(studio_remote::RemoteConnectionOptions),
+    /// Open the linked project in Reporch Studio.
+    Open {
+        #[arg(long)]
+        project_id: Option<Uuid>,
+        #[arg(
+            long,
+            env = "REPORCH_STUDIO_WEB_URL",
+            default_value = "https://studio.reporch.com"
+        )]
+        web_url: String,
+    },
     /// Show local linkage and dirty state.
     Status,
     /// Compare reporch.yaml and local files with the generated manifest.
@@ -261,6 +332,44 @@ enum ReviewCommand {
     Approve(studio_remote::ApproveReviewOptions),
     /// Request changes with an explanatory comment.
     RequestChanges(studio_remote::RequestChangesOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum MemberCommand {
+    /// Search Reporch identities eligible for this project.
+    Search(studio_remote::MemberSearchOptions),
+    /// List current project memberships.
+    List(studio_remote::MemberScopeOptions),
+    /// Add a project member.
+    Add(studio_remote::UpsertMemberOptions),
+    /// Change a project member's role.
+    Update(studio_remote::UpsertMemberOptions),
+    /// Remove a project member. Owners cannot be removed.
+    Remove(studio_remote::RemoveMemberOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum QuotaCommand {
+    Show(studio_remote::RemoteConnectionOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum PublicationCommand {
+    Publish(studio_remote::PublishOptions),
+    Status(studio_remote::PublicationOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum ValidationCommand {
+    Show(studio_remote::ValidationInspectOptions),
+    Watch(studio_remote::ValidationInspectOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum WaiverCommand {
+    List(studio_remote::WaiverScopeOptions),
+    Create(studio_remote::CreateWaiverOptions),
+    Revoke(studio_remote::RevokeWaiverOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,22 +415,27 @@ async fn main() {
     let arguments = match Args::try_parse() {
         Ok(arguments) => arguments,
         Err(error) => {
+            let exit_code = error.exit_code();
             if raw_arguments_request_json() {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "schema": "reporch.cli-error.v1",
-                        "command": "parse",
-                        "error_code": "input.invalid",
-                        "message": error.to_string(),
-                        "retryable": false,
-                        "trace_id": Uuid::now_v7(),
-                    })
-                );
+                if exit_code == 0 {
+                    print!("{error}");
+                } else {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "reporch.cli-error.v1",
+                            "command": "parse",
+                            "error_code": "input.invalid",
+                            "message": error.to_string(),
+                            "retryable": false,
+                            "trace_id": Uuid::now_v7(),
+                        })
+                    );
+                }
             } else {
                 let _ = error.print();
             }
-            std::process::exit(2);
+            std::process::exit(exit_code);
         }
     };
     let format = if arguments.json {
@@ -355,6 +469,30 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
     match command {
         Command::Migrate(options) => migrate(&options, yes, output),
         Command::Check => check_project(output),
+        Command::Statement(options) => authoring::statement(options, output),
+        Command::Test(options) => authoring::tests(options, output, no_input),
+        Command::Generator(options) => authoring::generator(options, output),
+        Command::Validator(options) => authoring::validator(options, output),
+        Command::Checker(options) => authoring::checker(options, output),
+        Command::Solution(options) => authoring::solution(options, output),
+        Command::Interactor(options) => authoring::interactor(options, output),
+        Command::Grader(options) => authoring::grader(options, output),
+        Command::Output(options) => authoring::output_submission(options, output),
+        Command::Verify(options) => {
+            let validation = studio_remote::validate_operation(&options).await?;
+            if validation.detail.as_ref().is_some_and(|detail| {
+                detail.status != studio_contracts::ValidationRunStatus::Passed
+            }) {
+                bail!("Studio validation did not pass");
+            }
+            let human = if validation.detail.is_some() {
+                "Studio verification passed"
+            } else {
+                "Studio verification queued"
+            };
+            output.emit("verify", &validation, human)
+        }
+        Command::Submit(options) => submit_project(options, output).await,
         Command::Auth { command } => match command {
             AuthCommand::Login(options) => auth_login(&options, output).await,
             AuthCommand::Status(options) => auth_status(&options, output).await,
@@ -427,6 +565,27 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     .find(|project| project.id == project_id)
                     .context("linked Studio project is no longer accessible")?;
                 output.emit("project show", &project, &project.title)
+            }
+            ProjectCommand::Open {
+                project_id,
+                web_url,
+            } => {
+                let project_id = studio_remote::current_project_id(project_id)?;
+                let mut url = url::Url::parse(&web_url).context("parse Studio web URL")?;
+                ensure!(url.scheme() == "https", "Studio web URL must use HTTPS");
+                ensure!(
+                    url.username().is_empty() && url.password().is_none(),
+                    "Studio web URL cannot contain credentials"
+                );
+                url.set_query(None);
+                url.set_fragment(None);
+                url.set_path(&format!("/projects/{project_id}"));
+                open::that(url.as_str()).context("open Studio project")?;
+                output.emit(
+                    "project open",
+                    &serde_json::json!({ "project_id": project_id, "url": url }),
+                    &format!("Opened project {project_id}"),
+                )
             }
             ProjectCommand::Status => {
                 let status = reporch_cli::local_project::project_status(Path::new("."))?;
@@ -511,6 +670,142 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                         package.release.id,
                         package.output.display()
                     ),
+                )
+            }
+        },
+        Command::Member { command } => match command {
+            MemberCommand::Search(options) => {
+                let identities = studio_remote::search_members_operation(&options).await?;
+                output.emit(
+                    "member search",
+                    &identities,
+                    &format!("{} matching account(s)", identities.items.len()),
+                )
+            }
+            MemberCommand::List(options) => {
+                let members = studio_remote::list_members_operation(&options).await?;
+                output.emit(
+                    "member list",
+                    &members,
+                    &format!("{} member(s)", members.items.len()),
+                )
+            }
+            MemberCommand::Add(options) => {
+                let member = studio_remote::upsert_member_operation(&options).await?;
+                output.emit(
+                    "member add",
+                    &member,
+                    &format!("Added {}", member.member.subject),
+                )
+            }
+            MemberCommand::Update(options) => {
+                let member = studio_remote::upsert_member_operation(&options).await?;
+                output.emit(
+                    "member update",
+                    &member,
+                    &format!("Updated {}", member.member.subject),
+                )
+            }
+            MemberCommand::Remove(options) => {
+                let removed = studio_remote::remove_member_operation(&options).await?;
+                output.emit("member remove", &removed, "Removed project member")
+            }
+        },
+        Command::Doctor(connection) => {
+            let capabilities = studio_remote::capabilities_operation(&connection).await?;
+            let quota = studio_remote::quota_operation(&connection).await?;
+            let local = reporch_cli::local_project::discover_project(Path::new("."))
+                .ok()
+                .and_then(|root| reporch_cli::local_project::project_status(&root).ok());
+            let data = serde_json::json!({
+                "capabilities": capabilities,
+                "quota": quota,
+                "local_project": local,
+            });
+            output.emit(
+                "doctor",
+                &data,
+                "Authentication, API compatibility, and quota are healthy",
+            )
+        }
+        Command::Quota { command } => match command {
+            QuotaCommand::Show(connection) => {
+                let quota = studio_remote::quota_operation(&connection).await?;
+                output.emit(
+                    "quota show",
+                    &quota,
+                    &format!(
+                        "{} CPU-ms remaining · {}/{} validations active",
+                        quota.monthly_cpu_remaining_millis,
+                        quota.active_validations,
+                        quota.concurrent_validation_limit
+                    ),
+                )
+            }
+        },
+        Command::Publication { command } => match command {
+            PublicationCommand::Publish(options) => {
+                confirm_publication(yes, no_input)?;
+                let publication = studio_remote::publish_operation(&options).await?;
+                output.emit(
+                    "publication publish",
+                    &publication,
+                    &format!("Publication status: {:?}", publication.status),
+                )
+            }
+            PublicationCommand::Status(options) => {
+                let publication = studio_remote::publication_status_operation(&options).await?;
+                output.emit(
+                    "publication status",
+                    &publication,
+                    &format!("Publication status: {:?}", publication.status),
+                )
+            }
+        },
+        Command::Validation { command } => match command {
+            ValidationCommand::Show(options) => {
+                let validation = studio_remote::validation_show_operation(&options).await?;
+                output.emit(
+                    "validation show",
+                    &validation,
+                    &format!("Validation {}: {:?}", validation.id, validation.status),
+                )
+            }
+            ValidationCommand::Watch(options) => {
+                let validation = studio_remote::validation_watch_operation(&options).await?;
+                if validation.status != studio_contracts::ValidationRunStatus::Passed {
+                    bail!("Studio validation did not pass");
+                }
+                output.emit(
+                    "validation watch",
+                    &validation,
+                    &format!("Validation {} passed", validation.id),
+                )
+            }
+        },
+        Command::Waiver { command } => match command {
+            WaiverCommand::List(options) => {
+                let waivers = studio_remote::list_waivers_operation(&options).await?;
+                output.emit(
+                    "waiver list",
+                    &waivers,
+                    &format!("{} waiver(s)", waivers.items.len()),
+                )
+            }
+            WaiverCommand::Create(options) => {
+                let waiver = studio_remote::create_waiver_operation(&options).await?;
+                output.emit(
+                    "waiver create",
+                    &waiver,
+                    &format!("Created waiver {}", waiver.id),
+                )
+            }
+            WaiverCommand::Revoke(options) => {
+                let waiver = studio_remote::revoke_waiver_operation(&options).await?;
+                output.emit(
+                    "waiver revoke",
+                    &waiver,
+                    &format!("Revoked waiver {}", waiver.id),
                 )
             }
         },
@@ -661,10 +956,40 @@ fn raw_arguments_request_json() -> bool {
     })
 }
 
+fn confirm_publication(yes: bool, no_input: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    ensure!(
+        !no_input && std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        "publication requires --yes when input is disabled or no terminal is attached"
+    );
+    eprint!("Publish this immutable release to Reporch? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    ensure!(
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        "publication cancelled"
+    );
+    Ok(())
+}
+
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Migrate(_) => "migrate",
         Command::Check => "check",
+        Command::Statement(_) => "statement",
+        Command::Test(_) => "test",
+        Command::Generator(_) => "generator",
+        Command::Validator(_) => "validator",
+        Command::Checker(_) => "checker",
+        Command::Solution(_) => "solution",
+        Command::Interactor(_) => "interactor",
+        Command::Grader(_) => "grader",
+        Command::Output(_) => "output",
+        Command::Verify(_) => "verify",
+        Command::Submit(_) => "submit",
         Command::Auth { command } => match command {
             AuthCommand::Login(_) => "auth login",
             AuthCommand::Status(_) => "auth status",
@@ -675,6 +1000,7 @@ fn command_name(command: &Command) -> &'static str {
             ProjectCommand::Link { .. } => "project link",
             ProjectCommand::List(_) => "project list",
             ProjectCommand::Show(_) => "project show",
+            ProjectCommand::Open { .. } => "project open",
             ProjectCommand::Status => "project status",
             ProjectCommand::Diff => "project diff",
             ProjectCommand::Create(_) => "project create",
@@ -682,6 +1008,28 @@ fn command_name(command: &Command) -> &'static str {
             ProjectCommand::Push(_) => "project push",
             ProjectCommand::Validate(_) => "project validate",
             ProjectCommand::Package(_) => "project package",
+        },
+        Command::Member { command } => match command {
+            MemberCommand::Search(_) => "member search",
+            MemberCommand::List(_) => "member list",
+            MemberCommand::Add(_) => "member add",
+            MemberCommand::Update(_) => "member update",
+            MemberCommand::Remove(_) => "member remove",
+        },
+        Command::Doctor(_) => "doctor",
+        Command::Quota { .. } => "quota show",
+        Command::Publication { command } => match command {
+            PublicationCommand::Publish(_) => "publication publish",
+            PublicationCommand::Status(_) => "publication status",
+        },
+        Command::Validation { command } => match command {
+            ValidationCommand::Show(_) => "validation show",
+            ValidationCommand::Watch(_) => "validation watch",
+        },
+        Command::Waiver { command } => match command {
+            WaiverCommand::List(_) => "waiver list",
+            WaiverCommand::Create(_) => "waiver create",
+            WaiverCommand::Revoke(_) => "waiver revoke",
         },
         Command::Review { command } => match command {
             ReviewCommand::Submit(_) => "review submit",
@@ -696,6 +1044,57 @@ fn command_name(command: &Command) -> &'static str {
         Command::Artifact { .. } => "artifact",
         Command::QualificationSelfTest => "qualification-self-test",
     }
+}
+
+async fn submit_project(options: SubmitOptions, output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
+    let checked = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let push = studio_remote::push_operation(&studio_remote::PushOptions {
+        connection: options.connection.clone(),
+        manifest: None,
+        source_root: None,
+        message: options.message,
+        timeout_seconds: options.timeout_seconds.min(10 * 60),
+    })
+    .await?;
+    let validation = studio_remote::validate_operation(&studio_remote::ValidateOptions {
+        connection: options.connection.clone(),
+        project_id: Some(push.commit.project_id),
+        commit_id: Some(push.commit.id),
+        idempotency_key: Some(format!("validation-{}", push.commit.id)),
+        wait: true,
+        timeout_seconds: options.timeout_seconds,
+    })
+    .await?;
+    let detail = validation
+        .detail
+        .as_ref()
+        .context("Studio validation did not return evidence")?;
+    ensure!(
+        detail.status == studio_contracts::ValidationRunStatus::Passed,
+        "Studio validation did not pass"
+    );
+    let review = studio_remote::submit_review_operation(&studio_remote::SubmitReviewOptions {
+        connection: options.connection,
+        project_id: Some(push.commit.project_id),
+        commit_id: Some(push.commit.id),
+        validation_run_id: Some(detail.id),
+        idempotency_key: Some(format!("review-{}", push.commit.id)),
+    })
+    .await?;
+    let human = format!("Submitted review {}", review.id);
+    let result = serde_json::json!({
+        "schema": "reporch.submit-result.v1",
+        "check": {
+            "file_count": checked.files.len(),
+            "valid": true,
+        },
+        "push": push,
+        "validation": validation,
+        "review": review,
+    });
+    output.emit("submit", &result, &human)
 }
 
 async fn qualification_self_test() -> Result<()> {

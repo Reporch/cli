@@ -42,7 +42,7 @@ struct SuccessEnvelope<'a, T> {
 struct ErrorEnvelope<'a> {
     schema: &'static str,
     command: &'a str,
-    error_code: &'a str,
+    error_code: String,
     message: String,
     retryable: bool,
     trace_id: String,
@@ -99,7 +99,9 @@ impl CliOutput {
             error_code: classified.error_code,
             message: format!("{error:#}"),
             retryable: classified.retryable,
-            trace_id: Uuid::now_v7().to_string(),
+            trace_id: classified
+                .trace_id
+                .unwrap_or_else(|| Uuid::now_v7().to_string()),
         };
         match self.format {
             OutputFormat::Human => eprintln!("{}: {}", envelope.error_code, envelope.message),
@@ -128,17 +130,34 @@ impl CliOutput {
 
 struct ClassifiedError {
     exit_code: ExitCode,
-    error_code: &'static str,
+    error_code: String,
     retryable: bool,
+    trace_id: Option<String>,
 }
 
 fn classify_error(error: &Error) -> ClassifiedError {
+    if let Some(remote) = crate::studio_remote::remote_error_metadata(error) {
+        let exit_code = match remote.status.map(|status| status.as_u16()) {
+            Some(401) => ExitCode::AuthenticationRequired,
+            Some(403 | 429) => ExitCode::PermissionDenied,
+            Some(409 | 412 | 428) => ExitCode::Conflict,
+            Some(500..=599) | None if remote.retryable => ExitCode::InfrastructureFailure,
+            _ => ExitCode::InvalidInput,
+        };
+        return ClassifiedError {
+            exit_code,
+            error_code: remote.error_code,
+            retryable: remote.retryable,
+            trace_id: remote.trace_id,
+        };
+    }
     let message = format!("{error:#}").to_ascii_lowercase();
     if message.contains("cancelled") || message.contains("canceled") {
         return ClassifiedError {
             exit_code: ExitCode::Cancelled,
-            error_code: "operation.cancelled",
+            error_code: "operation.cancelled".into(),
             retryable: false,
+            trace_id: None,
         };
     }
     if message.contains("credential")
@@ -148,8 +167,9 @@ fn classify_error(error: &Error) -> ClassifiedError {
     {
         return ClassifiedError {
             exit_code: ExitCode::AuthenticationRequired,
-            error_code: "auth.required",
+            error_code: "auth.required".into(),
             retryable: false,
+            trace_id: None,
         };
     }
     if message.contains("forbidden")
@@ -159,8 +179,9 @@ fn classify_error(error: &Error) -> ClassifiedError {
     {
         return ClassifiedError {
             exit_code: ExitCode::PermissionDenied,
-            error_code: "policy.denied",
+            error_code: "policy.denied".into(),
             retryable: false,
+            trace_id: None,
         };
     }
     if message.contains("etag")
@@ -170,8 +191,9 @@ fn classify_error(error: &Error) -> ClassifiedError {
     {
         return ClassifiedError {
             exit_code: ExitCode::Conflict,
-            error_code: "revision.conflict",
+            error_code: "revision.conflict".into(),
             retryable: false,
+            trace_id: None,
         };
     }
     if message.contains("timeout")
@@ -184,8 +206,9 @@ fn classify_error(error: &Error) -> ClassifiedError {
     {
         return ClassifiedError {
             exit_code: ExitCode::InfrastructureFailure,
-            error_code: "infrastructure.unavailable",
+            error_code: "infrastructure.unavailable".into(),
             retryable: true,
+            trace_id: None,
         };
     }
     if message.contains("validation did not pass")
@@ -194,14 +217,16 @@ fn classify_error(error: &Error) -> ClassifiedError {
     {
         return ClassifiedError {
             exit_code: ExitCode::DomainFailure,
-            error_code: "operation.failed",
+            error_code: "operation.failed".into(),
             retryable: false,
+            trace_id: None,
         };
     }
     ClassifiedError {
         exit_code: ExitCode::InvalidInput,
-        error_code: "input.invalid",
+        error_code: "input.invalid".into(),
         retryable: false,
+        trace_id: None,
     }
 }
 
@@ -226,5 +251,20 @@ mod tests {
         let classified = classify_error(&anyhow!("Studio transport timeout"));
         assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
         assert!(classified.retryable);
+    }
+
+    #[test]
+    fn studio_error_codes_and_trace_ids_survive_classification() {
+        let error = anyhow::Error::new(crate::studio_remote::StudioApiRequestError::Api {
+            status: reqwest::StatusCode::CONFLICT,
+            error_code: "working_copy.revision_conflict".into(),
+            message: "stale".into(),
+            retryable: false,
+            trace_id: "server-trace-id".into(),
+        });
+        let classified = classify_error(&error);
+        assert_eq!(classified.exit_code, ExitCode::Conflict);
+        assert_eq!(classified.error_code, "working_copy.revision_conflict");
+        assert_eq!(classified.trace_id.as_deref(), Some("server-trace-id"));
     }
 }

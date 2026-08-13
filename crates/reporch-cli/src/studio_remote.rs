@@ -8,24 +8,30 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use chrono::{DateTime, Utc};
 use clap::{ArgAction, Args as ClapArgs, ValueEnum};
 use futures_util::StreamExt;
-use reqwest::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_LENGTH, HeaderName, HeaderValue, IF_MATCH};
 use reqwest::{RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use studio_contracts::{
     ApiErrorResponse, BeginFileUploadRequest, BeginFileUploadResponse, CommitDetailResponse,
-    CommitPage, CommitResponse, CreateCommitRequest, CreateProjectRequest, CreateReleaseRequest,
-    CreateReviewDecisionRequest, EnqueueValidationRequest, FileDownloadResponse, FileEntryPage,
-    FileUploadResponse, FileUploadStatus, FileUploadStrategyV1, ProjectPage, ProjectResponse,
-    ReleaseDownloadResponse, ReleaseResponse, ReleaseStatus, ReviewPage, ReviewResponse,
-    SubmitReviewRequest, ValidationRunDetailResponse, ValidationRunResponse, ValidationRunStatus,
+    CommitPage, CommitResponse, CommitWorkingCopyRequestV1, CreateCommitRequest,
+    CreateProjectRequest, CreateReleaseRequest, CreateReviewDecisionRequest, CreateWaiverRequest,
+    EnqueueValidationRequest, FileDownloadResponse, FileEntryPage, FileUploadResponse,
+    FileUploadStatus, FileUploadStrategyV1, IdentityDirectoryPageV1, ProjectMembershipPage,
+    ProjectMembershipResponse, ProjectPage, ProjectResponse, PublicationResponse,
+    PublicationStatus, QuotaStatusV1, ReleaseDownloadResponse, ReleaseResponse, ReleaseStatus,
+    ReviewPage, ReviewResponse, RevokeWaiverRequest, StudioCapabilitiesV1, SubmitReviewRequest,
+    UpdateWorkingCopyRequestV1, UpsertProjectMembershipRequest, ValidationRunDetailResponse,
+    ValidationRunResponse, ValidationRunStatus, WaiverPage, WaiverResponse, WorkingCopyReadinessV1,
+    WorkingCopyV1,
 };
 use studio_core::{
-    ManifestFile, ProblemType, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
-    validate_manifest,
+    ManifestFile, ProblemType, ProjectRole, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
+    SubjectRef, validate_manifest,
 };
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use tempfile::NamedTempFile;
@@ -46,7 +52,8 @@ const DEFAULT_WAIT_SECONDS: u64 = 30 * 60;
 const MAX_TRANSIENT_POLL_RETRIES: u32 = 8;
 
 #[derive(Debug, Error)]
-enum StudioApiRequestError {
+#[doc(hidden)]
+pub enum StudioApiRequestError {
     #[error("Studio API {error_code}: {message} (trace {trace_id})")]
     Api {
         status: StatusCode,
@@ -62,6 +69,47 @@ enum StudioApiRequestError {
         #[source]
         source: reqwest::Error,
     },
+}
+
+#[doc(hidden)]
+pub struct RemoteErrorMetadata {
+    pub error_code: String,
+    pub retryable: bool,
+    pub trace_id: Option<String>,
+    pub status: Option<StatusCode>,
+}
+
+#[doc(hidden)]
+pub fn remote_error_metadata(error: &anyhow::Error) -> Option<RemoteErrorMetadata> {
+    error.chain().find_map(|cause| {
+        let remote = cause.downcast_ref::<StudioApiRequestError>()?;
+        Some(match remote {
+            StudioApiRequestError::Api {
+                status,
+                error_code,
+                retryable,
+                trace_id,
+                ..
+            } => RemoteErrorMetadata {
+                error_code: error_code.clone(),
+                retryable: *retryable || is_transient_http_status(*status),
+                trace_id: Some(trace_id.clone()),
+                status: Some(*status),
+            },
+            StudioApiRequestError::Http { status } => RemoteErrorMetadata {
+                error_code: "studio.http_error".into(),
+                retryable: is_transient_http_status(*status),
+                trace_id: None,
+                status: Some(*status),
+            },
+            StudioApiRequestError::Transport { .. } => RemoteErrorMetadata {
+                error_code: "infrastructure.transport".into(),
+                retryable: true,
+                trace_id: None,
+                status: None,
+            },
+        })
+    })
 }
 
 impl StudioApiRequestError {
@@ -165,9 +213,9 @@ pub struct ValidateOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub commit_id: Uuid,
+    pub commit_id: Option<Uuid>,
     /// Reuse this value after an ambiguous network failure.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -178,15 +226,27 @@ pub struct ValidateOptions {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+pub struct ValidationInspectOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub validation_run_id: Option<Uuid>,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
 pub struct PackageOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub commit_id: Uuid,
+    pub commit_id: Option<Uuid>,
     #[arg(long)]
-    pub validation_run_id: Uuid,
+    pub validation_run_id: Option<Uuid>,
     #[arg(long)]
     pub output: PathBuf,
     /// Reuse this value after an ambiguous network failure.
@@ -201,11 +261,11 @@ pub struct SubmitReviewOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub commit_id: Uuid,
+    pub commit_id: Option<Uuid>,
     #[arg(long)]
-    pub validation_run_id: Uuid,
+    pub validation_run_id: Option<Uuid>,
     /// Reuse this value after an ambiguous network failure.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -216,7 +276,7 @@ pub struct ListReviewsOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -246,6 +306,125 @@ pub struct RequestChangesOptions {
     #[arg(long)]
     pub comment: String,
     /// Reuse this value after an ambiguous network failure.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct MemberScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct MemberSearchOptions {
+    #[command(flatten)]
+    pub scope: MemberScopeOptions,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MemberRole {
+    Maintainer,
+    Author,
+    Reviewer,
+    Translator,
+    Viewer,
+}
+
+impl From<MemberRole> for ProjectRole {
+    fn from(value: MemberRole) -> Self {
+        match value {
+            MemberRole::Maintainer => Self::Maintainer,
+            MemberRole::Author => Self::Author,
+            MemberRole::Reviewer => Self::Reviewer,
+            MemberRole::Translator => Self::Translator,
+            MemberRole::Viewer => Self::Viewer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct UpsertMemberOptions {
+    #[command(flatten)]
+    pub scope: MemberScopeOptions,
+    #[arg(long)]
+    pub issuer: String,
+    #[arg(long)]
+    pub subject: String,
+    #[arg(long, value_enum)]
+    pub role: MemberRole,
+    #[arg(long, default_value_t = 0)]
+    pub entitlement_version: i64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RemoveMemberOptions {
+    #[command(flatten)]
+    pub scope: MemberScopeOptions,
+    #[arg(long)]
+    pub issuer: String,
+    #[arg(long)]
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct PublicationOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub release_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct PublishOptions {
+    #[command(flatten)]
+    pub target: PublicationOptions,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub wait: bool,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct WaiverScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub validation_run_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct CreateWaiverOptions {
+    #[command(flatten)]
+    pub scope: WaiverScopeOptions,
+    #[arg(long)]
+    pub issue_code: String,
+    #[arg(long)]
+    pub reason: String,
+    /// RFC 3339 timestamp after which this waiver is invalid.
+    #[arg(long)]
+    pub expires_at: String,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevokeWaiverOptions {
+    #[command(flatten)]
+    pub scope: WaiverScopeOptions,
+    #[arg(long)]
+    pub waiver_id: Uuid,
+    #[arg(long)]
+    pub reason: String,
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
@@ -301,6 +480,19 @@ impl StudioApiClient {
             .await
             .map_err(studio_api_transport_error)?;
         decode_api_response(response).await
+    }
+
+    async fn empty(&self, request: RequestBuilder) -> Result<()> {
+        let response = self
+            .authenticated(request)
+            .send()
+            .await
+            .map_err(studio_api_transport_error)?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let _: serde_json::Value = decode_api_response(response).await?;
+        Ok(())
     }
 
     async fn create_project(
@@ -401,6 +593,127 @@ impl StudioApiClient {
         .await
     }
 
+    async fn capabilities(&self) -> Result<StudioCapabilitiesV1> {
+        self.json(self.http.get(self.endpoint("capabilities")?))
+            .await
+    }
+
+    async fn quota(&self) -> Result<QuotaStatusV1> {
+        self.json(self.http.get(self.endpoint("quota")?)).await
+    }
+
+    async fn get_working_copy(&self, project_id: Uuid) -> Result<WorkingCopyV1> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("projects/{project_id}/working-copy"))?),
+        )
+        .await
+    }
+
+    async fn update_working_copy(
+        &self,
+        project_id: Uuid,
+        expected_revision: i64,
+        request: &UpdateWorkingCopyRequestV1,
+    ) -> Result<WorkingCopyV1> {
+        self.json(
+            self.http
+                .put(self.endpoint(&format!("projects/{project_id}/working-copy"))?)
+                .header(IF_MATCH, format!("\"{expected_revision}\""))
+                .json(request),
+        )
+        .await
+    }
+
+    async fn commit_working_copy(
+        &self,
+        project_id: Uuid,
+        request: &CommitWorkingCopyRequestV1,
+        idempotency_key: &str,
+    ) -> Result<CommitResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("projects/{project_id}/working-copy/commits"))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn working_copy_readiness(&self, project_id: Uuid) -> Result<WorkingCopyReadinessV1> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("projects/{project_id}/readiness"))?),
+        )
+        .await
+    }
+
+    async fn list_members(&self, project_id: Uuid) -> Result<ProjectMembershipPage> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("projects/{project_id}/memberships"))?),
+        )
+        .await
+    }
+
+    async fn search_members(
+        &self,
+        project_id: Uuid,
+        query: &str,
+    ) -> Result<IdentityDirectoryPageV1> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/identity-directory"))?;
+        url.query_pairs_mut().append_pair("q", query);
+        self.json(self.http.get(url)).await
+    }
+
+    async fn upsert_member(
+        &self,
+        project_id: Uuid,
+        request: &UpsertProjectMembershipRequest,
+    ) -> Result<ProjectMembershipResponse> {
+        self.json(
+            self.http
+                .put(self.endpoint(&format!("projects/{project_id}/memberships"))?)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn remove_member(&self, project_id: Uuid, issuer: &str, subject: &str) -> Result<()> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/memberships"))?;
+        url.query_pairs_mut()
+            .append_pair("issuer", issuer)
+            .append_pair("subject", subject);
+        self.empty(self.http.delete(url)).await
+    }
+
+    async fn publish_release(
+        &self,
+        project_id: Uuid,
+        release_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<PublicationResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/releases/{release_id}/publication"
+                ))?)
+                .header("idempotency-key", idempotency_key),
+        )
+        .await
+    }
+
+    async fn get_publication(
+        &self,
+        project_id: Uuid,
+        release_id: Uuid,
+    ) -> Result<PublicationResponse> {
+        self.json(self.http.get(self.endpoint(&format!(
+            "projects/{project_id}/releases/{release_id}/publication"
+        ))?))
+        .await
+    }
+
     async fn enqueue_validation(
         &self,
         project_id: Uuid,
@@ -424,6 +737,50 @@ impl StudioApiClient {
         self.json(self.http.get(self.endpoint(&format!(
             "projects/{project_id}/validations/{validation_id}"
         ))?))
+        .await
+    }
+
+    async fn list_waivers(&self, project_id: Uuid, validation_id: Uuid) -> Result<WaiverPage> {
+        self.json(self.http.get(self.endpoint(&format!(
+            "projects/{project_id}/validations/{validation_id}/waivers"
+        ))?))
+        .await
+    }
+
+    async fn create_waiver(
+        &self,
+        project_id: Uuid,
+        validation_id: Uuid,
+        request: &CreateWaiverRequest,
+        idempotency_key: &str,
+    ) -> Result<WaiverResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/validations/{validation_id}/waivers"
+                ))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn revoke_waiver(
+        &self,
+        project_id: Uuid,
+        validation_id: Uuid,
+        waiver_id: Uuid,
+        request: &RevokeWaiverRequest,
+        idempotency_key: &str,
+    ) -> Result<WaiverResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/validations/{validation_id}/waivers/{waiver_id}/revocation"
+                ))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
         .await
     }
 
@@ -733,6 +1090,131 @@ pub async fn list_projects_operation(connection: &RemoteConnectionOptions) -> Re
     bail!("Studio project listing exceeded the 10,000-item native client bound")
 }
 
+pub async fn capabilities_operation(
+    connection: &RemoteConnectionOptions,
+) -> Result<StudioCapabilitiesV1> {
+    let capabilities = StudioApiClient::connect(connection)
+        .await?
+        .capabilities()
+        .await?;
+    ensure_cli_compatible(&capabilities)?;
+    Ok(capabilities)
+}
+
+pub async fn quota_operation(connection: &RemoteConnectionOptions) -> Result<QuotaStatusV1> {
+    StudioApiClient::connect(connection).await?.quota().await
+}
+
+pub async fn list_members_operation(options: &MemberScopeOptions) -> Result<ProjectMembershipPage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    StudioApiClient::connect(&options.connection)
+        .await?
+        .list_members(project_id)
+        .await
+}
+
+pub async fn search_members_operation(
+    options: &MemberSearchOptions,
+) -> Result<IdentityDirectoryPageV1> {
+    let query = options.query.trim();
+    ensure!(
+        (2..=100).contains(&query.len()),
+        "search query must contain 2 to 100 characters"
+    );
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .search_members(project_id, query)
+        .await
+}
+
+pub async fn upsert_member_operation(
+    options: &UpsertMemberOptions,
+) -> Result<ProjectMembershipResponse> {
+    ensure!(!options.issuer.trim().is_empty(), "issuer cannot be empty");
+    ensure!(
+        !options.subject.trim().is_empty(),
+        "subject cannot be empty"
+    );
+    ensure!(
+        options.entitlement_version >= 0,
+        "entitlement version cannot be negative"
+    );
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .upsert_member(
+            project_id,
+            &UpsertProjectMembershipRequest {
+                member: SubjectRef {
+                    issuer: options.issuer.trim().into(),
+                    subject: options.subject.trim().into(),
+                },
+                role: options.role.into(),
+                entitlement_version: options.entitlement_version,
+            },
+        )
+        .await
+}
+
+pub async fn remove_member_operation(options: &RemoveMemberOptions) -> Result<serde_json::Value> {
+    ensure!(!options.issuer.trim().is_empty(), "issuer cannot be empty");
+    ensure!(
+        !options.subject.trim().is_empty(),
+        "subject cannot be empty"
+    );
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .remove_member(project_id, options.issuer.trim(), options.subject.trim())
+        .await?;
+    Ok(serde_json::json!({
+        "project_id": project_id,
+        "issuer": options.issuer.trim(),
+        "subject": options.subject.trim(),
+        "removed": true,
+    }))
+}
+
+pub async fn publication_status_operation(
+    options: &PublicationOptions,
+) -> Result<PublicationResponse> {
+    let (project_id, release_id) = resolve_local_release(options.project_id, options.release_id)?;
+    StudioApiClient::connect(&options.connection)
+        .await?
+        .get_publication(project_id, release_id)
+        .await
+}
+
+pub async fn publish_operation(options: &PublishOptions) -> Result<PublicationResponse> {
+    validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, release_id) =
+        resolve_local_release(options.target.project_id, options.target.release_id)?;
+    let key = operation_key("cli-publication", options.idempotency_key.as_deref())?;
+    let client = StudioApiClient::connect(&options.target.connection).await?;
+    let publication = client.publish_release(project_id, release_id, &key).await?;
+    if !options.wait || is_publication_terminal(publication.status) {
+        return Ok(publication);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(options.timeout_seconds);
+    loop {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "publication timed out"
+        );
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let publication = client.get_publication(project_id, release_id).await?;
+        if is_publication_terminal(publication.status) {
+            ensure!(
+                publication.status == PublicationStatus::Published,
+                "publication failed: {}",
+                publication.error_code.as_deref().unwrap_or("unknown")
+            );
+            return Ok(publication);
+        }
+    }
+}
+
 pub async fn create_operation(options: &CreateOptions) -> Result<ProjectResponse> {
     let title = options.title.trim();
     ensure!(
@@ -846,16 +1328,20 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         &staging.path().join("reporch.problem.json"),
         &commit.manifest,
     )?;
-    crate::local_project::write_authoring_spec_create_new(
-        staging.path(),
-        &reporch_format::AuthoringSpecV1::from_manifest(&commit.manifest),
-    )?;
+    let authoring_spec = reporch_format::AuthoringSpecV1::from_manifest(&commit.manifest);
+    crate::local_project::write_authoring_spec_create_new(staging.path(), &authoring_spec)?;
+    let working_copy_revision = match client.get_working_copy(options.project_id).await {
+        Ok(working_copy) if working_copy.spec == authoring_spec => {
+            Some(working_copy.revision.to_string())
+        }
+        _ => None,
+    };
     let state = crate::local_project::LocalStateV1 {
         remote: Some(crate::local_project::RemoteLinkV1 {
             api_url: options.connection.api_url.trim_end_matches('/').to_owned(),
             project_id: options.project_id,
         }),
-        base_revision: Some(commit.sequence.to_string()),
+        base_revision: working_copy_revision,
         baseline_working_digest: Some(commit.manifest_digest.to_string()),
         last_commit_id: Some(commit.id),
         ..Default::default()
@@ -945,46 +1431,111 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         "linked Studio API URL differs from the selected connection"
     );
 
-    let fingerprint_manifest =
-        crate::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
-    let fingerprint = fingerprint_manifest.digest()?.to_string();
-    let base_commit = state.last_commit_id;
-    let unchanged_manifest = if let Some(commit_id) = base_commit {
-        let candidate = crate::local_project::compile_authoring_spec(&root, &spec, commit_id)?;
-        (state.baseline_working_digest.as_deref() == Some(candidate.digest()?.as_str()))
-            .then_some(candidate)
-    } else {
-        None
-    };
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let capabilities = client.capabilities().await?;
+    ensure_cli_compatible(&capabilities)?;
+    ensure!(
+        capabilities
+            .authoring_spec_versions
+            .iter()
+            .any(|schema| schema == reporch_format::AUTHORING_SPEC_SCHEMA_V1),
+        "Studio does not support {}",
+        reporch_format::AUTHORING_SPEC_SCHEMA_V1
+    );
 
-    let manifest = match unchanged_manifest {
-        Some(manifest) => manifest,
-        None => {
-            let pending_key = format!("push:{fingerprint}");
-            let commit_id = match state.pending_idempotency_keys.get(&pending_key) {
-                Some(value) => value
-                    .parse()
-                    .context("invalid pending push commit ID in local state")?,
-                None => {
-                    let commit_id = Uuid::now_v7();
-                    state
-                        .pending_idempotency_keys
-                        .retain(|key, _| !key.starts_with("push:"));
-                    state
-                        .pending_idempotency_keys
-                        .insert(pending_key.clone(), commit_id.to_string());
-                    crate::local_project::write_local_state(&root, &state)?;
-                    commit_id
-                }
-            };
-            crate::local_project::compile_authoring_spec(&root, &spec, commit_id)?
+    let upload_manifest = crate::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let uploaded = upload_manifest_files(&client, options, &upload_manifest, &root).await?;
+
+    if uploaded == 0
+        && let Some(last_commit_id) = state.last_commit_id
+    {
+        let candidate = crate::local_project::compile_authoring_spec(&root, &spec, last_commit_id)?;
+        if state.baseline_working_digest.as_deref() == Some(candidate.digest()?.as_str()) {
+            let commits = client.list_commits(spec.project_id).await?;
+            if let Some(head) = commits.items.first()
+                && head.id == last_commit_id
+                && head.manifest_digest == candidate.digest()?
+            {
+                return Ok(PushOperationResult {
+                    uploaded_files: 0,
+                    commit: CommitResponse {
+                        id: head.id,
+                        project_id: head.project_id,
+                        sequence: head.sequence,
+                        manifest_digest: head.manifest_digest.clone(),
+                        created_at: head.created_at,
+                    },
+                });
+            }
         }
+    }
+
+    let remote_copy = client.get_working_copy(spec.project_id).await?;
+    if let Some(base_revision) = state.base_revision.as_deref() {
+        let base_revision: i64 = base_revision
+            .parse()
+            .context("invalid working-copy base revision in local state")?;
+        ensure!(
+            base_revision == remote_copy.revision,
+            "revision conflict: local base {base_revision}, remote working copy {}",
+            remote_copy.revision
+        );
+    } else if remote_copy.revision > 0 && remote_copy.spec != spec {
+        bail!(
+            "revision conflict: the remote working copy changed; pull or inspect the diff before pushing"
+        );
+    }
+    let saved_copy = if remote_copy.spec == spec {
+        remote_copy
+    } else {
+        client
+            .update_working_copy(
+                spec.project_id,
+                remote_copy.revision,
+                &UpdateWorkingCopyRequestV1 { spec: spec.clone() },
+            )
+            .await?
     };
+    state.base_revision = Some(saved_copy.revision.to_string());
+    let push_operation = format!(
+        "push:{}",
+        Sha256Digest::from_bytes(
+            format!("{}\n{}", saved_copy.revision, options.message).as_bytes()
+        )
+    );
+    let commit_key = state
+        .pending_idempotency_keys
+        .entry(push_operation)
+        .or_insert(operation_key("cli-push", None)?)
+        .clone();
+    crate::local_project::write_local_state(&root, &state)?;
+    let readiness = client.working_copy_readiness(spec.project_id).await?;
+    ensure!(
+        readiness.can_commit,
+        "working copy is not ready: {}",
+        readiness.issues.join("; ")
+    );
+    let commit = client
+        .commit_working_copy(
+            spec.project_id,
+            &CommitWorkingCopyRequestV1 {
+                message: options.message.clone(),
+            },
+            &commit_key,
+        )
+        .await?;
+    let manifest = crate::local_project::compile_authoring_spec(&root, &spec, commit.id)?;
     let manifest_digest = manifest.digest()?;
-    let result = push_manifest(options, manifest.clone(), root.clone()).await?;
+    ensure!(
+        commit.manifest_digest == manifest_digest,
+        "Studio compiled a different immutable manifest"
+    );
+    let result = PushOperationResult {
+        uploaded_files: uploaded,
+        commit,
+    };
 
     crate::local_project::write_generated_manifest_atomic(&root, &manifest)?;
-    state.base_revision = Some(result.commit.sequence.to_string());
     state.baseline_working_digest = Some(manifest_digest.to_string());
     state.last_commit_id = Some(result.commit.id);
     state.last_validation_run_id = None;
@@ -1002,50 +1553,7 @@ async fn push_manifest(
     source_root: PathBuf,
 ) -> Result<PushOperationResult> {
     let client = StudioApiClient::connect(&options.connection).await?;
-    let remote = client
-        .list_files(manifest.project_id)
-        .await?
-        .items
-        .into_iter()
-        .map(|file| (file.path.clone(), file))
-        .collect::<HashMap<_, _>>();
-    let mut uploaded = 0_usize;
-    for file in &manifest.files {
-        let source = source_root.join(&file.path);
-        verify_local_file(&source, file).await?;
-        if remote.get(&file.path).is_some_and(|remote| {
-            remote.sha256 == file.sha256
-                && remote.size_bytes == file.size_bytes
-                && remote.media_type == file.media_type
-                && remote.executable == file.executable
-        }) {
-            continue;
-        }
-        let upload = client
-            .begin_upload(
-                manifest.project_id,
-                &BeginFileUploadRequest {
-                    path: file.path.clone(),
-                    sha256: file.sha256.clone(),
-                    size_bytes: file.size_bytes,
-                    media_type: file.media_type.clone(),
-                    executable: file.executable,
-                },
-            )
-            .await?;
-        client.upload_file(&source, &upload).await?;
-        let status = client
-            .complete_upload(manifest.project_id, upload.upload.id)
-            .await?;
-        wait_for_upload(
-            &client,
-            manifest.project_id,
-            status,
-            options.timeout_seconds,
-        )
-        .await?;
-        uploaded += 1;
-    }
+    let uploaded = upload_manifest_files(&client, options, &manifest, &source_root).await?;
     let manifest_digest = manifest.digest()?;
     if uploaded == 0 {
         let commits = client.list_commits(manifest.project_id).await?;
@@ -1093,6 +1601,53 @@ async fn push_manifest(
     })
 }
 
+async fn upload_manifest_files(
+    client: &StudioApiClient,
+    options: &PushOptions,
+    manifest: &ReleaseManifestV1,
+    source_root: &Path,
+) -> Result<usize> {
+    let remote = client
+        .list_files(manifest.project_id)
+        .await?
+        .items
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    let mut uploaded = 0_usize;
+    for file in &manifest.files {
+        let source = source_root.join(&file.path);
+        verify_local_file(&source, file).await?;
+        if remote.get(&file.path).is_some_and(|remote| {
+            remote.sha256 == file.sha256
+                && remote.size_bytes == file.size_bytes
+                && remote.media_type == file.media_type
+                && remote.executable == file.executable
+        }) {
+            continue;
+        }
+        let upload = client
+            .begin_upload(
+                manifest.project_id,
+                &BeginFileUploadRequest {
+                    path: file.path.clone(),
+                    sha256: file.sha256.clone(),
+                    size_bytes: file.size_bytes,
+                    media_type: file.media_type.clone(),
+                    executable: file.executable,
+                },
+            )
+            .await?;
+        client.upload_file(&source, &upload).await?;
+        let status = client
+            .complete_upload(manifest.project_id, upload.upload.id)
+            .await?;
+        wait_for_upload(client, manifest.project_id, status, options.timeout_seconds).await?;
+        uploaded += 1;
+    }
+    Ok(uploaded)
+}
+
 fn is_unchanged_remote_head(
     uploaded_files: usize,
     local_commit_id: Uuid,
@@ -1117,39 +1672,63 @@ pub async fn push(options: &PushOptions) -> Result<()> {
 
 pub async fn validate_operation(options: &ValidateOptions) -> Result<ValidationOperationResult> {
     validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, commit_id, local_root) =
+        resolve_local_candidate(options.project_id, options.commit_id)?;
     let key = operation_key("cli-validation", options.idempotency_key.as_deref())?;
     eprintln!("Idempotency-Key: {key}");
     let client = StudioApiClient::connect(&options.connection).await?;
     let queued = client
-        .enqueue_validation(
-            options.project_id,
-            &EnqueueValidationRequest {
-                commit_id: options.commit_id,
-            },
-            &key,
-        )
+        .enqueue_validation(project_id, &EnqueueValidationRequest { commit_id }, &key)
         .await?;
     ensure!(
-        queued.project_id == options.project_id && queued.commit_id == options.commit_id,
+        queued.project_id == project_id && queued.commit_id == commit_id,
         "Studio returned a mismatched validation run"
     );
     if !options.wait {
-        return Ok(ValidationOperationResult {
+        let result = ValidationOperationResult {
             queued,
             detail: None,
-        });
+        };
+        if let Some(root) = local_root {
+            let mut state = crate::local_project::read_local_state(&root)?;
+            state.last_validation_run_id = Some(result.queued.id);
+            crate::local_project::write_local_state(&root, &state)?;
+        }
+        return Ok(result);
     }
-    let detail = wait_for_validation(
-        &client,
-        options.project_id,
-        queued.id,
-        options.timeout_seconds,
-    )
-    .await?;
-    Ok(ValidationOperationResult {
+    let detail =
+        wait_for_validation(&client, project_id, queued.id, options.timeout_seconds).await?;
+    let result = ValidationOperationResult {
         queued,
         detail: Some(detail),
-    })
+    };
+    if let Some(root) = local_root {
+        let mut state = crate::local_project::read_local_state(&root)?;
+        state.last_validation_run_id = Some(result.queued.id);
+        crate::local_project::write_local_state(&root, &state)?;
+    }
+    Ok(result)
+}
+
+pub async fn validation_show_operation(
+    options: &ValidationInspectOptions,
+) -> Result<ValidationRunDetailResponse> {
+    let (project_id, validation_id) =
+        resolve_local_validation(options.project_id, options.validation_run_id)?;
+    StudioApiClient::connect(&options.connection)
+        .await?
+        .get_validation(project_id, validation_id)
+        .await
+}
+
+pub async fn validation_watch_operation(
+    options: &ValidationInspectOptions,
+) -> Result<ValidationRunDetailResponse> {
+    validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, validation_id) =
+        resolve_local_validation(options.project_id, options.validation_run_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    wait_for_validation(&client, project_id, validation_id, options.timeout_seconds).await
 }
 
 pub async fn validate(options: &ValidateOptions) -> Result<()> {
@@ -1167,6 +1746,19 @@ pub async fn validate(options: &ValidateOptions) -> Result<()> {
 
 pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperationResult> {
     validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, commit_id, local_root) =
+        resolve_local_candidate(options.project_id, options.commit_id)?;
+    let validation_run_id = match options.validation_run_id {
+        Some(id) => id,
+        None => {
+            let root = local_root
+                .as_ref()
+                .context("--validation-run-id is required outside a local project")?;
+            crate::local_project::read_local_state(root)?
+                .last_validation_run_id
+                .context("no validation is recorded; run reporch project validate first")?
+        }
+    };
     ensure!(
         !options.output.exists(),
         "refusing to overwrite {}",
@@ -1177,29 +1769,21 @@ pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperat
     let client = StudioApiClient::connect(&options.connection).await?;
     let release = client
         .create_release(
-            options.project_id,
+            project_id,
             &CreateReleaseRequest {
-                commit_id: options.commit_id,
-                validation_run_id: options.validation_run_id,
+                commit_id,
+                validation_run_id,
             },
             &key,
         )
         .await?;
-    let release = wait_for_release(
-        &client,
-        options.project_id,
-        release,
-        options.timeout_seconds,
-    )
-    .await?;
+    let release = wait_for_release(&client, project_id, release, options.timeout_seconds).await?;
     ensure!(
         release.status == ReleaseStatus::Ready,
         "release build failed: {:?}",
         release.error_code
     );
-    let download = client
-        .release_download(options.project_id, release.id)
-        .await?;
+    let download = client.release_download(project_id, release.id).await?;
     ensure!(
         download.release_id == release.id,
         "Studio returned a mismatched release download"
@@ -1220,12 +1804,18 @@ pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperat
             &options.output,
         )
         .await?;
-    Ok(PackageOperationResult {
+    let result = PackageOperationResult {
         release,
         output: options.output.clone(),
         package_digest: download.package_digest,
         package_size_bytes: download.package_size_bytes,
-    })
+    };
+    if let Some(root) = local_root {
+        let mut state = crate::local_project::read_local_state(&root)?;
+        state.last_release_id = Some(result.release.id);
+        crate::local_project::write_local_state(&root, &state)?;
+    }
+    Ok(result)
 }
 
 pub async fn package(options: &PackageOptions) -> Result<()> {
@@ -1241,22 +1831,35 @@ pub async fn package(options: &PackageOptions) -> Result<()> {
 }
 
 pub async fn submit_review_operation(options: &SubmitReviewOptions) -> Result<ReviewResponse> {
+    let (project_id, commit_id, local_root) =
+        resolve_local_candidate(options.project_id, options.commit_id)?;
+    let validation_run_id = match options.validation_run_id {
+        Some(validation_run_id) => validation_run_id,
+        None => {
+            let root = local_root
+                .as_ref()
+                .context("validation run ID was omitted outside a local project")?;
+            crate::local_project::read_local_state(root)?
+                .last_validation_run_id
+                .context("no validation is recorded; run reporch verify first")?
+        }
+    };
     let key = operation_key("cli-review-submit", options.idempotency_key.as_deref())?;
     eprintln!("Idempotency-Key: {key}");
     let client = StudioApiClient::connect(&options.connection).await?;
     let review = client
         .submit_review(
-            options.project_id,
+            project_id,
             &SubmitReviewRequest {
-                commit_id: options.commit_id,
-                validation_run_id: options.validation_run_id,
+                commit_id,
+                validation_run_id,
             },
             &key,
         )
         .await?;
-    ensure_review_scope(&review, options.project_id, Some(options.commit_id))?;
+    ensure_review_scope(&review, project_id, Some(commit_id))?;
     ensure!(
-        review.validation_run_id == options.validation_run_id,
+        review.validation_run_id == validation_run_id,
         "Studio returned a review for another validation"
     );
     Ok(review)
@@ -1271,18 +1874,17 @@ pub async fn submit_review(options: &SubmitReviewOptions) -> Result<()> {
 }
 
 pub async fn list_reviews_operation(options: &ListReviewsOptions) -> Result<ReviewPage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
     let client = StudioApiClient::connect(&options.connection).await?;
     let mut items = Vec::new();
     let mut cursor = None;
     let mut seen_cursors = std::collections::HashSet::new();
     for _ in 0..100 {
-        let page = client
-            .list_reviews(options.project_id, cursor.as_deref())
-            .await?;
+        let page = client.list_reviews(project_id, cursor.as_deref()).await?;
         ensure!(
             page.items
                 .iter()
-                .all(|review| review.project_id == options.project_id),
+                .all(|review| review.project_id == project_id),
             "Studio returned a review from another project"
         );
         items.extend(page.items);
@@ -1320,6 +1922,75 @@ pub async fn approve_review_operation(options: &ApproveReviewOptions) -> Result<
         options.idempotency_key.as_deref(),
     )
     .await
+}
+
+pub async fn list_waivers_operation(options: &WaiverScopeOptions) -> Result<WaiverPage> {
+    let (project_id, validation_id) =
+        resolve_local_validation(options.project_id, options.validation_run_id)?;
+    StudioApiClient::connect(&options.connection)
+        .await?
+        .list_waivers(project_id, validation_id)
+        .await
+}
+
+pub async fn create_waiver_operation(options: &CreateWaiverOptions) -> Result<WaiverResponse> {
+    let issue_code = options.issue_code.trim();
+    let reason = options.reason.trim();
+    ensure!(!issue_code.is_empty(), "issue code cannot be empty");
+    ensure!(
+        (20..=2_000).contains(&reason.len()),
+        "waiver reason must contain 20 to 2000 bytes"
+    );
+    let expires_at = DateTime::parse_from_rfc3339(&options.expires_at)
+        .context("--expires-at must be an RFC 3339 timestamp")?
+        .with_timezone(&Utc);
+    ensure!(
+        expires_at > Utc::now(),
+        "waiver expiry must be in the future"
+    );
+    ensure!(
+        expires_at <= Utc::now() + chrono::Duration::days(90),
+        "waiver expiry cannot be more than 90 days in the future"
+    );
+    let (project_id, validation_id) =
+        resolve_local_validation(options.scope.project_id, options.scope.validation_run_id)?;
+    let key = operation_key("cli-waiver-create", options.idempotency_key.as_deref())?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .create_waiver(
+            project_id,
+            validation_id,
+            &CreateWaiverRequest {
+                issue_code: issue_code.into(),
+                reason: reason.into(),
+                expires_at,
+            },
+            &key,
+        )
+        .await
+}
+
+pub async fn revoke_waiver_operation(options: &RevokeWaiverOptions) -> Result<WaiverResponse> {
+    let reason = options.reason.trim();
+    ensure!(
+        (10..=2_000).contains(&reason.len()),
+        "revocation reason must contain 10 to 2000 bytes"
+    );
+    let (project_id, validation_id) =
+        resolve_local_validation(options.scope.project_id, options.scope.validation_run_id)?;
+    let key = operation_key("cli-waiver-revoke", options.idempotency_key.as_deref())?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .revoke_waiver(
+            project_id,
+            validation_id,
+            options.waiver_id,
+            &RevokeWaiverRequest {
+                reason: reason.into(),
+            },
+            &key,
+        )
+        .await
 }
 
 pub async fn request_review_changes_operation(
@@ -1563,6 +2234,130 @@ fn operation_key(prefix: &str, provided: Option<&str>) -> Result<String> {
         "idempotency key must contain 8 to 255 non-whitespace characters"
     );
     Ok(key)
+}
+
+fn ensure_cli_compatible(capabilities: &StudioCapabilitiesV1) -> Result<()> {
+    let current = parse_numeric_version(env!("CARGO_PKG_VERSION"))?;
+    let minimum = parse_numeric_version(&capabilities.minimum_cli_version)
+        .context("Studio returned an invalid minimum CLI version")?;
+    ensure!(
+        current >= minimum,
+        "this Studio requires Reporch CLI {} or newer; current version is {}",
+        capabilities.minimum_cli_version,
+        env!("CARGO_PKG_VERSION")
+    );
+    ensure!(
+        current.0 <= capabilities.maximum_cli_major,
+        "Studio supports Reporch CLI major versions through {}; current version is {}",
+        capabilities.maximum_cli_major,
+        env!("CARGO_PKG_VERSION")
+    );
+    Ok(())
+}
+
+fn parse_numeric_version(value: &str) -> Result<(u64, u64, u64)> {
+    let numeric = value.split_once('-').map_or(value, |(numeric, _)| numeric);
+    let mut parts = numeric.split('.');
+    let major = parts
+        .next()
+        .context("version is missing a major component")?;
+    let minor = parts
+        .next()
+        .context("version is missing a minor component")?;
+    let patch = parts
+        .next()
+        .context("version is missing a patch component")?;
+    ensure!(parts.next().is_none(), "version has too many components");
+    Ok((major.parse()?, minor.parse()?, patch.parse()?))
+}
+
+fn resolve_local_candidate(
+    project_id: Option<Uuid>,
+    commit_id: Option<Uuid>,
+) -> Result<(Uuid, Uuid, Option<PathBuf>)> {
+    if let (Some(project_id), Some(commit_id)) = (project_id, commit_id) {
+        return Ok((project_id, commit_id, None));
+    }
+    let root = crate::local_project::discover_project(Path::new("."))
+        .context("project and commit IDs were omitted and no local project was found")?;
+    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let resolved_project_id = project_id.unwrap_or(spec.project_id);
+    ensure!(
+        resolved_project_id == spec.project_id,
+        "explicit project ID does not match reporch.yaml"
+    );
+    if let Some(remote) = &state.remote {
+        ensure!(
+            remote.project_id == resolved_project_id,
+            "local remote link does not match reporch.yaml"
+        );
+    }
+    let resolved_commit_id = commit_id
+        .or(state.last_commit_id)
+        .context("no commit is recorded; run reporch project push first")?;
+    Ok((resolved_project_id, resolved_commit_id, Some(root)))
+}
+
+fn resolve_local_project_id(project_id: Option<Uuid>) -> Result<Uuid> {
+    if let Some(project_id) = project_id {
+        return Ok(project_id);
+    }
+    let root = crate::local_project::discover_project(Path::new("."))
+        .context("project ID was omitted and no local project was found")?;
+    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let remote = state
+        .remote
+        .context("project is not linked; run reporch project link")?;
+    ensure!(
+        remote.project_id == spec.project_id,
+        "local link and reporch.yaml project IDs differ"
+    );
+    Ok(spec.project_id)
+}
+
+pub fn current_project_id(project_id: Option<Uuid>) -> Result<Uuid> {
+    resolve_local_project_id(project_id)
+}
+
+fn resolve_local_release(
+    project_id: Option<Uuid>,
+    release_id: Option<Uuid>,
+) -> Result<(Uuid, Uuid)> {
+    let project_id = resolve_local_project_id(project_id)?;
+    if let Some(release_id) = release_id {
+        return Ok((project_id, release_id));
+    }
+    let root = crate::local_project::discover_project(Path::new("."))?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let release_id = state
+        .last_release_id
+        .context("no local release is recorded; pass --release-id or build a release")?;
+    Ok((project_id, release_id))
+}
+
+fn resolve_local_validation(
+    project_id: Option<Uuid>,
+    validation_id: Option<Uuid>,
+) -> Result<(Uuid, Uuid)> {
+    let project_id = resolve_local_project_id(project_id)?;
+    if let Some(validation_id) = validation_id {
+        return Ok((project_id, validation_id));
+    }
+    let root = crate::local_project::discover_project(Path::new("."))?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let validation_id = state
+        .last_validation_run_id
+        .context("no validation is recorded; pass --validation-run-id or run verify")?;
+    Ok((project_id, validation_id))
+}
+
+fn is_publication_terminal(status: PublicationStatus) -> bool {
+    matches!(
+        status,
+        PublicationStatus::Published | PublicationStatus::Failed
+    )
 }
 
 fn validate_wait_timeout(value: u64) -> Result<()> {
@@ -1823,6 +2618,25 @@ mod tests {
         );
         assert!(operation_key("unused", Some("short")).is_err());
         assert!(operation_key("unused", Some("contains whitespace")).is_err());
+    }
+
+    #[test]
+    fn capabilities_reject_incompatible_cli_versions() {
+        let compatible = StudioCapabilitiesV1 {
+            schema: "reporch.studio-capabilities.v1".into(),
+            api_versions: vec!["v1".into()],
+            authoring_spec_versions: vec![reporch_format::AUTHORING_SPEC_SCHEMA_V1.into()],
+            release_manifest_versions: vec![studio_core::RELEASE_MANIFEST_SCHEMA_V1.into()],
+            minimum_cli_version: env!("CARGO_PKG_VERSION").into(),
+            maximum_cli_major: 1,
+        };
+        ensure_cli_compatible(&compatible).unwrap();
+
+        let mut too_new = compatible.clone();
+        too_new.minimum_cli_version = "99.0.0".into();
+        assert!(ensure_cli_compatible(&too_new).is_err());
+
+        assert_eq!(parse_numeric_version("1.2.3-beta.1").unwrap(), (1, 2, 3));
     }
 
     #[test]
