@@ -591,6 +591,7 @@ pub enum ManifestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn rejects_unsafe_paths() {
@@ -620,5 +621,32 @@ mod tests {
             Sha256Digest::from_bytes(b"studio").as_str(),
             "da0daaba4b156961c049ab4b85b6d0bcba2872200b7dedb4aa77f9208c601444"
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1_024))]
+
+        #[test]
+        fn normalization_is_idempotent_for_safe_ascii_paths(
+            components in prop::collection::vec("[a-zA-Z0-9._-]{1,24}", 1..=12)
+        ) {
+            prop_assume!(components.iter().all(|component| component != "." && component != ".."));
+            let path = components.join("/");
+            let normalized = normalize_relative_path(&path).unwrap();
+            prop_assert_eq!(normalize_relative_path(&normalized).unwrap(), normalized);
+        }
+
+        #[test]
+        fn arbitrary_parent_traversal_is_always_rejected(
+            suffix in "[a-zA-Z0-9._/-]{0,128}"
+        ) {
+            let path = format!("../{suffix}");
+            prop_assert!(validate_relative_path(&path).is_err());
+        }
+
+        #[test]
+        fn arbitrary_unicode_paths_never_panic(path in ".{0,512}") {
+            let _ = normalize_relative_path(&path);
+        }
     }
 }

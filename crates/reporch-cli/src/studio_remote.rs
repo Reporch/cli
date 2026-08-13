@@ -8,24 +8,31 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use chrono::{DateTime, Utc};
 use clap::{ArgAction, Args as ClapArgs, ValueEnum};
 use futures_util::StreamExt;
-use reqwest::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, IF_MATCH};
 use reqwest::{RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use studio_contracts::{
     ApiErrorResponse, BeginFileUploadRequest, BeginFileUploadResponse, CommitDetailResponse,
-    CommitPage, CommitResponse, CreateCommitRequest, CreateProjectRequest, CreateReleaseRequest,
-    CreateReviewDecisionRequest, EnqueueValidationRequest, FileDownloadResponse, FileEntryPage,
-    FileUploadResponse, FileUploadStatus, FileUploadStrategyV1, ProjectPage, ProjectResponse,
-    ReleaseDownloadResponse, ReleaseResponse, ReleaseStatus, ReviewPage, ReviewResponse,
-    SubmitReviewRequest, ValidationRunDetailResponse, ValidationRunResponse, ValidationRunStatus,
+    CommitFileDownloadResponse, CommitPage, CommitResponse, CommitWorkingCopyRequestV1,
+    CreateCommitRequest, CreateProjectRequest, CreateReleaseRequest, CreateReviewDecisionRequest,
+    CreateWaiverRequest, EVENT_SCHEMA_V1, EnqueueValidationRequest, EventEnvelopeV1, FileEntryPage,
+    FileUploadResponse, FileUploadStatus, FileUploadStrategyV1, IdentityDirectoryPageV1,
+    ProjectMembershipPage, ProjectMembershipResponse, ProjectPage, ProjectResponse,
+    PublicationResponse, PublicationStatus, QuotaStatusV1, ReleaseDownloadResponse, ReleasePage,
+    ReleaseResponse, ReleaseStatus, ReviewPage, ReviewPoolPageV1, ReviewPoolRequestResponseV1,
+    ReviewResponse, RevokeWaiverRequest, StudioCapabilitiesV1, SubmitReviewRequest,
+    UpdateWorkingCopyRequestV1, UpsertProjectMembershipRequest, ValidationRunDetailResponse,
+    ValidationRunPage, ValidationRunResponse, ValidationRunStatus, WaiverPage, WaiverResponse,
+    WorkingCopyReadinessV1, WorkingCopyV1,
 };
 use studio_core::{
-    ManifestFile, ProblemType, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
-    validate_manifest,
+    ManifestFile, ProblemType, ProjectRole, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
+    SubjectRef, validate_manifest,
 };
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use tempfile::NamedTempFile;
@@ -44,9 +51,12 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_WAIT_SECONDS: u64 = 30 * 60;
 const MAX_TRANSIENT_POLL_RETRIES: u32 = 8;
+const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_SSE_DATA_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
-enum StudioApiRequestError {
+#[doc(hidden)]
+pub enum StudioApiRequestError {
     #[error("Studio API {error_code}: {message} (trace {trace_id})")]
     Api {
         status: StatusCode,
@@ -62,6 +72,47 @@ enum StudioApiRequestError {
         #[source]
         source: reqwest::Error,
     },
+}
+
+#[doc(hidden)]
+pub struct RemoteErrorMetadata {
+    pub error_code: String,
+    pub retryable: bool,
+    pub trace_id: Option<String>,
+    pub status: Option<StatusCode>,
+}
+
+#[doc(hidden)]
+pub fn remote_error_metadata(error: &anyhow::Error) -> Option<RemoteErrorMetadata> {
+    error.chain().find_map(|cause| {
+        let remote = cause.downcast_ref::<StudioApiRequestError>()?;
+        Some(match remote {
+            StudioApiRequestError::Api {
+                status,
+                error_code,
+                retryable,
+                trace_id,
+                ..
+            } => RemoteErrorMetadata {
+                error_code: error_code.clone(),
+                retryable: *retryable || is_transient_http_status(*status),
+                trace_id: Some(trace_id.clone()),
+                status: Some(*status),
+            },
+            StudioApiRequestError::Http { status } => RemoteErrorMetadata {
+                error_code: "studio.http_error".into(),
+                retryable: is_transient_http_status(*status),
+                trace_id: None,
+                status: Some(*status),
+            },
+            StudioApiRequestError::Transport { .. } => RemoteErrorMetadata {
+                error_code: "infrastructure.transport".into(),
+                retryable: true,
+                trace_id: None,
+                status: None,
+            },
+        })
+    })
 }
 
 impl StudioApiRequestError {
@@ -149,8 +200,9 @@ pub struct PullOptions {
 pub struct PushOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
-    #[arg(long, default_value = "reporch.problem.json")]
-    pub manifest: PathBuf,
+    /// Deprecated 0.1.x manifest input. Omit to compile reporch.yaml automatically.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
     #[arg(long)]
     pub source_root: Option<PathBuf>,
     #[arg(long, default_value = "CLI push")]
@@ -164,9 +216,9 @@ pub struct ValidateOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub commit_id: Uuid,
+    pub commit_id: Option<Uuid>,
     /// Reuse this value after an ambiguous network failure.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -177,15 +229,35 @@ pub struct ValidateOptions {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+pub struct ValidationInspectOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub validation_run_id: Option<Uuid>,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ValidationScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
 pub struct PackageOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub commit_id: Uuid,
+    pub commit_id: Option<Uuid>,
     #[arg(long)]
-    pub validation_run_id: Uuid,
+    pub validation_run_id: Option<Uuid>,
     #[arg(long)]
     pub output: PathBuf,
     /// Reuse this value after an ambiguous network failure.
@@ -196,15 +268,72 @@ pub struct PackageOptions {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+pub struct ReleaseBuildOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub commit_id: Option<Uuid>,
+    #[arg(long)]
+    pub validation_run_id: Option<Uuid>,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub wait: bool,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReleaseScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReleaseShowOptions {
+    #[command(flatten)]
+    pub scope: ReleaseScopeOptions,
+    #[arg(long)]
+    pub release_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReleaseDownloadOptions {
+    #[command(flatten)]
+    pub target: ReleaseShowOptions,
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct EventsWatchOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    /// Resume after this durable Studio event sequence.
+    #[arg(long)]
+    pub cursor: Option<u64>,
+    /// Emit only events for this project. Studio still authorizes every event server-side.
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    /// Exit successfully after this many events. Omit to follow until interrupted.
+    #[arg(long)]
+    pub max_events: Option<usize>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
 pub struct SubmitReviewOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub commit_id: Uuid,
+    pub commit_id: Option<Uuid>,
     #[arg(long)]
-    pub validation_run_id: Uuid,
+    pub validation_run_id: Option<Uuid>,
     /// Reuse this value after an ambiguous network failure.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -215,7 +344,7 @@ pub struct ListReviewsOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -223,9 +352,12 @@ pub struct ApproveReviewOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub review_id: Uuid,
+    pub review_id: Option<Uuid>,
+    /// Decide an assignment claimed from the Reporch review pool.
+    #[arg(long, conflicts_with_all = ["project_id", "review_id"])]
+    pub pool_request_id: Option<Uuid>,
     #[arg(long)]
     pub comment: Option<String>,
     /// Reuse this value after an ambiguous network failure.
@@ -238,13 +370,211 @@ pub struct RequestChangesOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
     #[arg(long)]
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     #[arg(long)]
-    pub review_id: Uuid,
+    pub review_id: Option<Uuid>,
+    /// Decide an assignment claimed from the Reporch review pool.
+    #[arg(long, conflicts_with_all = ["project_id", "review_id"])]
+    pub pool_request_id: Option<Uuid>,
     /// Explain the changes needed. Empty comments are rejected locally.
     #[arg(long)]
     pub comment: String,
     /// Reuse this value after an ambiguous network failure.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReviewPoolRequestOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub review_id: Uuid,
+    /// Route this review through the independent Reporch reviewer pool.
+    #[arg(long, required = true, action = ArgAction::SetTrue)]
+    pub pool: bool,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReviewPoolTargetOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub pool_request_id: Uuid,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ReviewPoolInboxOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct MemberScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct MemberSearchOptions {
+    #[command(flatten)]
+    pub scope: MemberScopeOptions,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MemberRole {
+    Maintainer,
+    Author,
+    Reviewer,
+    Translator,
+    Viewer,
+}
+
+impl From<MemberRole> for ProjectRole {
+    fn from(value: MemberRole) -> Self {
+        match value {
+            MemberRole::Maintainer => Self::Maintainer,
+            MemberRole::Author => Self::Author,
+            MemberRole::Reviewer => Self::Reviewer,
+            MemberRole::Translator => Self::Translator,
+            MemberRole::Viewer => Self::Viewer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct UpsertMemberOptions {
+    #[command(flatten)]
+    pub scope: MemberScopeOptions,
+    #[arg(long)]
+    pub member_issuer: String,
+    #[arg(long)]
+    pub subject: String,
+    #[arg(long, value_enum)]
+    pub role: MemberRole,
+    #[arg(long, default_value_t = 0)]
+    pub entitlement_version: i64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RemoveMemberOptions {
+    #[command(flatten)]
+    pub scope: MemberScopeOptions,
+    #[arg(long)]
+    pub member_issuer: String,
+    #[arg(long)]
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct PublicationOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub release_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct PublishOptions {
+    #[command(flatten)]
+    pub target: PublicationOptions,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub wait: bool,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct WaiverScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub validation_run_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevisionScopeOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevisionShowOptions {
+    #[command(flatten)]
+    pub scope: RevisionScopeOptions,
+    #[arg(long)]
+    pub commit_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevisionDiffOptions {
+    #[command(flatten)]
+    pub scope: RevisionScopeOptions,
+    pub from: Uuid,
+    pub to: Uuid,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevisionRestoreOptions {
+    #[command(flatten)]
+    pub scope: RevisionScopeOptions,
+    /// Immutable commit to restore.
+    pub commit_id: Uuid,
+    /// New or empty directory for the restored checkout. Existing work is never overwritten.
+    #[arg(long)]
+    pub directory: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevisionDiffV1 {
+    pub schema: &'static str,
+    pub project_id: Uuid,
+    pub from_commit_id: Uuid,
+    pub to_commit_id: Uuid,
+    pub metadata_changed: Vec<String>,
+    pub files_added: Vec<String>,
+    pub files_modified: Vec<String>,
+    pub files_removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct CreateWaiverOptions {
+    #[command(flatten)]
+    pub scope: WaiverScopeOptions,
+    #[arg(long)]
+    pub issue_code: String,
+    #[arg(long)]
+    pub reason: String,
+    /// RFC 3339 timestamp after which this waiver is invalid.
+    #[arg(long)]
+    pub expires_at: String,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct RevokeWaiverOptions {
+    #[command(flatten)]
+    pub scope: WaiverScopeOptions,
+    #[arg(long)]
+    pub waiver_id: Uuid,
+    #[arg(long)]
+    pub reason: String,
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
@@ -302,6 +632,19 @@ impl StudioApiClient {
         decode_api_response(response).await
     }
 
+    async fn empty(&self, request: RequestBuilder) -> Result<()> {
+        let response = self
+            .authenticated(request)
+            .send()
+            .await
+            .map_err(studio_api_transport_error)?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let _: serde_json::Value = decode_api_response(response).await?;
+        Ok(())
+    }
+
     async fn create_project(
         &self,
         request: &CreateProjectRequest,
@@ -333,6 +676,20 @@ impl StudioApiClient {
         .await
     }
 
+    async fn list_commits_page(
+        &self,
+        project_id: Uuid,
+        cursor: Option<Uuid>,
+    ) -> Result<CommitPage> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/commits"))?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        self.json(self.http.get(url)).await
+    }
+
     async fn get_commit(&self, project_id: Uuid, commit_id: Uuid) -> Result<CommitDetailResponse> {
         self.json(
             self.http
@@ -349,8 +706,15 @@ impl StudioApiClient {
         .await
     }
 
-    async fn file_download(&self, project_id: Uuid, path: &str) -> Result<FileDownloadResponse> {
-        let mut url = self.endpoint(&format!("projects/{project_id}/file-download"))?;
+    async fn commit_file_download(
+        &self,
+        project_id: Uuid,
+        commit_id: Uuid,
+        path: &str,
+    ) -> Result<CommitFileDownloadResponse> {
+        let mut url = self.endpoint(&format!(
+            "projects/{project_id}/commits/{commit_id}/file-download"
+        ))?;
         url.query_pairs_mut().append_pair("path", path);
         self.json(self.http.get(url)).await
     }
@@ -400,6 +764,158 @@ impl StudioApiClient {
         .await
     }
 
+    async fn capabilities(&self) -> Result<StudioCapabilitiesV1> {
+        self.json(self.http.get(self.endpoint("capabilities")?))
+            .await
+    }
+
+    async fn quota(&self) -> Result<QuotaStatusV1> {
+        self.json(self.http.get(self.endpoint("quota")?)).await
+    }
+
+    async fn events_response(&self, cursor: Option<u64>) -> Result<Response> {
+        let mut url = self.endpoint("events")?;
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        let response = self
+            .authenticated(self.http.get(url).header(ACCEPT, "text/event-stream"))
+            .timeout(Duration::from_secs(30 * 60))
+            .send()
+            .await
+            .map_err(studio_api_transport_error)?;
+        if !response.status().is_success() {
+            let _: serde_json::Value = decode_api_response(response).await?;
+            unreachable!("a successful error response cannot be decoded")
+        }
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        ensure!(
+            content_type
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim() == "text/event-stream"),
+            "Studio events endpoint returned an unexpected Content-Type"
+        );
+        Ok(response)
+    }
+
+    async fn get_working_copy(&self, project_id: Uuid) -> Result<WorkingCopyV1> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("projects/{project_id}/working-copy"))?),
+        )
+        .await
+    }
+
+    async fn update_working_copy(
+        &self,
+        project_id: Uuid,
+        expected_revision: i64,
+        request: &UpdateWorkingCopyRequestV1,
+    ) -> Result<WorkingCopyV1> {
+        self.json(
+            self.http
+                .put(self.endpoint(&format!("projects/{project_id}/working-copy"))?)
+                .header(IF_MATCH, format!("\"{expected_revision}\""))
+                .json(request),
+        )
+        .await
+    }
+
+    async fn commit_working_copy(
+        &self,
+        project_id: Uuid,
+        request: &CommitWorkingCopyRequestV1,
+        idempotency_key: &str,
+    ) -> Result<CommitResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("projects/{project_id}/working-copy/commits"))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn working_copy_readiness(&self, project_id: Uuid) -> Result<WorkingCopyReadinessV1> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("projects/{project_id}/readiness"))?),
+        )
+        .await
+    }
+
+    async fn list_members(&self, project_id: Uuid) -> Result<ProjectMembershipPage> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("projects/{project_id}/memberships"))?),
+        )
+        .await
+    }
+
+    async fn search_members(
+        &self,
+        project_id: Uuid,
+        query: &str,
+    ) -> Result<IdentityDirectoryPageV1> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/identity-directory"))?;
+        url.query_pairs_mut().append_pair("q", query);
+        self.json(self.http.get(url)).await
+    }
+
+    async fn upsert_member(
+        &self,
+        project_id: Uuid,
+        request: &UpsertProjectMembershipRequest,
+    ) -> Result<ProjectMembershipResponse> {
+        self.json(
+            self.http
+                .put(self.endpoint(&format!("projects/{project_id}/memberships"))?)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn remove_member(&self, project_id: Uuid, issuer: &str, subject: &str) -> Result<()> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/memberships"))?;
+        url.query_pairs_mut()
+            .append_pair("issuer", issuer)
+            .append_pair("subject", subject);
+        self.empty(self.http.delete(url)).await
+    }
+
+    async fn publish_release(
+        &self,
+        project_id: Uuid,
+        release_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<PublicationResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/releases/{release_id}/publication"
+                ))?)
+                .header("idempotency-key", idempotency_key),
+        )
+        .await
+    }
+
+    async fn get_publication(
+        &self,
+        project_id: Uuid,
+        release_id: Uuid,
+    ) -> Result<PublicationResponse> {
+        self.json(self.http.get(self.endpoint(&format!(
+            "projects/{project_id}/releases/{release_id}/publication"
+        ))?))
+        .await
+    }
+
     async fn enqueue_validation(
         &self,
         project_id: Uuid,
@@ -426,6 +942,50 @@ impl StudioApiClient {
         .await
     }
 
+    async fn list_waivers(&self, project_id: Uuid, validation_id: Uuid) -> Result<WaiverPage> {
+        self.json(self.http.get(self.endpoint(&format!(
+            "projects/{project_id}/validations/{validation_id}/waivers"
+        ))?))
+        .await
+    }
+
+    async fn create_waiver(
+        &self,
+        project_id: Uuid,
+        validation_id: Uuid,
+        request: &CreateWaiverRequest,
+        idempotency_key: &str,
+    ) -> Result<WaiverResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/validations/{validation_id}/waivers"
+                ))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn revoke_waiver(
+        &self,
+        project_id: Uuid,
+        validation_id: Uuid,
+        waiver_id: Uuid,
+        request: &RevokeWaiverRequest,
+        idempotency_key: &str,
+    ) -> Result<WaiverResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/validations/{validation_id}/waivers/{waiver_id}/revocation"
+                ))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
     async fn create_release(
         &self,
         project_id: Uuid,
@@ -439,6 +999,30 @@ impl StudioApiClient {
                 .json(request),
         )
         .await
+    }
+
+    async fn list_releases(&self, project_id: Uuid, cursor: Option<Uuid>) -> Result<ReleasePage> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/releases"))?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        self.json(self.http.get(url)).await
+    }
+
+    async fn list_validations(
+        &self,
+        project_id: Uuid,
+        cursor: Option<Uuid>,
+    ) -> Result<ValidationRunPage> {
+        let mut url = self.endpoint(&format!("projects/{project_id}/validations"))?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        self.json(self.http.get(url)).await
     }
 
     async fn submit_review(
@@ -477,6 +1061,80 @@ impl StudioApiClient {
                 .post(self.endpoint(&format!(
                     "projects/{project_id}/reviews/{review_id}/decisions"
                 ))?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn request_review_pool(
+        &self,
+        project_id: Uuid,
+        review_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<ReviewPoolRequestResponseV1> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!(
+                    "projects/{project_id}/reviews/{review_id}/pool-request"
+                ))?)
+                .header("idempotency-key", idempotency_key),
+        )
+        .await
+    }
+
+    async fn get_review_pool_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<ReviewPoolRequestResponseV1> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("review-pool/{request_id}"))?),
+        )
+        .await
+    }
+
+    async fn list_review_pool_inbox(&self, cursor: Option<Uuid>) -> Result<ReviewPoolPageV1> {
+        let mut url = self.endpoint("review-pool/inbox")?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor.to_string());
+        }
+        self.json(self.http.get(url)).await
+    }
+
+    async fn claim_review_pool_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<ReviewPoolRequestResponseV1> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("review-pool/{request_id}/claim"))?),
+        )
+        .await
+    }
+
+    async fn cancel_review_pool_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<ReviewPoolRequestResponseV1> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("review-pool/{request_id}/cancel"))?),
+        )
+        .await
+    }
+
+    async fn decide_pool_review(
+        &self,
+        request_id: Uuid,
+        request: &CreateReviewDecisionRequest,
+        idempotency_key: &str,
+    ) -> Result<ReviewResponse> {
+        self.json(
+            self.http
+                .post(self.endpoint(&format!("review-pool/{request_id}/decision"))?)
                 .header("idempotency-key", idempotency_key)
                 .json(request),
         )
@@ -709,6 +1367,96 @@ pub struct PackageOperationResult {
     pub package_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EventWatchItem {
+    pub cursor: u64,
+    pub event: EventEnvelopeV1,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EventWatchResult {
+    pub events: Vec<EventWatchItem>,
+    pub last_cursor: Option<u64>,
+    pub interrupted: bool,
+}
+
+#[derive(Debug, Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+    id: Option<String>,
+    event: Option<String>,
+    data_lines: Vec<String>,
+    data_bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SseFrame {
+    id: Option<String>,
+    event: Option<String>,
+    data: Option<String>,
+}
+
+impl SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>> {
+        self.buffer.extend_from_slice(chunk);
+        ensure!(
+            self.buffer.len() <= MAX_SSE_BUFFER_BYTES,
+            "Studio SSE line exceeded the 1 MiB client bound"
+        );
+        let mut frames = Vec::new();
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut raw = self.buffer.drain(..=newline).collect::<Vec<_>>();
+            raw.pop();
+            if raw.last() == Some(&b'\r') {
+                raw.pop();
+            }
+            let line = std::str::from_utf8(&raw).context("Studio SSE was not UTF-8")?;
+            if let Some(frame) = self.line(line)? {
+                frames.push(frame);
+            }
+        }
+        Ok(frames)
+    }
+
+    fn line(&mut self, line: &str) -> Result<Option<SseFrame>> {
+        if line.is_empty() {
+            if self.id.is_none() && self.event.is_none() && self.data_lines.is_empty() {
+                return Ok(None);
+            }
+            let frame = SseFrame {
+                id: self.id.take(),
+                event: self.event.take(),
+                data: (!self.data_lines.is_empty()).then(|| self.data_lines.join("\n")),
+            };
+            self.data_lines.clear();
+            self.data_bytes = 0;
+            return Ok(Some(frame));
+        }
+        if line.starts_with(':') {
+            return Ok(None);
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "id" if !value.contains('\0') => self.id = Some(value.to_owned()),
+            "event" => self.event = Some(value.to_owned()),
+            "data" => {
+                self.data_bytes = self
+                    .data_bytes
+                    .checked_add(value.len() + usize::from(!self.data_lines.is_empty()))
+                    .context("Studio SSE data size overflow")?;
+                ensure!(
+                    self.data_bytes <= MAX_SSE_DATA_BYTES,
+                    "Studio SSE event exceeded the 1 MiB client bound"
+                );
+                self.data_lines.push(value.to_owned());
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+}
+
 pub async fn list_projects_operation(connection: &RemoteConnectionOptions) -> Result<ProjectPage> {
     let client = StudioApiClient::connect(connection).await?;
     let mut items = Vec::new();
@@ -730,6 +1478,403 @@ pub async fn list_projects_operation(connection: &RemoteConnectionOptions) -> Re
         cursor = Some(next_cursor);
     }
     bail!("Studio project listing exceeded the 10,000-item native client bound")
+}
+
+pub async fn capabilities_operation(
+    connection: &RemoteConnectionOptions,
+) -> Result<StudioCapabilitiesV1> {
+    let capabilities = StudioApiClient::connect(connection)
+        .await?
+        .capabilities()
+        .await?;
+    ensure_cli_compatible(&capabilities)?;
+    Ok(capabilities)
+}
+
+pub async fn quota_operation(connection: &RemoteConnectionOptions) -> Result<QuotaStatusV1> {
+    StudioApiClient::connect(connection).await?.quota().await
+}
+
+pub async fn watch_events_operation<F>(
+    options: &EventsWatchOptions,
+    mut emit: F,
+) -> Result<EventWatchResult>
+where
+    F: FnMut(&EventWatchItem) -> Result<()>,
+{
+    ensure!(
+        options
+            .max_events
+            .is_none_or(|max_events| (1..=10_000).contains(&max_events)),
+        "--max-events must be between 1 and 10000"
+    );
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut cursor = options.cursor;
+    let mut events = Vec::new();
+    let mut reconnect_attempt = 0_u32;
+    loop {
+        let response = match client.events_response(cursor).await {
+            Ok(response) => response,
+            Err(error)
+                if is_transient_api_error(&error)
+                    && reconnect_attempt < MAX_TRANSIENT_POLL_RETRIES =>
+            {
+                reconnect_attempt += 1;
+                tokio::time::sleep(transient_poll_delay(reconnect_attempt)).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("connect Studio event stream"),
+        };
+        let mut stream = response.bytes_stream();
+        let mut decoder = SseDecoder::default();
+        let mut reconnect_requested = false;
+        loop {
+            let next = tokio::select! {
+                interrupted = tokio::signal::ctrl_c() => {
+                    interrupted.context("listen for interrupt")?;
+                    return Ok(EventWatchResult {
+                        events,
+                        last_cursor: cursor,
+                        interrupted: true,
+                    });
+                }
+                next = stream.next() => next,
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let error = studio_api_transport_error(error);
+                    if is_transient_api_error(&error) {
+                        break;
+                    }
+                    return Err(error).context("read Studio event stream");
+                }
+            };
+            for frame in decoder.push(&chunk)? {
+                if let Some(id) = frame.id {
+                    cursor = Some(parse_event_cursor(&id)?);
+                }
+                if frame.event.as_deref() == Some("studio.stream.error.v1") {
+                    reconnect_requested = true;
+                    break;
+                }
+                let Some(data) = frame.data else {
+                    continue;
+                };
+                let event: EventEnvelopeV1 =
+                    serde_json::from_str(&data).context("decode Studio event envelope")?;
+                ensure!(
+                    event.schema == EVENT_SCHEMA_V1 && event.event_version == 1,
+                    "Studio returned an unsupported event envelope"
+                );
+                if let Some(sse_type) = frame.event.as_deref() {
+                    ensure!(
+                        sse_type == event.event_type,
+                        "Studio SSE type did not match its event envelope"
+                    );
+                }
+                let event_cursor = cursor.context("Studio event was missing a durable cursor")?;
+                reconnect_attempt = 0;
+                if options
+                    .project_id
+                    .is_some_and(|project_id| event.project_id != Some(project_id))
+                {
+                    continue;
+                }
+                let item = EventWatchItem {
+                    cursor: event_cursor,
+                    event,
+                };
+                if let Some(max_events) = options.max_events {
+                    events.push(item);
+                    if events.len() == max_events {
+                        return Ok(EventWatchResult {
+                            events,
+                            last_cursor: cursor,
+                            interrupted: false,
+                        });
+                    }
+                } else {
+                    emit(&item)?;
+                }
+            }
+            if reconnect_requested {
+                break;
+            }
+        }
+        reconnect_attempt += 1;
+        ensure!(
+            reconnect_attempt <= MAX_TRANSIENT_POLL_RETRIES,
+            "Studio event stream disconnected repeatedly"
+        );
+        tokio::time::sleep(transient_poll_delay(reconnect_attempt)).await;
+    }
+}
+
+fn parse_event_cursor(value: &str) -> Result<u64> {
+    ensure!(
+        !value.is_empty() && value.len() <= 19 && value.bytes().all(|byte| byte.is_ascii_digit()),
+        "Studio returned an invalid event cursor"
+    );
+    let cursor = value.parse::<u64>()?;
+    ensure!(
+        cursor < i64::MAX as u64,
+        "Studio event cursor exceeded the supported range"
+    );
+    Ok(cursor)
+}
+
+pub async fn list_revisions_operation(options: &RevisionScopeOptions) -> Result<CommitPage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_commits_page(project_id, cursor).await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|commit| commit.project_id == project_id),
+            "Studio returned a revision from another project"
+        );
+        items.extend(page.items);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(CommitPage {
+                items,
+                next_cursor: None,
+            });
+        };
+        ensure!(
+            seen.insert(next_cursor),
+            "Studio returned a repeated revision cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio revision listing exceeded the 10,000-item client bound")
+}
+
+pub async fn show_revision_operation(
+    options: &RevisionShowOptions,
+) -> Result<CommitDetailResponse> {
+    let (project_id, commit_id, _) =
+        resolve_local_candidate(options.scope.project_id, options.commit_id)?;
+    let commit = StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .get_commit(project_id, commit_id)
+        .await?;
+    ensure!(
+        commit.project_id == project_id,
+        "Studio returned a revision from another project"
+    );
+    Ok(commit)
+}
+
+pub async fn diff_revisions_operation(options: &RevisionDiffOptions) -> Result<RevisionDiffV1> {
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    ensure!(options.from != options.to, "revision IDs must be different");
+    let client = StudioApiClient::connect(&options.scope.connection).await?;
+    let from = client.get_commit(project_id, options.from).await?;
+    let to = client.get_commit(project_id, options.to).await?;
+    ensure!(
+        from.project_id == project_id && to.project_id == project_id,
+        "Studio returned a revision from another project"
+    );
+    Ok(diff_revisions(&from, &to))
+}
+
+pub async fn restore_revision_operation(
+    options: &RevisionRestoreOptions,
+) -> Result<PullOperationResult> {
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    pull_operation(&PullOptions {
+        connection: options.scope.connection.clone(),
+        project_id,
+        commit_id: Some(options.commit_id),
+        directory: options.directory.clone(),
+    })
+    .await
+}
+
+fn diff_revisions(from: &CommitDetailResponse, to: &CommitDetailResponse) -> RevisionDiffV1 {
+    let from_spec = reporch_format::AuthoringSpecV1::from_manifest(&from.manifest);
+    let to_spec = reporch_format::AuthoringSpecV1::from_manifest(&to.manifest);
+    let from_json = serde_json::to_value(&from_spec).expect("AuthoringSpec serializes");
+    let to_json = serde_json::to_value(&to_spec).expect("AuthoringSpec serializes");
+    let mut metadata_changed = Vec::new();
+    let empty = serde_json::Map::new();
+    let from_object = from_json.as_object().unwrap_or(&empty);
+    let to_object = to_json.as_object().unwrap_or(&empty);
+    for key in from_object.keys().chain(to_object.keys()) {
+        if key != "files"
+            && from_object.get(key) != to_object.get(key)
+            && !metadata_changed.iter().any(|existing| existing == key)
+        {
+            metadata_changed.push(key.clone());
+        }
+    }
+    metadata_changed.sort();
+
+    let from_files = from
+        .manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let to_files = to
+        .manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let files_added = to_files
+        .keys()
+        .filter(|path| !from_files.contains_key(**path))
+        .map(|path| (*path).to_owned())
+        .collect();
+    let files_removed = from_files
+        .keys()
+        .filter(|path| !to_files.contains_key(**path))
+        .map(|path| (*path).to_owned())
+        .collect();
+    let files_modified = to_files
+        .iter()
+        .filter(|(path, file)| from_files.get(**path).is_some_and(|old| *old != **file))
+        .map(|(path, _)| (*path).to_owned())
+        .collect();
+    RevisionDiffV1 {
+        schema: "reporch.revision-diff.v1",
+        project_id: from.project_id,
+        from_commit_id: from.id,
+        to_commit_id: to.id,
+        metadata_changed,
+        files_added,
+        files_modified,
+        files_removed,
+    }
+}
+
+pub async fn list_members_operation(options: &MemberScopeOptions) -> Result<ProjectMembershipPage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    StudioApiClient::connect(&options.connection)
+        .await?
+        .list_members(project_id)
+        .await
+}
+
+pub async fn search_members_operation(
+    options: &MemberSearchOptions,
+) -> Result<IdentityDirectoryPageV1> {
+    let query = options.query.trim();
+    ensure!(
+        (2..=100).contains(&query.len()),
+        "search query must contain 2 to 100 characters"
+    );
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .search_members(project_id, query)
+        .await
+}
+
+pub async fn upsert_member_operation(
+    options: &UpsertMemberOptions,
+) -> Result<ProjectMembershipResponse> {
+    ensure!(
+        !options.member_issuer.trim().is_empty(),
+        "member issuer cannot be empty"
+    );
+    ensure!(
+        !options.subject.trim().is_empty(),
+        "subject cannot be empty"
+    );
+    ensure!(
+        options.entitlement_version >= 0,
+        "entitlement version cannot be negative"
+    );
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .upsert_member(
+            project_id,
+            &UpsertProjectMembershipRequest {
+                member: SubjectRef {
+                    issuer: options.member_issuer.trim().into(),
+                    subject: options.subject.trim().into(),
+                },
+                role: options.role.into(),
+                entitlement_version: options.entitlement_version,
+            },
+        )
+        .await
+}
+
+pub async fn remove_member_operation(options: &RemoveMemberOptions) -> Result<serde_json::Value> {
+    ensure!(
+        !options.member_issuer.trim().is_empty(),
+        "member issuer cannot be empty"
+    );
+    ensure!(
+        !options.subject.trim().is_empty(),
+        "subject cannot be empty"
+    );
+    let project_id = resolve_local_project_id(options.scope.project_id)?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .remove_member(
+            project_id,
+            options.member_issuer.trim(),
+            options.subject.trim(),
+        )
+        .await?;
+    Ok(serde_json::json!({
+        "project_id": project_id,
+        "issuer": options.member_issuer.trim(),
+        "subject": options.subject.trim(),
+        "removed": true,
+    }))
+}
+
+pub async fn publication_status_operation(
+    options: &PublicationOptions,
+) -> Result<PublicationResponse> {
+    let (project_id, release_id) = resolve_local_release(options.project_id, options.release_id)?;
+    StudioApiClient::connect(&options.connection)
+        .await?
+        .get_publication(project_id, release_id)
+        .await
+}
+
+pub async fn publish_operation(options: &PublishOptions) -> Result<PublicationResponse> {
+    validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, release_id) =
+        resolve_local_release(options.target.project_id, options.target.release_id)?;
+    let key = operation_key("cli-publication", options.idempotency_key.as_deref())?;
+    let client = StudioApiClient::connect(&options.target.connection).await?;
+    let publication = client.publish_release(project_id, release_id, &key).await?;
+    if !options.wait || is_publication_terminal(publication.status) {
+        return Ok(publication);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(options.timeout_seconds);
+    loop {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "publication timed out"
+        );
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let publication = client.get_publication(project_id, release_id).await?;
+        if is_publication_terminal(publication.status) {
+            ensure!(
+                publication.status == PublicationStatus::Published,
+                "publication failed: {}",
+                publication.error_code.as_deref().unwrap_or("unknown")
+            );
+            return Ok(publication);
+        }
+    }
 }
 
 pub async fn create_operation(options: &CreateOptions) -> Result<ProjectResponse> {
@@ -756,6 +1901,7 @@ pub async fn create_operation(options: &CreateOptions) -> Result<ProjectResponse
         .await?;
     if let Some(directory) = &options.directory {
         crate::init_project_template(directory, title, project.id, options.problem_type.into())?;
+        crate::local_project::link_project(directory, &options.connection.api_url, project.id)?;
     }
     Ok(project)
 }
@@ -825,8 +1971,10 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         .prefix(".reporch-pull-")
         .tempdir_in(parent)?;
     for file in &commit.manifest.files {
-        let descriptor = client.file_download(options.project_id, &file.path).await?;
-        verify_file_descriptor(file, &descriptor)?;
+        let descriptor = client
+            .commit_file_download(options.project_id, commit_id, &file.path)
+            .await?;
+        verify_commit_file_descriptor(commit_id, file, &descriptor)?;
         let output = staging.path().join(&file.path);
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
@@ -844,6 +1992,25 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         &staging.path().join("reporch.problem.json"),
         &commit.manifest,
     )?;
+    let authoring_spec = reporch_format::AuthoringSpecV1::from_manifest(&commit.manifest);
+    crate::local_project::write_authoring_spec_create_new(staging.path(), &authoring_spec)?;
+    let working_copy_revision = match client.get_working_copy(options.project_id).await {
+        Ok(working_copy) if working_copy.spec == authoring_spec => {
+            Some(working_copy.revision.to_string())
+        }
+        _ => None,
+    };
+    let state = crate::local_project::LocalStateV1 {
+        remote: Some(crate::local_project::RemoteLinkV1 {
+            api_url: options.connection.api_url.trim_end_matches('/').to_owned(),
+            project_id: options.project_id,
+        }),
+        base_revision: working_copy_revision,
+        baseline_working_digest: Some(commit.manifest_digest.to_string()),
+        last_commit_id: Some(commit.id),
+        ..Default::default()
+    };
+    crate::local_project::write_local_state(staging.path(), &state)?;
     let staging = staging.keep();
     if destination_was_empty {
         fs::remove_dir(&options.directory).with_context(|| {
@@ -885,62 +2052,172 @@ pub async fn pull(options: &PullOptions) -> Result<()> {
 
 pub async fn push_operation(options: &PushOptions) -> Result<PushOperationResult> {
     validate_wait_timeout(options.timeout_seconds)?;
-    let manifest = read_manifest(&options.manifest)?;
+    let Some(manifest_path) = options.manifest.as_ref() else {
+        return push_authoring_operation(options).await;
+    };
+    let manifest = read_manifest(manifest_path)?;
     let issues = validate_manifest(&manifest);
     if !issues.is_empty() {
-        println!("{}", serde_json::to_string_pretty(&issues)?);
-        bail!("manifest validation failed with {} issue(s)", issues.len());
+        bail!(
+            "manifest validation failed with {} issue(s): {}",
+            issues.len(),
+            serde_json::to_string(&issues)?
+        );
     }
     let source_root = options
         .source_root
         .clone()
-        .or_else(|| options.manifest.parent().map(Path::to_path_buf))
+        .or_else(|| manifest_path.parent().map(Path::to_path_buf))
         .context("manifest path has no source root")?;
+    push_manifest(options, manifest, source_root).await
+}
+
+async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperationResult> {
+    let root = crate::local_project::discover_project(Path::new("."))?;
+    if let Some(source_root) = &options.source_root {
+        ensure!(
+            fs::canonicalize(source_root)? == root,
+            "--source-root must match the discovered reporch.yaml project root"
+        );
+    }
+    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let mut state = crate::local_project::read_local_state(&root)?;
+    let remote = state
+        .remote
+        .as_ref()
+        .context("project is not linked; run reporch project link")?;
+    ensure!(
+        remote.project_id == spec.project_id,
+        "local link and reporch.yaml project IDs differ"
+    );
+    ensure!(
+        remote.api_url.trim_end_matches('/') == options.connection.api_url.trim_end_matches('/'),
+        "linked Studio API URL differs from the selected connection"
+    );
+
     let client = StudioApiClient::connect(&options.connection).await?;
-    let remote = client
-        .list_files(manifest.project_id)
-        .await?
-        .items
-        .into_iter()
-        .map(|file| (file.path.clone(), file))
-        .collect::<HashMap<_, _>>();
-    let mut uploaded = 0_usize;
-    for file in &manifest.files {
-        let source = source_root.join(&file.path);
-        verify_local_file(&source, file).await?;
-        if remote.get(&file.path).is_some_and(|remote| {
-            remote.sha256 == file.sha256
-                && remote.size_bytes == file.size_bytes
-                && remote.media_type == file.media_type
-                && remote.executable == file.executable
-        }) {
-            continue;
+    let capabilities = client.capabilities().await?;
+    ensure_cli_compatible(&capabilities)?;
+    ensure!(
+        capabilities
+            .authoring_spec_versions
+            .iter()
+            .any(|schema| schema == reporch_format::AUTHORING_SPEC_SCHEMA_V1),
+        "Studio does not support {}",
+        reporch_format::AUTHORING_SPEC_SCHEMA_V1
+    );
+
+    let upload_manifest = crate::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let uploaded = upload_manifest_files(&client, options, &upload_manifest, &root).await?;
+
+    if uploaded == 0
+        && let Some(last_commit_id) = state.last_commit_id
+    {
+        let candidate = crate::local_project::compile_authoring_spec(&root, &spec, last_commit_id)?;
+        if state.baseline_working_digest.as_deref() == Some(candidate.digest()?.as_str()) {
+            let commits = client.list_commits(spec.project_id).await?;
+            if let Some(head) = commits.items.first()
+                && head.id == last_commit_id
+                && head.manifest_digest == candidate.digest()?
+            {
+                return Ok(PushOperationResult {
+                    uploaded_files: 0,
+                    commit: CommitResponse {
+                        id: head.id,
+                        project_id: head.project_id,
+                        sequence: head.sequence,
+                        manifest_digest: head.manifest_digest.clone(),
+                        created_at: head.created_at,
+                    },
+                });
+            }
         }
-        let upload = client
-            .begin_upload(
-                manifest.project_id,
-                &BeginFileUploadRequest {
-                    path: file.path.clone(),
-                    sha256: file.sha256.clone(),
-                    size_bytes: file.size_bytes,
-                    media_type: file.media_type.clone(),
-                    executable: file.executable,
-                },
+    }
+
+    let remote_copy = client.get_working_copy(spec.project_id).await?;
+    if let Some(base_revision) = state.base_revision.as_deref() {
+        let base_revision: i64 = base_revision
+            .parse()
+            .context("invalid working-copy base revision in local state")?;
+        ensure!(
+            base_revision == remote_copy.revision,
+            "revision conflict: local base {base_revision}, remote working copy {}",
+            remote_copy.revision
+        );
+    } else if remote_copy.revision > 0 && remote_copy.spec != spec {
+        bail!(
+            "revision conflict: the remote working copy changed; pull or inspect the diff before pushing"
+        );
+    }
+    let saved_copy = if remote_copy.spec == spec {
+        remote_copy
+    } else {
+        client
+            .update_working_copy(
+                spec.project_id,
+                remote_copy.revision,
+                &UpdateWorkingCopyRequestV1 { spec: spec.clone() },
             )
-            .await?;
-        client.upload_file(&source, &upload).await?;
-        let status = client
-            .complete_upload(manifest.project_id, upload.upload.id)
-            .await?;
-        wait_for_upload(
-            &client,
-            manifest.project_id,
-            status,
-            options.timeout_seconds,
+            .await?
+    };
+    state.base_revision = Some(saved_copy.revision.to_string());
+    let push_operation = format!(
+        "push:{}",
+        Sha256Digest::from_bytes(
+            format!("{}\n{}", saved_copy.revision, options.message).as_bytes()
+        )
+    );
+    let commit_key = state
+        .pending_idempotency_keys
+        .entry(push_operation)
+        .or_insert(operation_key("cli-push", None)?)
+        .clone();
+    crate::local_project::write_local_state(&root, &state)?;
+    let readiness = client.working_copy_readiness(spec.project_id).await?;
+    ensure!(
+        readiness.can_commit,
+        "working copy is not ready: {}",
+        readiness.issues.join("; ")
+    );
+    let commit = client
+        .commit_working_copy(
+            spec.project_id,
+            &CommitWorkingCopyRequestV1 {
+                message: options.message.clone(),
+            },
+            &commit_key,
         )
         .await?;
-        uploaded += 1;
-    }
+    let manifest = crate::local_project::compile_authoring_spec(&root, &spec, commit.id)?;
+    let manifest_digest = manifest.digest()?;
+    ensure!(
+        commit.manifest_digest == manifest_digest,
+        "Studio compiled a different immutable manifest"
+    );
+    let result = PushOperationResult {
+        uploaded_files: uploaded,
+        commit,
+    };
+
+    crate::local_project::write_generated_manifest_atomic(&root, &manifest)?;
+    state.baseline_working_digest = Some(manifest_digest.to_string());
+    state.last_commit_id = Some(result.commit.id);
+    state.last_validation_run_id = None;
+    state.last_release_id = None;
+    state
+        .pending_idempotency_keys
+        .retain(|key, _| !key.starts_with("push:"));
+    crate::local_project::write_local_state(&root, &state)?;
+    Ok(result)
+}
+
+async fn push_manifest(
+    options: &PushOptions,
+    manifest: ReleaseManifestV1,
+    source_root: PathBuf,
+) -> Result<PushOperationResult> {
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let uploaded = upload_manifest_files(&client, options, &manifest, &source_root).await?;
     let manifest_digest = manifest.digest()?;
     if uploaded == 0 {
         let commits = client.list_commits(manifest.project_id).await?;
@@ -988,6 +2265,53 @@ pub async fn push_operation(options: &PushOptions) -> Result<PushOperationResult
     })
 }
 
+async fn upload_manifest_files(
+    client: &StudioApiClient,
+    options: &PushOptions,
+    manifest: &ReleaseManifestV1,
+    source_root: &Path,
+) -> Result<usize> {
+    let remote = client
+        .list_files(manifest.project_id)
+        .await?
+        .items
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    let mut uploaded = 0_usize;
+    for file in &manifest.files {
+        let source = source_root.join(&file.path);
+        verify_local_file(&source, file).await?;
+        if remote.get(&file.path).is_some_and(|remote| {
+            remote.sha256 == file.sha256
+                && remote.size_bytes == file.size_bytes
+                && remote.media_type == file.media_type
+                && remote.executable == file.executable
+        }) {
+            continue;
+        }
+        let upload = client
+            .begin_upload(
+                manifest.project_id,
+                &BeginFileUploadRequest {
+                    path: file.path.clone(),
+                    sha256: file.sha256.clone(),
+                    size_bytes: file.size_bytes,
+                    media_type: file.media_type.clone(),
+                    executable: file.executable,
+                },
+            )
+            .await?;
+        client.upload_file(&source, &upload).await?;
+        let status = client
+            .complete_upload(manifest.project_id, upload.upload.id)
+            .await?;
+        wait_for_upload(client, manifest.project_id, status, options.timeout_seconds).await?;
+        uploaded += 1;
+    }
+    Ok(uploaded)
+}
+
 fn is_unchanged_remote_head(
     uploaded_files: usize,
     local_commit_id: Uuid,
@@ -1012,39 +2336,95 @@ pub async fn push(options: &PushOptions) -> Result<()> {
 
 pub async fn validate_operation(options: &ValidateOptions) -> Result<ValidationOperationResult> {
     validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, commit_id, local_root) =
+        resolve_local_candidate(options.project_id, options.commit_id)?;
     let key = operation_key("cli-validation", options.idempotency_key.as_deref())?;
     eprintln!("Idempotency-Key: {key}");
     let client = StudioApiClient::connect(&options.connection).await?;
     let queued = client
-        .enqueue_validation(
-            options.project_id,
-            &EnqueueValidationRequest {
-                commit_id: options.commit_id,
-            },
-            &key,
-        )
+        .enqueue_validation(project_id, &EnqueueValidationRequest { commit_id }, &key)
         .await?;
     ensure!(
-        queued.project_id == options.project_id && queued.commit_id == options.commit_id,
+        queued.project_id == project_id && queued.commit_id == commit_id,
         "Studio returned a mismatched validation run"
     );
     if !options.wait {
-        return Ok(ValidationOperationResult {
+        let result = ValidationOperationResult {
             queued,
             detail: None,
-        });
+        };
+        if let Some(root) = local_root {
+            let mut state = crate::local_project::read_local_state(&root)?;
+            state.last_validation_run_id = Some(result.queued.id);
+            crate::local_project::write_local_state(&root, &state)?;
+        }
+        return Ok(result);
     }
-    let detail = wait_for_validation(
-        &client,
-        options.project_id,
-        queued.id,
-        options.timeout_seconds,
-    )
-    .await?;
-    Ok(ValidationOperationResult {
+    let detail =
+        wait_for_validation(&client, project_id, queued.id, options.timeout_seconds).await?;
+    let result = ValidationOperationResult {
         queued,
         detail: Some(detail),
-    })
+    };
+    if let Some(root) = local_root {
+        let mut state = crate::local_project::read_local_state(&root)?;
+        state.last_validation_run_id = Some(result.queued.id);
+        crate::local_project::write_local_state(&root, &state)?;
+    }
+    Ok(result)
+}
+
+pub async fn validation_show_operation(
+    options: &ValidationInspectOptions,
+) -> Result<ValidationRunDetailResponse> {
+    let (project_id, validation_id) =
+        resolve_local_validation(options.project_id, options.validation_run_id)?;
+    StudioApiClient::connect(&options.connection)
+        .await?
+        .get_validation(project_id, validation_id)
+        .await
+}
+
+pub async fn list_validations_operation(
+    options: &ValidationScopeOptions,
+) -> Result<ValidationRunPage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_validations(project_id, cursor).await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|validation| validation.project_id == project_id),
+            "Studio returned a validation from another project"
+        );
+        items.extend(page.items);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(ValidationRunPage {
+                items,
+                next_cursor: None,
+            });
+        };
+        ensure!(
+            seen.insert(next_cursor),
+            "Studio returned a repeated validation cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio validation listing exceeded the 10,000-item native client bound")
+}
+
+pub async fn validation_watch_operation(
+    options: &ValidationInspectOptions,
+) -> Result<ValidationRunDetailResponse> {
+    validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, validation_id) =
+        resolve_local_validation(options.project_id, options.validation_run_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    wait_for_validation(&client, project_id, validation_id, options.timeout_seconds).await
 }
 
 pub async fn validate(options: &ValidateOptions) -> Result<()> {
@@ -1060,8 +2440,128 @@ pub async fn validate(options: &ValidateOptions) -> Result<()> {
     Ok(())
 }
 
+pub async fn build_release_operation(options: &ReleaseBuildOptions) -> Result<ReleaseResponse> {
+    validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, commit_id, local_root) =
+        resolve_local_candidate(options.project_id, options.commit_id)?;
+    let validation_run_id = match options.validation_run_id {
+        Some(id) => id,
+        None => {
+            let root = local_root
+                .as_ref()
+                .context("--validation-run-id is required outside a local project")?;
+            crate::local_project::read_local_state(root)?
+                .last_validation_run_id
+                .context("no validation is recorded; run reporch verify first")?
+        }
+    };
+    let key = operation_key("cli-release", options.idempotency_key.as_deref())?;
+    eprintln!("Idempotency-Key: {key}");
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let release = client
+        .create_release(
+            project_id,
+            &CreateReleaseRequest {
+                commit_id,
+                validation_run_id,
+            },
+            &key,
+        )
+        .await?;
+    let release = if options.wait {
+        wait_for_release(&client, project_id, release, options.timeout_seconds).await?
+    } else {
+        release
+    };
+    if options.wait {
+        ensure!(
+            release.status == ReleaseStatus::Ready,
+            "release build failed: {}",
+            release.error_code.as_deref().unwrap_or("unknown")
+        );
+    }
+    if let Some(root) = local_root {
+        let mut state = crate::local_project::read_local_state(&root)?;
+        state.last_release_id = Some(release.id);
+        crate::local_project::write_local_state(&root, &state)?;
+    }
+    Ok(release)
+}
+
+pub async fn list_releases_operation(options: &ReleaseScopeOptions) -> Result<ReleasePage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_releases(project_id, cursor).await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|release| release.project_id == project_id),
+            "Studio returned a release from another project"
+        );
+        items.extend(page.items);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(ReleasePage {
+                items,
+                next_cursor: None,
+            });
+        };
+        ensure!(
+            seen.insert(next_cursor),
+            "Studio returned a repeated release cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio release listing exceeded the 10,000-item native client bound")
+}
+
+pub async fn show_release_operation(options: &ReleaseShowOptions) -> Result<ReleaseResponse> {
+    let (project_id, release_id) =
+        resolve_local_release(options.scope.project_id, options.release_id)?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .get_release(project_id, release_id)
+        .await
+}
+
+pub async fn download_release_operation(
+    options: &ReleaseDownloadOptions,
+) -> Result<PackageOperationResult> {
+    ensure!(
+        !options.output.exists(),
+        "refusing to overwrite {}",
+        options.output.display()
+    );
+    let (project_id, release_id) =
+        resolve_local_release(options.target.scope.project_id, options.target.release_id)?;
+    let client = StudioApiClient::connect(&options.target.scope.connection).await?;
+    let release = client.get_release(project_id, release_id).await?;
+    ensure!(
+        release.status == ReleaseStatus::Ready,
+        "release is not ready: {:?}",
+        release.status
+    );
+    download_release_to(&client, project_id, release, &options.output).await
+}
+
 pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperationResult> {
     validate_wait_timeout(options.timeout_seconds)?;
+    let (project_id, commit_id, local_root) =
+        resolve_local_candidate(options.project_id, options.commit_id)?;
+    let validation_run_id = match options.validation_run_id {
+        Some(id) => id,
+        None => {
+            let root = local_root
+                .as_ref()
+                .context("--validation-run-id is required outside a local project")?;
+            crate::local_project::read_local_state(root)?
+                .last_validation_run_id
+                .context("no validation is recorded; run reporch project validate first")?
+        }
+    };
     ensure!(
         !options.output.exists(),
         "refusing to overwrite {}",
@@ -1072,29 +2572,36 @@ pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperat
     let client = StudioApiClient::connect(&options.connection).await?;
     let release = client
         .create_release(
-            options.project_id,
+            project_id,
             &CreateReleaseRequest {
-                commit_id: options.commit_id,
-                validation_run_id: options.validation_run_id,
+                commit_id,
+                validation_run_id,
             },
             &key,
         )
         .await?;
-    let release = wait_for_release(
-        &client,
-        options.project_id,
-        release,
-        options.timeout_seconds,
-    )
-    .await?;
+    let release = wait_for_release(&client, project_id, release, options.timeout_seconds).await?;
     ensure!(
         release.status == ReleaseStatus::Ready,
         "release build failed: {:?}",
         release.error_code
     );
-    let download = client
-        .release_download(options.project_id, release.id)
-        .await?;
+    let result = download_release_to(&client, project_id, release, &options.output).await?;
+    if let Some(root) = local_root {
+        let mut state = crate::local_project::read_local_state(&root)?;
+        state.last_release_id = Some(result.release.id);
+        crate::local_project::write_local_state(&root, &state)?;
+    }
+    Ok(result)
+}
+
+async fn download_release_to(
+    client: &StudioApiClient,
+    project_id: Uuid,
+    release: ReleaseResponse,
+    output: &Path,
+) -> Result<PackageOperationResult> {
+    let download = client.release_download(project_id, release.id).await?;
     ensure!(
         download.release_id == release.id,
         "Studio returned a mismatched release download"
@@ -1112,12 +2619,12 @@ pub async fn package_operation(options: &PackageOptions) -> Result<PackageOperat
             &download.download_url,
             download.package_size_bytes,
             &download.package_digest,
-            &options.output,
+            output,
         )
         .await?;
     Ok(PackageOperationResult {
         release,
-        output: options.output.clone(),
+        output: output.to_owned(),
         package_digest: download.package_digest,
         package_size_bytes: download.package_size_bytes,
     })
@@ -1135,54 +2642,69 @@ pub async fn package(options: &PackageOptions) -> Result<()> {
     Ok(())
 }
 
-pub async fn submit_review(options: &SubmitReviewOptions) -> Result<()> {
+pub async fn submit_review_operation(options: &SubmitReviewOptions) -> Result<ReviewResponse> {
+    let (project_id, commit_id, local_root) =
+        resolve_local_candidate(options.project_id, options.commit_id)?;
+    let validation_run_id = match options.validation_run_id {
+        Some(validation_run_id) => validation_run_id,
+        None => {
+            let root = local_root
+                .as_ref()
+                .context("validation run ID was omitted outside a local project")?;
+            crate::local_project::read_local_state(root)?
+                .last_validation_run_id
+                .context("no validation is recorded; run reporch verify first")?
+        }
+    };
     let key = operation_key("cli-review-submit", options.idempotency_key.as_deref())?;
     eprintln!("Idempotency-Key: {key}");
     let client = StudioApiClient::connect(&options.connection).await?;
     let review = client
         .submit_review(
-            options.project_id,
+            project_id,
             &SubmitReviewRequest {
-                commit_id: options.commit_id,
-                validation_run_id: options.validation_run_id,
+                commit_id,
+                validation_run_id,
             },
             &key,
         )
         .await?;
-    ensure_review_scope(&review, options.project_id, Some(options.commit_id))?;
+    ensure_review_scope(&review, project_id, Some(commit_id))?;
     ensure!(
-        review.validation_run_id == options.validation_run_id,
+        review.validation_run_id == validation_run_id,
         "Studio returned a review for another validation"
     );
-    println!("{}", serde_json::to_string_pretty(&review)?);
+    Ok(review)
+}
+
+pub async fn submit_review(options: &SubmitReviewOptions) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&submit_review_operation(options).await?)?
+    );
     Ok(())
 }
 
-pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
+pub async fn list_reviews_operation(options: &ListReviewsOptions) -> Result<ReviewPage> {
+    let project_id = resolve_local_project_id(options.project_id)?;
     let client = StudioApiClient::connect(&options.connection).await?;
     let mut items = Vec::new();
     let mut cursor = None;
     let mut seen_cursors = std::collections::HashSet::new();
     for _ in 0..100 {
-        let page = client
-            .list_reviews(options.project_id, cursor.as_deref())
-            .await?;
+        let page = client.list_reviews(project_id, cursor.as_deref()).await?;
         ensure!(
             page.items
                 .iter()
-                .all(|review| review.project_id == options.project_id),
+                .all(|review| review.project_id == project_id),
             "Studio returned a review from another project"
         );
         items.extend(page.items);
         let Some(next_cursor) = page.next_cursor else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&ReviewPage {
-                    items,
-                    next_cursor: None,
-                })?
-            );
-            return Ok(());
+            return Ok(ReviewPage {
+                items,
+                next_cursor: None,
+            });
         };
         ensure!(
             seen_cursors.insert(next_cursor.clone()),
@@ -1193,12 +2715,109 @@ pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
     bail!("Studio review listing exceeded the 10,000-item native client bound")
 }
 
-pub async fn approve_review(options: &ApproveReviewOptions) -> Result<()> {
+pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&list_reviews_operation(options).await?)?
+    );
+    Ok(())
+}
+
+pub async fn request_review_pool_operation(
+    options: &ReviewPoolRequestOptions,
+) -> Result<ReviewPoolRequestResponseV1> {
+    ensure!(options.pool, "review request requires --pool");
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let key = operation_key(
+        "cli-review-pool-request",
+        options.idempotency_key.as_deref(),
+    )?;
+    eprintln!("Idempotency-Key: {key}");
+    let response = StudioApiClient::connect(&options.connection)
+        .await?
+        .request_review_pool(project_id, options.review_id, &key)
+        .await?;
+    ensure!(
+        response.project_id == project_id && response.review_id == options.review_id,
+        "Studio returned a review pool request outside the requested candidate"
+    );
+    Ok(response)
+}
+
+pub async fn review_pool_status_operation(
+    options: &ReviewPoolTargetOptions,
+) -> Result<ReviewPoolRequestResponseV1> {
+    let response = StudioApiClient::connect(&options.connection)
+        .await?
+        .get_review_pool_request(options.pool_request_id)
+        .await?;
+    ensure!(
+        response.id == options.pool_request_id,
+        "Studio returned a different review pool request"
+    );
+    Ok(response)
+}
+
+pub async fn list_review_pool_inbox_operation(
+    options: &ReviewPoolInboxOptions,
+) -> Result<ReviewPoolPageV1> {
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_review_pool_inbox(cursor).await?;
+        items.extend(page.items);
+        let Some(next) = page.next_cursor else {
+            return Ok(ReviewPoolPageV1 {
+                items,
+                next_cursor: None,
+            });
+        };
+        ensure!(
+            seen.insert(next),
+            "Studio returned a repeated review pool cursor"
+        );
+        cursor = Some(next);
+    }
+    bail!("Studio review pool inbox exceeded the 10,000-item native client bound")
+}
+
+pub async fn claim_review_pool_operation(
+    options: &ReviewPoolTargetOptions,
+) -> Result<ReviewPoolRequestResponseV1> {
+    let response = StudioApiClient::connect(&options.connection)
+        .await?
+        .claim_review_pool_request(options.pool_request_id)
+        .await?;
+    ensure!(
+        response.id == options.pool_request_id && response.assignment_id.is_some(),
+        "Studio returned an invalid review pool assignment"
+    );
+    Ok(response)
+}
+
+pub async fn cancel_review_pool_operation(
+    options: &ReviewPoolTargetOptions,
+) -> Result<ReviewPoolRequestResponseV1> {
+    let response = StudioApiClient::connect(&options.connection)
+        .await?
+        .cancel_review_pool_request(options.pool_request_id)
+        .await?;
+    ensure!(
+        response.id == options.pool_request_id,
+        "Studio returned a different review pool request"
+    );
+    Ok(response)
+}
+
+pub async fn approve_review_operation(options: &ApproveReviewOptions) -> Result<ReviewResponse> {
     let comment = normalize_optional_review_comment(options.comment.as_deref())?;
-    decide_review(
+    decide_review_target(
         &options.connection,
         options.project_id,
         options.review_id,
+        options.pool_request_id,
         ReviewDecisionKindV1::Approve,
         comment,
         options.idempotency_key.as_deref(),
@@ -1206,17 +2825,154 @@ pub async fn approve_review(options: &ApproveReviewOptions) -> Result<()> {
     .await
 }
 
-pub async fn request_review_changes(options: &RequestChangesOptions) -> Result<()> {
+pub async fn list_waivers_operation(options: &WaiverScopeOptions) -> Result<WaiverPage> {
+    let (project_id, validation_id) =
+        resolve_local_validation(options.project_id, options.validation_run_id)?;
+    StudioApiClient::connect(&options.connection)
+        .await?
+        .list_waivers(project_id, validation_id)
+        .await
+}
+
+pub async fn create_waiver_operation(options: &CreateWaiverOptions) -> Result<WaiverResponse> {
+    let issue_code = options.issue_code.trim();
+    let reason = options.reason.trim();
+    ensure!(!issue_code.is_empty(), "issue code cannot be empty");
+    ensure!(
+        (20..=2_000).contains(&reason.len()),
+        "waiver reason must contain 20 to 2000 bytes"
+    );
+    let expires_at = DateTime::parse_from_rfc3339(&options.expires_at)
+        .context("--expires-at must be an RFC 3339 timestamp")?
+        .with_timezone(&Utc);
+    ensure!(
+        expires_at > Utc::now(),
+        "waiver expiry must be in the future"
+    );
+    ensure!(
+        expires_at <= Utc::now() + chrono::Duration::days(90),
+        "waiver expiry cannot be more than 90 days in the future"
+    );
+    let (project_id, validation_id) =
+        resolve_local_validation(options.scope.project_id, options.scope.validation_run_id)?;
+    let key = operation_key("cli-waiver-create", options.idempotency_key.as_deref())?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .create_waiver(
+            project_id,
+            validation_id,
+            &CreateWaiverRequest {
+                issue_code: issue_code.into(),
+                reason: reason.into(),
+                expires_at,
+            },
+            &key,
+        )
+        .await
+}
+
+pub async fn revoke_waiver_operation(options: &RevokeWaiverOptions) -> Result<WaiverResponse> {
+    let reason = options.reason.trim();
+    ensure!(
+        (10..=2_000).contains(&reason.len()),
+        "revocation reason must contain 10 to 2000 bytes"
+    );
+    let (project_id, validation_id) =
+        resolve_local_validation(options.scope.project_id, options.scope.validation_run_id)?;
+    let key = operation_key("cli-waiver-revoke", options.idempotency_key.as_deref())?;
+    StudioApiClient::connect(&options.scope.connection)
+        .await?
+        .revoke_waiver(
+            project_id,
+            validation_id,
+            options.waiver_id,
+            &RevokeWaiverRequest {
+                reason: reason.into(),
+            },
+            &key,
+        )
+        .await
+}
+
+pub async fn request_review_changes_operation(
+    options: &RequestChangesOptions,
+) -> Result<ReviewResponse> {
     let comment = normalize_required_review_comment(&options.comment)?;
-    decide_review(
+    decide_review_target(
         &options.connection,
         options.project_id,
         options.review_id,
+        options.pool_request_id,
         ReviewDecisionKindV1::RequestChanges,
         Some(comment),
         options.idempotency_key.as_deref(),
     )
     .await
+}
+
+pub async fn approve_review(options: &ApproveReviewOptions) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&approve_review_operation(options).await?)?
+    );
+    Ok(())
+}
+
+pub async fn request_review_changes(options: &RequestChangesOptions) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&request_review_changes_operation(options).await?)?
+    );
+    Ok(())
+}
+
+async fn decide_review_target(
+    connection: &RemoteConnectionOptions,
+    project_id: Option<Uuid>,
+    review_id: Option<Uuid>,
+    pool_request_id: Option<Uuid>,
+    decision: ReviewDecisionKindV1,
+    comment: Option<String>,
+    provided_key: Option<&str>,
+) -> Result<ReviewResponse> {
+    match pool_request_id {
+        Some(request_id) => {
+            ensure!(
+                project_id.is_none() && review_id.is_none(),
+                "--pool-request-id cannot be combined with --project-id or --review-id"
+            );
+            let key = operation_key("cli-review-pool-decision", provided_key)?;
+            eprintln!("Idempotency-Key: {key}");
+            let review = StudioApiClient::connect(connection)
+                .await?
+                .decide_pool_review(
+                    request_id,
+                    &CreateReviewDecisionRequest { decision, comment },
+                    &key,
+                )
+                .await?;
+            ensure!(
+                review.decision.as_ref().is_some_and(|record| {
+                    record.decision == decision
+                        && record.pool_assignment_id.is_some()
+                        && record.approval_source == studio_core::ReviewApprovalSourceV1::ReviewPool
+                }),
+                "Studio returned a mismatched review pool decision"
+            );
+            Ok(review)
+        }
+        None => {
+            decide_review(
+                connection,
+                project_id.context("--project-id is required without --pool-request-id")?,
+                review_id.context("--review-id is required without --pool-request-id")?,
+                decision,
+                comment,
+                provided_key,
+            )
+            .await
+        }
+    }
 }
 
 async fn decide_review(
@@ -1226,7 +2982,7 @@ async fn decide_review(
     decision: ReviewDecisionKindV1,
     comment: Option<String>,
     provided_key: Option<&str>,
-) -> Result<()> {
+) -> Result<ReviewResponse> {
     let key = operation_key("cli-review-decision", provided_key)?;
     eprintln!("Idempotency-Key: {key}");
     let client = StudioApiClient::connect(connection).await?;
@@ -1247,8 +3003,7 @@ async fn decide_review(
             .is_some_and(|record| record.decision == decision),
         "Studio returned a mismatched review decision"
     );
-    println!("{}", serde_json::to_string_pretty(&review)?);
-    Ok(())
+    Ok(review)
 }
 
 fn ensure_review_scope(
@@ -1432,6 +3187,130 @@ fn operation_key(prefix: &str, provided: Option<&str>) -> Result<String> {
     Ok(key)
 }
 
+fn ensure_cli_compatible(capabilities: &StudioCapabilitiesV1) -> Result<()> {
+    let current = parse_numeric_version(env!("CARGO_PKG_VERSION"))?;
+    let minimum = parse_numeric_version(&capabilities.minimum_cli_version)
+        .context("Studio returned an invalid minimum CLI version")?;
+    ensure!(
+        current >= minimum,
+        "this Studio requires Reporch CLI {} or newer; current version is {}",
+        capabilities.minimum_cli_version,
+        env!("CARGO_PKG_VERSION")
+    );
+    ensure!(
+        current.0 <= capabilities.maximum_cli_major,
+        "Studio supports Reporch CLI major versions through {}; current version is {}",
+        capabilities.maximum_cli_major,
+        env!("CARGO_PKG_VERSION")
+    );
+    Ok(())
+}
+
+fn parse_numeric_version(value: &str) -> Result<(u64, u64, u64)> {
+    let numeric = value.split_once('-').map_or(value, |(numeric, _)| numeric);
+    let mut parts = numeric.split('.');
+    let major = parts
+        .next()
+        .context("version is missing a major component")?;
+    let minor = parts
+        .next()
+        .context("version is missing a minor component")?;
+    let patch = parts
+        .next()
+        .context("version is missing a patch component")?;
+    ensure!(parts.next().is_none(), "version has too many components");
+    Ok((major.parse()?, minor.parse()?, patch.parse()?))
+}
+
+fn resolve_local_candidate(
+    project_id: Option<Uuid>,
+    commit_id: Option<Uuid>,
+) -> Result<(Uuid, Uuid, Option<PathBuf>)> {
+    if let (Some(project_id), Some(commit_id)) = (project_id, commit_id) {
+        return Ok((project_id, commit_id, None));
+    }
+    let root = crate::local_project::discover_project(Path::new("."))
+        .context("project and commit IDs were omitted and no local project was found")?;
+    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let resolved_project_id = project_id.unwrap_or(spec.project_id);
+    ensure!(
+        resolved_project_id == spec.project_id,
+        "explicit project ID does not match reporch.yaml"
+    );
+    if let Some(remote) = &state.remote {
+        ensure!(
+            remote.project_id == resolved_project_id,
+            "local remote link does not match reporch.yaml"
+        );
+    }
+    let resolved_commit_id = commit_id
+        .or(state.last_commit_id)
+        .context("no commit is recorded; run reporch project push first")?;
+    Ok((resolved_project_id, resolved_commit_id, Some(root)))
+}
+
+fn resolve_local_project_id(project_id: Option<Uuid>) -> Result<Uuid> {
+    if let Some(project_id) = project_id {
+        return Ok(project_id);
+    }
+    let root = crate::local_project::discover_project(Path::new("."))
+        .context("project ID was omitted and no local project was found")?;
+    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let remote = state
+        .remote
+        .context("project is not linked; run reporch project link")?;
+    ensure!(
+        remote.project_id == spec.project_id,
+        "local link and reporch.yaml project IDs differ"
+    );
+    Ok(spec.project_id)
+}
+
+pub fn current_project_id(project_id: Option<Uuid>) -> Result<Uuid> {
+    resolve_local_project_id(project_id)
+}
+
+fn resolve_local_release(
+    project_id: Option<Uuid>,
+    release_id: Option<Uuid>,
+) -> Result<(Uuid, Uuid)> {
+    let project_id = resolve_local_project_id(project_id)?;
+    if let Some(release_id) = release_id {
+        return Ok((project_id, release_id));
+    }
+    let root = crate::local_project::discover_project(Path::new("."))?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let release_id = state
+        .last_release_id
+        .context("no local release is recorded; pass --release-id or build a release")?;
+    Ok((project_id, release_id))
+}
+
+fn resolve_local_validation(
+    project_id: Option<Uuid>,
+    validation_id: Option<Uuid>,
+) -> Result<(Uuid, Uuid)> {
+    let project_id = resolve_local_project_id(project_id)?;
+    if let Some(validation_id) = validation_id {
+        return Ok((project_id, validation_id));
+    }
+    let root = crate::local_project::discover_project(Path::new("."))?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let validation_id = state
+        .last_validation_run_id
+        .context("no validation is recorded; pass --validation-run-id or run verify")?;
+    Ok((project_id, validation_id))
+}
+
+fn is_publication_terminal(status: PublicationStatus) -> bool {
+    matches!(
+        status,
+        PublicationStatus::Published | PublicationStatus::Failed
+    )
+}
+
 fn validate_wait_timeout(value: u64) -> Result<()> {
     ensure!(
         (1..=7_200).contains(&value),
@@ -1490,10 +3369,15 @@ async fn verify_local_file(source: &Path, expected: &ManifestFile) -> Result<()>
     Ok(())
 }
 
-fn verify_file_descriptor(
+fn verify_commit_file_descriptor(
+    commit_id: Uuid,
     expected: &ManifestFile,
-    descriptor: &FileDownloadResponse,
+    descriptor: &CommitFileDownloadResponse,
 ) -> Result<()> {
+    ensure!(
+        descriptor.commit_id == commit_id,
+        "file download commit mismatch"
+    );
     let actual = &descriptor.file;
     ensure!(actual.path == expected.path, "file download path mismatch");
     ensure!(
@@ -1693,6 +3577,25 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_reject_incompatible_cli_versions() {
+        let compatible = StudioCapabilitiesV1 {
+            schema: "reporch.studio-capabilities.v1".into(),
+            api_versions: vec!["v1".into()],
+            authoring_spec_versions: vec![reporch_format::AUTHORING_SPEC_SCHEMA_V1.into()],
+            release_manifest_versions: vec![studio_core::RELEASE_MANIFEST_SCHEMA_V1.into()],
+            minimum_cli_version: env!("CARGO_PKG_VERSION").into(),
+            maximum_cli_major: 1,
+        };
+        ensure_cli_compatible(&compatible).unwrap();
+
+        let mut too_new = compatible.clone();
+        too_new.minimum_cli_version = "99.0.0".into();
+        assert!(ensure_cli_compatible(&too_new).is_err());
+
+        assert_eq!(parse_numeric_version("1.2.3-beta.1").unwrap(), (1, 2, 3));
+    }
+
+    #[test]
     fn review_comments_are_trimmed_and_bounded() {
         assert_eq!(
             normalize_optional_review_comment(Some("  approved  ")).unwrap(),
@@ -1799,6 +3702,74 @@ mod tests {
         assert_eq!(transient_poll_delay(2), Duration::from_millis(500));
         assert_eq!(transient_poll_delay(8), Duration::from_secs(5));
         assert_eq!(transient_poll_delay(u32::MAX), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn sse_decoder_handles_chunk_boundaries_checkpoints_and_multiline_data() {
+        let mut decoder = SseDecoder::default();
+        assert!(
+            decoder
+                .push(b"id: 41\nevent: studio.progress")
+                .unwrap()
+                .is_empty()
+        );
+        let frames = decoder
+            .push(b".validation.v1\ndata: {\"first\":1,\ndata: \"second\":2}\n\n")
+            .unwrap();
+        assert_eq!(
+            frames,
+            vec![SseFrame {
+                id: Some("41".into()),
+                event: Some("studio.progress.validation.v1".into()),
+                data: Some("{\"first\":1,\n\"second\":2}".into()),
+            }]
+        );
+
+        let checkpoint = decoder.push(b"id: 42\n: cursor-checkpoint\n\n").unwrap();
+        assert_eq!(
+            checkpoint,
+            vec![SseFrame {
+                id: Some("42".into()),
+                event: None,
+                data: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn sse_decoder_and_cursor_fail_closed_on_oversized_or_ambiguous_input() {
+        let mut decoder = SseDecoder::default();
+        assert!(decoder.push(&vec![b'x'; MAX_SSE_BUFFER_BYTES + 1]).is_err());
+        for invalid in ["", "-1", "+1", " 1", "1x", "9223372036854775807"] {
+            assert!(parse_event_cursor(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert_eq!(parse_event_cursor("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn immutable_file_download_is_bound_to_the_requested_commit() {
+        let commit_id = Uuid::now_v7();
+        let file = ManifestFile {
+            path: "statement.md".into(),
+            sha256: Sha256Digest::from_bytes(b"statement"),
+            size_bytes: 9,
+            media_type: "text/markdown".into(),
+            executable: false,
+        };
+        let descriptor = CommitFileDownloadResponse {
+            commit_id,
+            file: file.clone(),
+            download_url: "https://storage.example.test/cas".into(),
+            expires_at: Utc::now(),
+        };
+        verify_commit_file_descriptor(commit_id, &file, &descriptor).unwrap();
+        assert!(
+            verify_commit_file_descriptor(Uuid::now_v7(), &file, &descriptor).is_err(),
+            "a descriptor for another immutable commit must fail closed"
+        );
+        let mut changed = descriptor;
+        changed.file.sha256 = Sha256Digest::from_bytes(b"changed");
+        assert!(verify_commit_file_descriptor(commit_id, &file, &changed).is_err());
     }
 
     #[tokio::test]

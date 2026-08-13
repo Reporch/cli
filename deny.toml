@@ -18,6 +18,8 @@ allow = [
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
+  # Test-only LLVM libFuzzer runtime; OSI-approved University of Illinois/NCSA.
+  "NCSA",
   "Unicode-3.0",
   "Zlib",
 ]

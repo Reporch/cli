@@ -1,0 +1,10 @@
+[package]
+name = "reporch-toolchain-index-signer"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+minisign = "0.9.1"

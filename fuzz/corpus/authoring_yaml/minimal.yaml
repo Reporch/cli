@@ -1,0 +1,43 @@
+schema: reporch.authoring-spec.v1
+project_id: 019ffa9f-6333-7a83-bdab-db042aa38717
+problem_type: standard
+package_profile: reporch_native
+default_locale: ko
+title:
+  ko: Fuzz
+statements:
+  ko: statements/ko.md
+files:
+- path: statements/ko.md
+  media_type: text/markdown
+  executable: false
+- path: tests/1.in
+  media_type: text/plain
+  executable: false
+- path: tests/1.ans
+  media_type: text/plain
+  executable: false
+toolchains: {}
+judging:
+  limits:
+    time_ms: 1000
+    memory_mib: 256
+    output_kib: 65536
+  checker:
+    kind: token
+  tests:
+  - id: 019ffa9f-6347-7c92-a3ec-018ff572970f
+    name: sample-1
+    input_file: tests/1.in
+    answer_file: tests/1.ans
+    groups: []
+    generated_by: null
+    seed: null
+  groups: []
+  validator_path: null
+  interactor_path: null
+  grader_path: null
+sources: []
+solutions: []
+publication: null
+policy_version: studio-policy-v1

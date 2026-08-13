@@ -3,11 +3,18 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const rootPackage = JSON.parse(readFileSync("package.json", "utf8"));
+const rootLock = JSON.parse(readFileSync("package-lock.json", "utf8"));
 const cliPackage = JSON.parse(readFileSync("npm/cli/package.json", "utf8"));
 const cargo = readFileSync("crates/reporch-cli/Cargo.toml", "utf8");
 const cargoVersion = cargo.match(/^version = "([^"]+)"$/m)?.[1];
 
 assert.equal(rootPackage.version, cliPackage.version, "source and npm versions differ");
+assert.equal(rootLock.version, rootPackage.version, "package lock version differs");
+assert.equal(
+  rootLock.packages?.[""]?.version,
+  rootPackage.version,
+  "package lock root version differs"
+);
 assert.equal(cargoVersion, cliPackage.version, "Cargo and npm versions differ");
 
 const expected = new Set(Object.keys(cliPackage.optionalDependencies));

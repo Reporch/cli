@@ -1,6 +1,6 @@
 [package]
 name = "reporch-cli"
-version = "0.1.3"
+version = "0.9.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,7 +16,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 minisign-verify.workspace = true
@@ -25,6 +27,7 @@ pulldown-cmark.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+reporch-format = { path = "../reporch-format" }
 serde_json.workspace = true
 serde.workspace = true
 serde_yaml_ng.workspace = true
@@ -36,6 +39,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+toml.workspace = true
 uuid.workspace = true
 url.workspace = true
 zip.workspace = true
@@ -43,4 +47,3 @@ zeroize.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-chrono.workspace = true
