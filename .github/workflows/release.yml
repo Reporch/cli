@@ -126,6 +126,7 @@ jobs:
           merge-multiple: true
       - run: node scripts/prepare-npm-packages.mjs release-input dist
       - run: node scripts/pack-npm-release.mjs dist
+      - run: node scripts/pack-native-release.mjs release-input dist/native
       - run: npm test
       - run: npm run check:versions
       - name: Generate SPDX SBOM
@@ -140,12 +141,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd dist/tarballs && sha256sum ./*.tgz) > dist/SHA256SUMS
-          (cd dist/tarballs && sha256sum --check ../SHA256SUMS)
-      - name: Attest immutable npm tarballs
+          mkdir dist/release-assets
+          cp dist/tarballs/*.tgz dist/native/*.tar.gz dist/native/*.zip \
+            dist/reporch-cli.spdx.json dist/release-manifest.json \
+            dist/npm-pack-manifest.json dist/native/native-release-manifest.json \
+            dist/release-assets/
+          (cd dist/release-assets && sha256sum ./*) > dist/SHA256SUMS
+          (cd dist/release-assets && sha256sum --check --strict ../SHA256SUMS)
+      - name: Attest immutable release assets
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
-          subject-path: dist/tarballs/*.tgz
+          subject-path: dist/release-assets/*
       - name: Create or verify the draft GitHub release
         shell: bash
         run: |
@@ -156,10 +162,9 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" \
               --title "Reporch CLI $VERSION" \
-              --notes "Official Apache-2.0 Reporch CLI release. Install with npm install --global @reporch/cli."
+              --notes $'Official Apache-2.0 Reporch CLI release.\n\nInstall with `npm install --global @reporch/cli`, or download the standalone archive for your target and verify it with `SHA256SUMS`. Every release asset has GitHub artifact provenance; manifests and an SPDX SBOM are included.'
           fi
-          gh release upload "$RELEASE_TAG" dist/tarballs/*.tgz dist/SHA256SUMS \
-            dist/reporch-cli.spdx.json dist/release-manifest.json dist/npm-pack-manifest.json --clobber
+          gh release upload "$RELEASE_TAG" dist/release-assets/* dist/SHA256SUMS --clobber
       - name: Publish exact npm tarballs with OIDC and provenance
         run: node scripts/publish-npm-release.mjs dist
       - name: Publish GitHub release after npm verification

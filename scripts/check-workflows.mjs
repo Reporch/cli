@@ -31,8 +31,19 @@ assert.match(
 );
 assert.match(
   release,
-  /\(cd dist\/tarballs && sha256sum \.\/\*\.tgz\) > dist\/SHA256SUMS/,
+  /node scripts\/pack-native-release\.mjs release-input dist\/native/,
+  "release must build standalone archives for every native target"
+);
+assert.match(
+  release,
+  /\(cd dist\/release-assets && sha256sum \.\/\*\) > dist\/SHA256SUMS/,
   "release checksums must remain verifiable after downloading flat release assets"
+);
+assert.match(release, /sha256sum --check --strict/, "release checksum verification must be strict");
+assert.match(
+  release,
+  /subject-path: dist\/release-assets\/\*/,
+  "every immutable release asset must receive provenance"
 );
 const ci = readFileSync(".github/workflows/ci.yml", "utf8");
 assert.match(ci, /actionlint_1\.7\.12_linux_amd64\.tar\.gz/);
