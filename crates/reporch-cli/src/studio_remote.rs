@@ -149,8 +149,9 @@ pub struct PullOptions {
 pub struct PushOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
-    #[arg(long, default_value = "reporch.problem.json")]
-    pub manifest: PathBuf,
+    /// Deprecated 0.1.x manifest input. Omit to compile reporch.yaml automatically.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
     #[arg(long)]
     pub source_root: Option<PathBuf>,
     #[arg(long, default_value = "CLI push")]
@@ -756,6 +757,7 @@ pub async fn create_operation(options: &CreateOptions) -> Result<ProjectResponse
         .await?;
     if let Some(directory) = &options.directory {
         crate::init_project_template(directory, title, project.id, options.problem_type.into())?;
+        crate::local_project::link_project(directory, &options.connection.api_url, project.id)?;
     }
     Ok(project)
 }
@@ -844,6 +846,21 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         &staging.path().join("reporch.problem.json"),
         &commit.manifest,
     )?;
+    crate::local_project::write_authoring_spec_create_new(
+        staging.path(),
+        &reporch_format::AuthoringSpecV1::from_manifest(&commit.manifest),
+    )?;
+    let state = crate::local_project::LocalStateV1 {
+        remote: Some(crate::local_project::RemoteLinkV1 {
+            api_url: options.connection.api_url.trim_end_matches('/').to_owned(),
+            project_id: options.project_id,
+        }),
+        base_revision: Some(commit.sequence.to_string()),
+        baseline_working_digest: Some(commit.manifest_digest.to_string()),
+        last_commit_id: Some(commit.id),
+        ..Default::default()
+    };
+    crate::local_project::write_local_state(staging.path(), &state)?;
     let staging = staging.keep();
     if destination_was_empty {
         fs::remove_dir(&options.directory).with_context(|| {
@@ -885,17 +902,105 @@ pub async fn pull(options: &PullOptions) -> Result<()> {
 
 pub async fn push_operation(options: &PushOptions) -> Result<PushOperationResult> {
     validate_wait_timeout(options.timeout_seconds)?;
-    let manifest = read_manifest(&options.manifest)?;
+    let Some(manifest_path) = options.manifest.as_ref() else {
+        return push_authoring_operation(options).await;
+    };
+    let manifest = read_manifest(manifest_path)?;
     let issues = validate_manifest(&manifest);
     if !issues.is_empty() {
-        println!("{}", serde_json::to_string_pretty(&issues)?);
-        bail!("manifest validation failed with {} issue(s)", issues.len());
+        bail!(
+            "manifest validation failed with {} issue(s): {}",
+            issues.len(),
+            serde_json::to_string(&issues)?
+        );
     }
     let source_root = options
         .source_root
         .clone()
-        .or_else(|| options.manifest.parent().map(Path::to_path_buf))
+        .or_else(|| manifest_path.parent().map(Path::to_path_buf))
         .context("manifest path has no source root")?;
+    push_manifest(options, manifest, source_root).await
+}
+
+async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperationResult> {
+    let root = crate::local_project::discover_project(Path::new("."))?;
+    if let Some(source_root) = &options.source_root {
+        ensure!(
+            fs::canonicalize(source_root)? == root,
+            "--source-root must match the discovered reporch.yaml project root"
+        );
+    }
+    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let mut state = crate::local_project::read_local_state(&root)?;
+    let remote = state
+        .remote
+        .as_ref()
+        .context("project is not linked; run reporch project link")?;
+    ensure!(
+        remote.project_id == spec.project_id,
+        "local link and reporch.yaml project IDs differ"
+    );
+    ensure!(
+        remote.api_url.trim_end_matches('/') == options.connection.api_url.trim_end_matches('/'),
+        "linked Studio API URL differs from the selected connection"
+    );
+
+    let fingerprint_manifest =
+        crate::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let fingerprint = fingerprint_manifest.digest()?.to_string();
+    let base_commit = state.last_commit_id;
+    let unchanged_manifest = if let Some(commit_id) = base_commit {
+        let candidate = crate::local_project::compile_authoring_spec(&root, &spec, commit_id)?;
+        (state.baseline_working_digest.as_deref() == Some(candidate.digest()?.as_str()))
+            .then_some(candidate)
+    } else {
+        None
+    };
+
+    let manifest = match unchanged_manifest {
+        Some(manifest) => manifest,
+        None => {
+            let pending_key = format!("push:{fingerprint}");
+            let commit_id = match state.pending_idempotency_keys.get(&pending_key) {
+                Some(value) => value
+                    .parse()
+                    .context("invalid pending push commit ID in local state")?,
+                None => {
+                    let commit_id = Uuid::now_v7();
+                    state
+                        .pending_idempotency_keys
+                        .retain(|key, _| !key.starts_with("push:"));
+                    state
+                        .pending_idempotency_keys
+                        .insert(pending_key.clone(), commit_id.to_string());
+                    crate::local_project::write_local_state(&root, &state)?;
+                    commit_id
+                }
+            };
+            crate::local_project::compile_authoring_spec(&root, &spec, commit_id)?
+        }
+    };
+    let manifest_digest = manifest.digest()?;
+    let result = push_manifest(options, manifest.clone(), root.clone()).await?;
+
+    crate::local_project::write_generated_manifest_atomic(&root, &manifest)?;
+    state.base_revision = Some(result.commit.sequence.to_string());
+    state.baseline_working_digest = Some(manifest_digest.to_string());
+    state.last_commit_id = Some(result.commit.id);
+    state.last_validation_run_id = None;
+    state.last_release_id = None;
+    state
+        .pending_idempotency_keys
+        .retain(|key, _| !key.starts_with("push:"));
+    crate::local_project::write_local_state(&root, &state)?;
+    Ok(result)
+}
+
+async fn push_manifest(
+    options: &PushOptions,
+    manifest: ReleaseManifestV1,
+    source_root: PathBuf,
+) -> Result<PushOperationResult> {
     let client = StudioApiClient::connect(&options.connection).await?;
     let remote = client
         .list_files(manifest.project_id)
@@ -1135,7 +1240,7 @@ pub async fn package(options: &PackageOptions) -> Result<()> {
     Ok(())
 }
 
-pub async fn submit_review(options: &SubmitReviewOptions) -> Result<()> {
+pub async fn submit_review_operation(options: &SubmitReviewOptions) -> Result<ReviewResponse> {
     let key = operation_key("cli-review-submit", options.idempotency_key.as_deref())?;
     eprintln!("Idempotency-Key: {key}");
     let client = StudioApiClient::connect(&options.connection).await?;
@@ -1154,11 +1259,18 @@ pub async fn submit_review(options: &SubmitReviewOptions) -> Result<()> {
         review.validation_run_id == options.validation_run_id,
         "Studio returned a review for another validation"
     );
-    println!("{}", serde_json::to_string_pretty(&review)?);
+    Ok(review)
+}
+
+pub async fn submit_review(options: &SubmitReviewOptions) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&submit_review_operation(options).await?)?
+    );
     Ok(())
 }
 
-pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
+pub async fn list_reviews_operation(options: &ListReviewsOptions) -> Result<ReviewPage> {
     let client = StudioApiClient::connect(&options.connection).await?;
     let mut items = Vec::new();
     let mut cursor = None;
@@ -1175,14 +1287,10 @@ pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
         );
         items.extend(page.items);
         let Some(next_cursor) = page.next_cursor else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&ReviewPage {
-                    items,
-                    next_cursor: None,
-                })?
-            );
-            return Ok(());
+            return Ok(ReviewPage {
+                items,
+                next_cursor: None,
+            });
         };
         ensure!(
             seen_cursors.insert(next_cursor.clone()),
@@ -1193,7 +1301,15 @@ pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
     bail!("Studio review listing exceeded the 10,000-item native client bound")
 }
 
-pub async fn approve_review(options: &ApproveReviewOptions) -> Result<()> {
+pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&list_reviews_operation(options).await?)?
+    );
+    Ok(())
+}
+
+pub async fn approve_review_operation(options: &ApproveReviewOptions) -> Result<ReviewResponse> {
     let comment = normalize_optional_review_comment(options.comment.as_deref())?;
     decide_review(
         &options.connection,
@@ -1206,7 +1322,9 @@ pub async fn approve_review(options: &ApproveReviewOptions) -> Result<()> {
     .await
 }
 
-pub async fn request_review_changes(options: &RequestChangesOptions) -> Result<()> {
+pub async fn request_review_changes_operation(
+    options: &RequestChangesOptions,
+) -> Result<ReviewResponse> {
     let comment = normalize_required_review_comment(&options.comment)?;
     decide_review(
         &options.connection,
@@ -1219,6 +1337,22 @@ pub async fn request_review_changes(options: &RequestChangesOptions) -> Result<(
     .await
 }
 
+pub async fn approve_review(options: &ApproveReviewOptions) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&approve_review_operation(options).await?)?
+    );
+    Ok(())
+}
+
+pub async fn request_review_changes(options: &RequestChangesOptions) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&request_review_changes_operation(options).await?)?
+    );
+    Ok(())
+}
+
 async fn decide_review(
     connection: &RemoteConnectionOptions,
     project_id: Uuid,
@@ -1226,7 +1360,7 @@ async fn decide_review(
     decision: ReviewDecisionKindV1,
     comment: Option<String>,
     provided_key: Option<&str>,
-) -> Result<()> {
+) -> Result<ReviewResponse> {
     let key = operation_key("cli-review-decision", provided_key)?;
     eprintln!("Idempotency-Key: {key}");
     let client = StudioApiClient::connect(connection).await?;
@@ -1247,8 +1381,7 @@ async fn decide_review(
             .is_some_and(|record| record.decision == decision),
         "Studio returned a mismatched review decision"
     );
-    println!("{}", serde_json::to_string_pretty(&review)?);
-    Ok(())
+    Ok(review)
 }
 
 fn ensure_review_scope(

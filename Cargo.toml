@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/reporch-format",
   "crates/studio-core",
   "crates/studio-contracts",
   "crates/studio-native-auth",

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod cli_output;
 mod desktop_artifact;
 mod icpc_export;
 mod icpc_import;
@@ -11,22 +12,18 @@ mod polygon_export;
 mod polygon_import;
 mod statement_tex;
 
-use std::collections::BTreeMap;
 use std::fs;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result, bail, ensure};
+use clap::{ArgAction, Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use cli_output::{CliOutput, ColorMode, OutputFormat};
 use reporch_cli::local_sandbox::{LocalSandboxOptions, OciRuntime};
 use reporch_cli::studio_remote;
 use reporch_cli::{NativeAuthOptions, device_auth_config};
-use studio_core::{
-    CheckerSpec, ExpectedVerdict, JudgingSpec, ManifestFile, PackageProfile, ProblemType,
-    PublicationSampleV1, PublicationSpecV1, RELEASE_MANIFEST_SCHEMA_V1, ReleaseManifestV1,
-    ResourceLimits, SolutionSpec, StatementSectionsV1, TestCaseSpec, compatibility_report,
-    validate_manifest,
-};
+use studio_core::{PackageProfile, ReleaseManifestV1, compatibility_report, validate_manifest};
 use studio_native_auth::qualification_keyring_canary;
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use uuid::Uuid;
@@ -38,12 +35,39 @@ use uuid::Uuid;
     about = "Create, validate, package, and sync Reporch problems"
 )]
 struct Args {
+    /// Resolve relative paths from this directory.
+    #[arg(long, global = true, default_value = ".")]
+    cwd: PathBuf,
+    /// Named configuration profile.
+    #[arg(long, global = true, env = "REPORCH_PROFILE")]
+    profile: Option<String>,
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
+    format: OutputFormat,
+    /// Alias for --format json.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Never prompt for missing input.
+    #[arg(long, global = true)]
+    no_input: bool,
+    /// Confirm safe interactive operations.
+    #[arg(long, global = true)]
+    yes: bool,
+    #[arg(long, global = true)]
+    quiet: bool,
+    #[arg(long, global = true, action = ArgAction::Count)]
+    verbose: u8,
+    #[arg(long, global = true, value_enum, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Migrate a pre-1.0 manifest to the human-editable reporch.yaml format.
+    Migrate(MigrateOptions),
+    /// Validate reporch.yaml and every declared local file without network access.
+    Check,
     /// Authenticate this native client with Reporch without storing tokens in files.
     Auth {
         #[command(subcommand)]
@@ -83,6 +107,12 @@ enum Command {
     },
     #[command(hide = true)]
     QualificationSelfTest,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct MigrateOptions {
+    #[arg(long, default_value = ".")]
+    directory: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -194,6 +224,21 @@ enum ProjectCommand {
         #[arg(long)]
         project_id: Option<Uuid>,
     },
+    /// Link the current directory to an existing private Studio project.
+    Link {
+        #[command(flatten)]
+        connection: studio_remote::RemoteConnectionOptions,
+        #[arg(long)]
+        project_id: Uuid,
+    },
+    /// List Studio projects available to the current account.
+    List(studio_remote::RemoteConnectionOptions),
+    /// Show the linked Studio project.
+    Show(studio_remote::RemoteConnectionOptions),
+    /// Show local linkage and dirty state.
+    Status,
+    /// Compare reporch.yaml and local files with the generated manifest.
+    Diff,
     /// Create a private Studio project through native OAuth.
     Create(studio_remote::CreateOptions),
     /// Pull an immutable Studio commit and every digest-bound file.
@@ -257,12 +302,63 @@ impl From<CompatibilityProfile> for PackageProfile {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    match Args::parse().command {
+async fn main() {
+    let arguments = match Args::try_parse() {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            if raw_arguments_request_json() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": "reporch.cli-error.v1",
+                        "command": "parse",
+                        "error_code": "input.invalid",
+                        "message": error.to_string(),
+                        "retryable": false,
+                        "trace_id": Uuid::now_v7(),
+                    })
+                );
+            } else {
+                let _ = error.print();
+            }
+            std::process::exit(2);
+        }
+    };
+    let format = if arguments.json {
+        OutputFormat::Json
+    } else {
+        arguments.format
+    };
+    let output = CliOutput::new(format, arguments.quiet, arguments.color);
+    let command = command_name(&arguments.command);
+    if let Err(error) = run(arguments, &output).await {
+        let exit_code = output.emit_error(command, &error);
+        std::process::exit(exit_code as i32);
+    }
+}
+
+async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
+    let Args {
+        cwd,
+        profile,
+        no_input,
+        yes,
+        verbose,
+        command,
+        ..
+    } = arguments;
+    let cwd = fs::canonicalize(&cwd).with_context(|| format!("resolve --cwd {}", cwd.display()))?;
+    std::env::set_current_dir(&cwd)
+        .with_context(|| format!("change working directory to {}", cwd.display()))?;
+    let _configuration = (profile, no_input, verbose, output.colors_enabled());
+
+    match command {
+        Command::Migrate(options) => migrate(&options, yes, output),
+        Command::Check => check_project(output),
         Command::Auth { command } => match command {
-            AuthCommand::Login(options) => auth_login(&options).await,
-            AuthCommand::Status(options) => auth_status(&options).await,
-            AuthCommand::Logout(options) => auth_logout(&options).await,
+            AuthCommand::Login(options) => auth_login(&options, output).await,
+            AuthCommand::Status(options) => auth_status(&options, output).await,
+            AuthCommand::Logout(options) => auth_logout(&options, output).await,
         },
         Command::Project { command } => match command {
             ProjectCommand::Init {
@@ -272,67 +368,224 @@ async fn main() -> Result<()> {
                 project_id,
             } => {
                 let project_id = project_id.unwrap_or_else(Uuid::now_v7);
-                if matches!(problem_type, studio_remote::RemoteProblemType::Standard) {
-                    init_project_with_id(&directory, &title, project_id)
-                } else {
-                    reporch_cli::init_project_template(
-                        &directory,
-                        &title,
-                        project_id,
-                        problem_type.into(),
-                    )?;
-                    println!("initialized {}", directory.canonicalize()?.display());
-                    Ok(())
-                }
+                reporch_cli::init_project_template(
+                    &directory,
+                    &title,
+                    project_id,
+                    problem_type.into(),
+                )?;
+                let status = reporch_cli::local_project::project_status(&directory)?;
+                output.emit(
+                    "project init",
+                    &status,
+                    &format!("Initialized {}", status.root.display()),
+                )
             }
-            ProjectCommand::Create(options) => studio_remote::create(&options).await,
-            ProjectCommand::Pull(options) => studio_remote::pull(&options).await,
-            ProjectCommand::Push(options) => studio_remote::push(&options).await,
-            ProjectCommand::Validate(options) => studio_remote::validate(&options).await,
-            ProjectCommand::Package(options) => studio_remote::package(&options).await,
+            ProjectCommand::Link {
+                connection,
+                project_id,
+            } => {
+                let projects = studio_remote::list_projects_operation(&connection).await?;
+                ensure!(
+                    projects
+                        .items
+                        .iter()
+                        .any(|project| project.id == project_id),
+                    "Studio project {project_id} was not found or is not accessible"
+                );
+                let status = reporch_cli::local_project::link_project(
+                    Path::new("."),
+                    &connection.api_url,
+                    project_id,
+                )?;
+                output.emit(
+                    "project link",
+                    &status,
+                    &format!("Linked {}", status.project_id),
+                )
+            }
+            ProjectCommand::List(connection) => {
+                let projects = studio_remote::list_projects_operation(&connection).await?;
+                output.emit(
+                    "project list",
+                    &projects,
+                    &format!("{} project(s)", projects.items.len()),
+                )
+            }
+            ProjectCommand::Show(connection) => {
+                let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+                let state = reporch_cli::local_project::read_local_state(&root)?;
+                let project_id = state
+                    .remote
+                    .as_ref()
+                    .context("project is not linked; run reporch project link")?
+                    .project_id;
+                let projects = studio_remote::list_projects_operation(&connection).await?;
+                let project = projects
+                    .items
+                    .into_iter()
+                    .find(|project| project.id == project_id)
+                    .context("linked Studio project is no longer accessible")?;
+                output.emit("project show", &project, &project.title)
+            }
+            ProjectCommand::Status => {
+                let status = reporch_cli::local_project::project_status(Path::new("."))?;
+                let human = format!(
+                    "{} · {} · {}",
+                    status.project_id,
+                    if status.linked {
+                        "linked"
+                    } else {
+                        "not linked"
+                    },
+                    if status.dirty { "changes" } else { "clean" }
+                );
+                output.emit("project status", &status, &human)
+            }
+            ProjectCommand::Diff => {
+                let diff = reporch_cli::local_project::project_diff(Path::new("."))?;
+                let human = format!(
+                    "{} added, {} modified, {} removed{}",
+                    diff.added.len(),
+                    diff.modified.len(),
+                    diff.removed.len(),
+                    if diff.metadata_changed {
+                        ", metadata changed"
+                    } else {
+                        ""
+                    }
+                );
+                output.emit("project diff", &diff, &human)
+            }
+            ProjectCommand::Create(options) => {
+                let project = studio_remote::create_operation(&options).await?;
+                output.emit(
+                    "project create",
+                    &project,
+                    &format!("Created {} ({})", project.title, project.id),
+                )
+            }
+            ProjectCommand::Pull(options) => {
+                let pulled = studio_remote::pull_operation(&options).await?;
+                output.emit(
+                    "project pull",
+                    &pulled,
+                    &format!(
+                        "Pulled commit {} into {}",
+                        pulled.commit_id,
+                        pulled.directory.display()
+                    ),
+                )
+            }
+            ProjectCommand::Push(options) => {
+                let pushed = studio_remote::push_operation(&options).await?;
+                output.emit(
+                    "project push",
+                    &pushed,
+                    &format!(
+                        "Pushed {} file(s) · commit {}",
+                        pushed.uploaded_files, pushed.commit.id
+                    ),
+                )
+            }
+            ProjectCommand::Validate(options) => {
+                let validation = studio_remote::validate_operation(&options).await?;
+                if validation.detail.as_ref().is_some_and(|detail| {
+                    detail.status != studio_contracts::ValidationRunStatus::Passed
+                }) {
+                    bail!("Studio validation did not pass");
+                }
+                let human = match &validation.detail {
+                    Some(detail) => format!("Validation {} passed", detail.id),
+                    None => format!("Validation {} queued", validation.queued.id),
+                };
+                output.emit("project validate", &validation, &human)
+            }
+            ProjectCommand::Package(options) => {
+                let package = studio_remote::package_operation(&options).await?;
+                output.emit(
+                    "project package",
+                    &package,
+                    &format!(
+                        "Downloaded release {} to {}",
+                        package.release.id,
+                        package.output.display()
+                    ),
+                )
+            }
         },
         Command::Review { command } => match command {
-            ReviewCommand::Submit(options) => studio_remote::submit_review(&options).await,
-            ReviewCommand::List(options) => studio_remote::list_reviews(&options).await,
-            ReviewCommand::Approve(options) => studio_remote::approve_review(&options).await,
+            ReviewCommand::Submit(options) => {
+                let review = studio_remote::submit_review_operation(&options).await?;
+                output.emit(
+                    "review submit",
+                    &review,
+                    &format!("Submitted review {}", review.id),
+                )
+            }
+            ReviewCommand::List(options) => {
+                let reviews = studio_remote::list_reviews_operation(&options).await?;
+                output.emit(
+                    "review list",
+                    &reviews,
+                    &format!("{} review(s)", reviews.items.len()),
+                )
+            }
+            ReviewCommand::Approve(options) => {
+                let review = studio_remote::approve_review_operation(&options).await?;
+                output.emit(
+                    "review approve",
+                    &review,
+                    &format!("Approved review {}", review.id),
+                )
+            }
             ReviewCommand::RequestChanges(options) => {
-                studio_remote::request_review_changes(&options).await
+                let review = studio_remote::request_review_changes_operation(&options).await?;
+                output.emit(
+                    "review request-changes",
+                    &review,
+                    &format!("Requested changes on review {}", review.id),
+                )
             }
         },
         Command::Manifest { command } => match command {
-            ManifestCommand::Validate { path } => validate(&path, false),
-            ManifestCommand::Digest { path } => validate(&path, true),
+            ManifestCommand::Validate { path } => validate(&path, false, output),
+            ManifestCommand::Digest { path } => validate(&path, true, output),
             ManifestCommand::Compatibility {
                 path,
                 profile,
                 strict,
-            } => compatibility(&path, profile.into(), strict),
+            } => compatibility(&path, profile.into(), strict, output),
         },
         Command::Package { command } => match command {
             PackageCommand::Export {
                 manifest,
-                output,
+                output: archive,
                 profile,
                 source_root,
-            } => export_package(&manifest, &output, profile.into(), source_root.as_deref()),
+            } => export_package(
+                &manifest,
+                &archive,
+                profile.into(),
+                source_root.as_deref(),
+                output,
+            ),
             PackageCommand::Import {
                 input,
                 directory,
                 profile,
-            } => import_package(&input, &directory, profile.into()),
+            } => import_package(&input, &directory, profile.into(), output),
         },
         Command::Sandbox { command } => match command {
             SandboxCommand::Plan(options) => {
                 let plan = reporch_cli::local_sandbox::plan(&options.into_local()).await?;
-                println!("{}", serde_json::to_string_pretty(&plan)?);
-                Ok(())
+                output.emit("sandbox plan", &plan, "Local sandbox plan is valid")
             }
             SandboxCommand::Run(options) => {
                 let plan = reporch_cli::local_sandbox::plan(&options.into_local()).await?;
                 let result = reporch_cli::local_sandbox::execute(&plan).await?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
                 if result.exit_code == 0 {
-                    Ok(())
+                    output.emit("sandbox run", &result, "Local sandbox command passed")
                 } else {
                     bail!("sandbox command exited with {}", result.exit_code)
                 }
@@ -350,6 +603,101 @@ async fn main() -> Result<()> {
     }
 }
 
+fn migrate(options: &MigrateOptions, yes: bool, output: &CliOutput) -> Result<()> {
+    if !yes {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!("migration requires --yes when input is not interactive");
+        }
+        print!(
+            "Create reporch.yaml and a create-only pre-1.0 backup in {}? [y/N] ",
+            options.directory.display()
+        );
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            bail!("migration cancelled");
+        }
+    }
+
+    let outcome = reporch_cli::local_project::migrate_legacy_project(&options.directory)?;
+    let human = if outcome.migrated {
+        format!("Migrated {}", outcome.directory.display())
+    } else {
+        format!("Already migrated: {}", outcome.directory.display())
+    };
+    output.emit("migrate", &outcome, &human)
+}
+
+fn check_project(output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
+    let manifest = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let digest = manifest.digest()?;
+    let data = serde_json::json!({
+        "schema": "reporch.check-result.v1",
+        "project_id": spec.project_id,
+        "problem_type": spec.problem_type,
+        "file_count": manifest.files.len(),
+        "digest": digest,
+        "valid": true,
+    });
+    output.emit(
+        "check",
+        &data,
+        &format!("Valid · {} file(s) · {digest}", manifest.files.len()),
+    )
+}
+
+fn raw_arguments_request_json() -> bool {
+    let arguments: Vec<_> = std::env::args_os().collect();
+    arguments.iter().enumerate().any(|(index, argument)| {
+        argument == "--json"
+            || argument == "--format=json"
+            || (argument == "--format"
+                && arguments
+                    .get(index + 1)
+                    .is_some_and(|value| value == "json" || value == "jsonl"))
+    })
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Migrate(_) => "migrate",
+        Command::Check => "check",
+        Command::Auth { command } => match command {
+            AuthCommand::Login(_) => "auth login",
+            AuthCommand::Status(_) => "auth status",
+            AuthCommand::Logout(_) => "auth logout",
+        },
+        Command::Project { command } => match command {
+            ProjectCommand::Init { .. } => "project init",
+            ProjectCommand::Link { .. } => "project link",
+            ProjectCommand::List(_) => "project list",
+            ProjectCommand::Show(_) => "project show",
+            ProjectCommand::Status => "project status",
+            ProjectCommand::Diff => "project diff",
+            ProjectCommand::Create(_) => "project create",
+            ProjectCommand::Pull(_) => "project pull",
+            ProjectCommand::Push(_) => "project push",
+            ProjectCommand::Validate(_) => "project validate",
+            ProjectCommand::Package(_) => "project package",
+        },
+        Command::Review { command } => match command {
+            ReviewCommand::Submit(_) => "review submit",
+            ReviewCommand::List(_) => "review list",
+            ReviewCommand::Approve(_) => "review approve",
+            ReviewCommand::RequestChanges(_) => "review request-changes",
+        },
+        Command::Manifest { .. } => "manifest",
+        Command::Package { .. } => "package",
+        Command::Sandbox { .. } => "sandbox",
+        Command::Desktop { .. } => "desktop",
+        Command::Artifact { .. } => "artifact",
+        Command::QualificationSelfTest => "qualification-self-test",
+    }
+}
+
 async fn qualification_self_test() -> Result<()> {
     qualification_keyring_canary()
         .await
@@ -363,6 +711,7 @@ async fn qualification_self_test() -> Result<()> {
     )?;
     let manifest_bytes = fs::read(temporary.path().join("reporch.problem.json"))?;
     let manifest: ReleaseManifestV1 = serde_json::from_slice(&manifest_bytes)?;
+    let authoring = reporch_cli::local_project::read_authoring_spec(temporary.path())?;
     let issues = validate_manifest(&manifest);
     if !issues.is_empty() {
         bail!("generated qualification manifest did not pass static validation");
@@ -377,6 +726,7 @@ async fn qualification_self_test() -> Result<()> {
             "target_arch": std::env::consts::ARCH,
             "credential_store_round_trip": true,
             "generated_manifest_valid": true,
+            "generated_authoring_spec_valid": authoring.project_id == manifest.project_id,
             "problem_type_count": 6,
             "passed": true,
         }))?
@@ -384,7 +734,7 @@ async fn qualification_self_test() -> Result<()> {
     Ok(())
 }
 
-async fn auth_login(options: &NativeAuthOptions) -> Result<()> {
+async fn auth_login(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
     let config = device_auth_config(options)?;
     let client = NativeAuthClient::discover(config)
         .await
@@ -394,9 +744,9 @@ async fn auth_login(options: &NativeAuthOptions) -> Result<()> {
         .await
         .context("start device authorization")?;
 
-    println!("Open this URL to sign in: {}", prompt.verification_uri);
-    println!("Enter code: {}", prompt.user_code);
-    println!("The code expires at {}.", prompt.expires_at.to_rfc3339());
+    eprintln!("Open this URL to sign in: {}", prompt.verification_uri);
+    eprintln!("Enter code: {}", prompt.user_code);
+    eprintln!("The code expires at {}.", prompt.expires_at.to_rfc3339());
     let browser_url = prompt
         .verification_uri_complete
         .clone()
@@ -412,93 +762,86 @@ async fn auth_login(options: &NativeAuthOptions) -> Result<()> {
         .finish_device_authorization(&prompt, &KeyringTokenStore)
         .await
         .context("finish device authorization")?;
-    println!("{}", serde_json::to_string_pretty(&status)?);
-    Ok(())
+    output.emit("auth login", &status, "Signed in to Reporch")
 }
 
-async fn auth_status(options: &NativeAuthOptions) -> Result<()> {
+async fn auth_status(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
     let config = device_auth_config(options)?;
     let status = config
         .local_session_status(&KeyringTokenStore)
         .await
         .context("read the OS credential store")?;
-    println!("{}", serde_json::to_string_pretty(&status)?);
-    Ok(())
+    let human = if status.authenticated {
+        "Signed in"
+    } else {
+        "Not signed in"
+    };
+    output.emit("auth status", &status, human)
 }
 
-async fn auth_logout(options: &NativeAuthOptions) -> Result<()> {
+async fn auth_logout(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
     let config = device_auth_config(options)?;
     let remote_result = match NativeAuthClient::discover(config.clone()).await {
         Ok(client) => client.logout(&KeyringTokenStore).await,
         Err(error) => {
             eprintln!("Remote revocation is unavailable: {error}");
             config.clear_local_session(&KeyringTokenStore).await?;
-            println!("Local Studio credential removed.");
-            return Ok(());
+            let result = serde_json::json!({
+                "schema": "reporch.auth-logout-result.v1",
+                "local_removed": true,
+                "remote_revoked": false,
+            });
+            return output.emit("auth logout", &result, "Local Studio credential removed");
         }
     };
-    match remote_result {
-        Ok(true) => println!("Studio credential revoked and removed."),
-        Ok(false) => {
-            println!("Local Studio credential removed; no revocation endpoint was available.")
-        }
+    let remote_revoked = match remote_result {
+        Ok(value) => value,
         Err(error) => {
             config.clear_local_session(&KeyringTokenStore).await?;
             eprintln!("Remote revocation failed: {error}");
-            println!("Local Studio credential removed.");
+            false
         }
-    }
-    Ok(())
+    };
+    let result = serde_json::json!({
+        "schema": "reporch.auth-logout-result.v1",
+        "local_removed": true,
+        "remote_revoked": remote_revoked,
+    });
+    output.emit("auth logout", &result, "Signed out")
 }
 
-fn import_package(input: &Path, directory: &Path, profile: PackageProfile) -> Result<()> {
-    match profile {
-        PackageProfile::Icpc202509 => {
-            let manifest = icpc_import::import_icpc_2025_09(input, directory)?;
-            println!(
-                "imported ICPC 2025-09 package into {}: {}",
-                directory.display(),
-                manifest.digest()?
-            );
-            Ok(())
-        }
-        PackageProfile::IcpcLegacy => {
-            let manifest = icpc_legacy::import_icpc_legacy(input, directory)?;
-            println!(
-                "imported legacy ICPC package into {}: {}",
-                directory.display(),
-                manifest.digest()?
-            );
-            Ok(())
-        }
-        PackageProfile::DomjudgeZip => {
-            let manifest = icpc_import::import_domjudge_zip(input, directory)?;
-            println!(
-                "imported DOMjudge package into {}: {}",
-                directory.display(),
-                manifest.digest()?
-            );
-            Ok(())
-        }
+fn import_package(
+    input: &Path,
+    directory: &Path,
+    profile: PackageProfile,
+    output: &CliOutput,
+) -> Result<()> {
+    let manifest = match profile {
+        PackageProfile::Icpc202509 => icpc_import::import_icpc_2025_09(input, directory)?,
+        PackageProfile::IcpcLegacy => icpc_legacy::import_icpc_legacy(input, directory)?,
+        PackageProfile::DomjudgeZip => icpc_import::import_domjudge_zip(input, directory)?,
         PackageProfile::PolygonCompatible => {
-            let manifest = polygon_import::import_polygon_package(input, directory)?;
-            println!(
-                "imported Polygon-compatible package into {}: {}",
-                directory.display(),
-                manifest.digest()?
-            );
-            Ok(())
+            polygon_import::import_polygon_package(input, directory)?
         }
-        PackageProfile::ReporchNative => {
-            let manifest = native_package::import_native(input, directory)?;
-            println!(
-                "imported Reporch Native package into {}: {}",
-                directory.display(),
-                manifest.digest()?
-            );
-            Ok(())
-        }
-    }
+        PackageProfile::ReporchNative => native_package::import_native(input, directory)?,
+    };
+    reporch_cli::local_project::write_authoring_spec_create_new(
+        directory,
+        &reporch_format::AuthoringSpecV1::from_manifest(&manifest),
+    )?;
+    let data = serde_json::json!({
+        "schema": "reporch.package-import-result.v1",
+        "profile": profile,
+        "input": input,
+        "directory": directory,
+        "project_id": manifest.project_id,
+        "manifest_digest": manifest.digest()?,
+    });
+    output.emit(
+        "package import",
+        &data,
+        &format!("Imported package into {}", directory.display()),
+    )
 }
 
 fn export_package(
@@ -506,6 +849,7 @@ fn export_package(
     output: &Path,
     profile: PackageProfile,
     source_root: Option<&Path>,
+    cli_output: &CliOutput,
 ) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     let source_root = source_root
@@ -514,41 +858,54 @@ fn export_package(
         .context("manifest path has no parent directory")?;
     match profile {
         PackageProfile::Icpc202509 => {
-            icpc_export::export_icpc_2025_09(&manifest, &source_root, output)?;
-            println!("exported ICPC 2025-09 package: {}", output.display());
-            Ok(())
+            icpc_export::export_icpc_2025_09(&manifest, &source_root, output)?
         }
         PackageProfile::IcpcLegacy => {
-            icpc_legacy::export_icpc_legacy(&manifest, &source_root, output)?;
-            println!("exported legacy ICPC package: {}", output.display());
-            Ok(())
+            icpc_legacy::export_icpc_legacy(&manifest, &source_root, output)?
         }
         PackageProfile::DomjudgeZip => {
-            icpc_export::export_domjudge_zip(&manifest, &source_root, output)?;
-            println!("exported DOMjudge package: {}", output.display());
-            Ok(())
+            icpc_export::export_domjudge_zip(&manifest, &source_root, output)?
         }
         PackageProfile::PolygonCompatible => {
-            polygon_export::export_polygon_package(&manifest, &source_root, output)?;
-            println!("exported Polygon-compatible package: {}", output.display());
-            Ok(())
+            polygon_export::export_polygon_package(&manifest, &source_root, output)?
         }
         PackageProfile::ReporchNative => {
-            native_package::export_native(&manifest, &source_root, output)?;
-            println!("exported Reporch Native package: {}", output.display());
-            Ok(())
+            native_package::export_native(&manifest, &source_root, output)?
         }
     }
+    let data = serde_json::json!({
+        "schema": "reporch.package-export-result.v1",
+        "profile": profile,
+        "output": output,
+        "manifest_digest": manifest.digest()?,
+    });
+    cli_output.emit(
+        "package export",
+        &data,
+        &format!("Exported package to {}", output.display()),
+    )
 }
 
-fn compatibility(path: &Path, profile: PackageProfile, strict: bool) -> Result<()> {
+fn compatibility(
+    path: &Path,
+    profile: PackageProfile,
+    strict: bool,
+    output: &CliOutput,
+) -> Result<()> {
     let manifest = read_manifest(path)?;
     let report = compatibility_report(&manifest, profile);
-    println!("{}", serde_json::to_string_pretty(&report)?);
     if strict && !report.exportable {
         bail!("manifest cannot be exported to the requested profile");
     }
-    Ok(())
+    output.emit(
+        "manifest compatibility",
+        &report,
+        if report.exportable {
+            "Manifest is exportable"
+        } else {
+            "Manifest has compatibility losses"
+        },
+    )
 }
 
 fn read_manifest(path: &Path) -> Result<ReleaseManifestV1> {
@@ -556,202 +913,41 @@ fn read_manifest(path: &Path) -> Result<ReleaseManifestV1> {
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
-fn validate(path: &Path, print_digest: bool) -> Result<()> {
+fn validate(path: &Path, print_digest: bool, output: &CliOutput) -> Result<()> {
     let manifest = read_manifest(path)?;
     let issues = validate_manifest(&manifest);
     if !issues.is_empty() {
-        println!("{}", serde_json::to_string_pretty(&issues)?);
-        bail!("manifest validation failed with {} issue(s)", issues.len());
+        bail!(
+            "manifest validation failed with {} issue(s): {}",
+            issues.len(),
+            serde_json::to_string(&issues)?
+        );
     }
     local_manifest::verify_files(path, &manifest)?;
-    if print_digest {
-        println!("{}", manifest.digest()?);
+    let digest = manifest.digest()?;
+    let data = serde_json::json!({
+        "schema": "reporch.manifest-validation-result.v1",
+        "path": path,
+        "digest": digest,
+        "valid": true,
+    });
+    let human = if print_digest {
+        digest.to_string()
     } else {
-        println!("manifest is valid: {}", manifest.digest()?);
-    }
-    Ok(())
-}
-
-pub(crate) fn init_project_with_id(directory: &Path, title: &str, project_id: Uuid) -> Result<()> {
-    let title = title.trim();
-    if title.is_empty() {
-        bail!("title is required");
-    }
-    preflight_init_directory(directory)?;
-    fs::create_dir_all(directory.join("statements"))?;
-    fs::create_dir_all(directory.join("tests"))?;
-    fs::create_dir_all(directory.join("solutions"))?;
-    let statement = format!(
-        "# {title}\n\n입력으로 주어진 내용을 그대로 출력하는 시작 템플릿입니다. 문제 설명을 교체하세요.\n"
-    );
-    let sample_input = "sample\n";
-    let sample_answer = "sample\n";
-    let accepted = "import sys\nsys.stdout.write(sys.stdin.read())\n";
-    let accepted_alt = "value = input()\nprint(value)\n";
-    let wrong = "print('wrong')\n";
-    write_new_file(directory.join("statements/ko.md"), statement.as_bytes())?;
-    write_new_file(directory.join("tests/1.in"), sample_input.as_bytes())?;
-    write_new_file(directory.join("tests/1.ans"), sample_answer.as_bytes())?;
-    write_new_file(directory.join("solutions/accepted.py"), accepted.as_bytes())?;
-    write_new_file(
-        directory.join("solutions/accepted-alt.py"),
-        accepted_alt.as_bytes(),
-    )?;
-    write_new_file(directory.join("solutions/wrong.py"), wrong.as_bytes())?;
-
-    let files = vec![
-        manifest_file("statements/ko.md", statement.as_bytes(), "text/markdown"),
-        manifest_file("tests/1.in", sample_input.as_bytes(), "text/plain"),
-        manifest_file("tests/1.ans", sample_answer.as_bytes(), "text/plain"),
-        manifest_file(
-            "solutions/accepted.py",
-            accepted.as_bytes(),
-            "text/x-python",
-        ),
-        manifest_file(
-            "solutions/accepted-alt.py",
-            accepted_alt.as_bytes(),
-            "text/x-python",
-        ),
-        manifest_file("solutions/wrong.py", wrong.as_bytes(), "text/x-python"),
-    ];
-
-    let manifest = ReleaseManifestV1 {
-        schema: RELEASE_MANIFEST_SCHEMA_V1.into(),
-        project_id,
-        commit_id: Uuid::now_v7(),
-        problem_type: ProblemType::Standard,
-        package_profile: PackageProfile::ReporchNative,
-        default_locale: "ko".into(),
-        title: BTreeMap::from([("ko".into(), title.into())]),
-        statements: BTreeMap::from([("ko".into(), "statements/ko.md".into())]),
-        files,
-        toolchains: BTreeMap::new(),
-        judging: JudgingSpec {
-            limits: ResourceLimits {
-                time_ms: 1000,
-                memory_mib: 256,
-                output_kib: 1024,
-            },
-            checker: CheckerSpec::Token,
-            tests: vec![TestCaseSpec {
-                id: Uuid::now_v7(),
-                name: "sample-1".into(),
-                input_file: "tests/1.in".into(),
-                answer_file: Some("tests/1.ans".into()),
-                groups: vec![],
-                generated_by: None,
-                generator_arguments: vec![],
-                seed: None,
-            }],
-            groups: vec![],
-            generators: vec![],
-            validator_path: None,
-            validator_language: None,
-            extra_validator_paths: vec![],
-            extra_validators: vec![],
-            validator_tests: vec![],
-            checker_tests: vec![],
-            interactor_path: None,
-            interactor_language: None,
-            grader_path: None,
-            grader_language: None,
-            harness: None,
-        },
-        sources: vec![],
-        solutions: vec![
-            SolutionSpec {
-                name: "accepted".into(),
-                source_path: "solutions/accepted.py".into(),
-                language: "python3".into(),
-                expected_verdict: ExpectedVerdict::Accepted,
-                expected_score: None,
-            },
-            SolutionSpec {
-                name: "accepted-alt".into(),
-                source_path: "solutions/accepted-alt.py".into(),
-                language: "python3".into(),
-                expected_verdict: ExpectedVerdict::Accepted,
-                expected_score: None,
-            },
-            SolutionSpec {
-                name: "known-wrong".into(),
-                source_path: "solutions/wrong.py".into(),
-                language: "python3".into(),
-                expected_verdict: ExpectedVerdict::WrongAnswer,
-                expected_score: None,
-            },
-        ],
-        output_submissions: vec![],
-        publication: Some(PublicationSpecV1 {
-            category: "Algorithm".into(),
-            difficulty: "Bronze 5".into(),
-            grading_category: "algorithmic".into(),
-            tags: vec![],
-            allowed_languages: vec!["python3".into()],
-            statement_sections: BTreeMap::from([(
-                "ko".into(),
-                StatementSectionsV1 {
-                    input_format: "출력할 문자열이 주어집니다.".into(),
-                    output_format: "입력을 그대로 출력합니다.".into(),
-                    note: String::new(),
-                },
-            )]),
-            samples: vec![PublicationSampleV1 {
-                name: "sample-1".into(),
-                input_file: "tests/1.in".into(),
-                output_file: "tests/1.ans".into(),
-            }],
-        }),
-        policy_version: "studio-policy-v1".into(),
+        format!("Manifest is valid: {digest}")
     };
-    write_new_file(
-        directory.join("reporch.problem.json"),
-        &serde_json::to_vec_pretty(&manifest)?,
-    )?;
-    println!("initialized {}", directory.canonicalize()?.display());
-    println!("the generated project is immediately valid; replace the template files as needed");
-    Ok(())
-}
-
-pub(crate) fn preflight_init_directory(directory: &Path) -> Result<()> {
-    if !directory.exists() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(directory)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("project directory must be a real directory");
-    }
-    if fs::read_dir(directory)?.next().transpose()?.is_some() {
-        bail!("refusing to initialize a non-empty project directory");
-    }
-    Ok(())
-}
-
-fn write_new_file(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    let path = path.as_ref();
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("create {} without overwrite", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+    output.emit(
+        if print_digest {
+            "manifest digest"
+        } else {
+            "manifest validate"
+        },
+        &data,
+        &human,
+    )
 }
 
 #[cfg(test)]
 pub(crate) fn init_project(directory: &Path, title: &str) -> Result<()> {
-    init_project_with_id(directory, title, Uuid::now_v7())
-}
-
-fn manifest_file(path: &str, bytes: &[u8], media_type: &str) -> ManifestFile {
-    ManifestFile {
-        path: path.into(),
-        sha256: studio_core::Sha256Digest::from_bytes(bytes),
-        size_bytes: bytes.len() as u64,
-        media_type: media_type.into(),
-        executable: false,
-    }
+    reporch_cli::init_project_with_id(directory, title, Uuid::now_v7())
 }

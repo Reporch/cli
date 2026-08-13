@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod local_project;
 pub mod local_sandbox;
 mod project_template;
 pub mod studio_remote;

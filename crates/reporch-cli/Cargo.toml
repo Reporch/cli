@@ -25,6 +25,7 @@ pulldown-cmark.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+reporch-format = { path = "../reporch-format" }
 serde_json.workspace = true
 serde.workspace = true
 serde_yaml_ng.workspace = true

@@ -224,6 +224,10 @@ pub fn init_project_template(
         &serde_json::to_vec_pretty(&manifest)?,
         false,
     )?;
+    crate::local_project::write_authoring_spec_create_new(
+        directory,
+        &reporch_format::AuthoringSpecV1::from_manifest(&manifest),
+    )?;
     Ok(())
 }
 
@@ -532,6 +536,9 @@ mod tests {
             .unwrap();
             assert_eq!(manifest.problem_type, problem_type);
             assert!(studio_core::validate_manifest(&manifest).is_empty());
+            let authoring = crate::local_project::read_authoring_spec(temporary.path()).unwrap();
+            assert_eq!(authoring.problem_type, problem_type);
+            assert_eq!(authoring.project_id, manifest.project_id);
             assert!(
                 init_project_template(temporary.path(), "Again", Uuid::now_v7(), problem_type)
                     .is_err()
