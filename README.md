@@ -166,6 +166,22 @@ reporch revision diff <from-commit> <to-commit>
 reporch revision restore <commit> --directory ../restored-problem
 ```
 
+Local validation toolchains are opt-in. The available catalog is embedded in
+the binary and verified with an embedded Minisign public key before it is
+parsed. Install accepts only a catalog ID; arbitrary tags and images are not an
+input surface. Every catalog image is pinned by SHA-256 and the OCI runtime is
+re-inspected after the explicit pull:
+
+```bash
+reporch toolchain list
+reporch toolchain inspect gcc-16.1-cpp
+reporch toolchain install gcc-16.1-cpp
+```
+
+`sandbox run` continues to use `--pull=never`, network isolation, a read-only
+root filesystem, dropped capabilities, and resource limits. Local results are
+never accepted as Studio release evidence.
+
 Downloads never overwrite an existing path and are installed only after the
 declared size and SHA-256 both match. Progress events can be resumed by durable
 cursor. Use JSONL for an unbounded stream, or bound JSON output for CI:

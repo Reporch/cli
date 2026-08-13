@@ -401,3 +401,30 @@ fn completion_scripts_cover_every_supported_shell_and_reject_json_wrapping() {
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["error_code"], "input.invalid");
 }
+
+#[test]
+fn toolchain_catalog_is_signed_and_install_never_accepts_an_arbitrary_image() {
+    let output = reporch()
+        .args(["--format", "json", "toolchain", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["command"], "toolchain list");
+    assert_eq!(value["data"]["schema"], "reporch.toolchain-list.v1");
+    assert!(value["data"]["entries"].as_array().unwrap().len() >= 10);
+    assert_eq!(
+        value["data"]["signing_key_sha256"].as_str().unwrap().len(),
+        64
+    );
+
+    let help = reporch()
+        .args(["toolchain", "install", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success(), "{help:?}");
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("<ID>"), "{help}");
+    assert!(!help.contains("--image"), "{help}");
+}

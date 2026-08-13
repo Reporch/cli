@@ -6,6 +6,7 @@ members = [
   "crates/studio-native-auth",
   "crates/reporch-cli",
 ]
+exclude = ["tools/toolchain-index-signer"]
 resolver = "2"
 
 [workspace.package]

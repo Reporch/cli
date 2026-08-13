@@ -165,6 +165,11 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// List, inspect, or explicitly install signed digest-pinned toolchains.
+    Toolchain {
+        #[command(subcommand)]
+        command: ToolchainCommand,
+    },
     /// Verify signed desktop release artifacts without installing them.
     Desktop {
         #[command(subcommand)]
@@ -215,6 +220,24 @@ enum SandboxCommand {
     Run(SandboxOptions),
 }
 
+#[derive(Debug, Subcommand)]
+enum ToolchainCommand {
+    /// List the toolchains in the embedded signed index.
+    List,
+    /// Inspect whether an exact signed toolchain digest is installed locally.
+    Inspect {
+        id: String,
+        #[arg(long, value_enum, default_value_t = SandboxRuntime::Auto)]
+        runtime: SandboxRuntime,
+    },
+    /// Explicitly pull one toolchain from the signed index.
+    Install {
+        id: String,
+        #[arg(long, value_enum, default_value_t = SandboxRuntime::Auto)]
+        runtime: SandboxRuntime,
+    },
+}
+
 #[derive(Debug, Clone, ClapArgs)]
 struct SandboxOptions {
     #[arg(long, value_enum, default_value_t = SandboxRuntime::Auto)]
@@ -244,14 +267,20 @@ enum SandboxRuntime {
     Docker,
 }
 
+impl SandboxRuntime {
+    fn into_oci(self) -> OciRuntime {
+        match self {
+            Self::Auto => OciRuntime::Auto,
+            Self::Podman => OciRuntime::Podman,
+            Self::Docker => OciRuntime::Docker,
+        }
+    }
+}
+
 impl SandboxOptions {
     fn into_local(self) -> LocalSandboxOptions {
         LocalSandboxOptions {
-            runtime: match self.runtime {
-                SandboxRuntime::Auto => OciRuntime::Auto,
-                SandboxRuntime::Podman => OciRuntime::Podman,
-                SandboxRuntime::Docker => OciRuntime::Docker,
-            },
+            runtime: self.runtime.into_oci(),
             image: self.image,
             project_directory: self.project_directory,
             command: self.command,
@@ -1122,6 +1151,33 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 }
             }
         },
+        Command::Toolchain { command } => match command {
+            ToolchainCommand::List => {
+                let toolchains = reporch_cli::toolchain::list()?;
+                output.emit(
+                    "toolchain list",
+                    &toolchains,
+                    &format!("{} signed toolchain(s)", toolchains.entries.len()),
+                )
+            }
+            ToolchainCommand::Inspect { id, runtime } => {
+                let inspected = reporch_cli::toolchain::inspect(&id, runtime.into_oci()).await?;
+                let human = if inspected.installed {
+                    format!("{} is installed", inspected.entry.id)
+                } else {
+                    format!("{} is not installed", inspected.entry.id)
+                };
+                output.emit("toolchain inspect", &inspected, &human)
+            }
+            ToolchainCommand::Install { id, runtime } => {
+                let installed = reporch_cli::toolchain::install(&id, runtime.into_oci()).await?;
+                output.emit(
+                    "toolchain install",
+                    &installed,
+                    &format!("Installed {}", installed.entry.id),
+                )
+            }
+        },
         Command::Desktop { command } => match command {
             DesktopCommand::VerifyUpdaterArtifact(options) => desktop_artifact::verify(&options),
         },
@@ -1308,6 +1364,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::Manifest { .. } => "manifest",
         Command::Package { .. } => "package",
         Command::Sandbox { .. } => "sandbox",
+        Command::Toolchain { command } => match command {
+            ToolchainCommand::List => "toolchain list",
+            ToolchainCommand::Inspect { .. } => "toolchain inspect",
+            ToolchainCommand::Install { .. } => "toolchain install",
+        },
         Command::Desktop { .. } => "desktop",
         Command::Artifact { .. } => "artifact",
         Command::QualificationSelfTest => "qualification-self-test",

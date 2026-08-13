@@ -1,4 +1,5 @@
 /target/
+/tools/toolchain-index-signer/target/
 /node_modules/
 *.log
 *.tmp
@@ -10,4 +11,7 @@
 /artifacts/*
 !/artifacts/studio-openapi.json.gz.b64
 !/artifacts/studio-openapi.sha256
+!/artifacts/toolchains-v1.json
+!/artifacts/toolchains-v1.json.minisig
+!/artifacts/toolchains-v1.minisign.pub
 /.gstack/

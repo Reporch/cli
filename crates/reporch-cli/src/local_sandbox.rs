@@ -52,8 +52,7 @@ pub struct LocalSandboxResult {
 
 pub async fn plan(options: &LocalSandboxOptions) -> Result<LocalSandboxPlan> {
     validate_options(options)?;
-    let runtime = resolve_runtime(options.runtime).await?;
-    require_rootless(&runtime).await?;
+    let runtime = resolve_secure_runtime(options.runtime).await?;
     let project_directory = canonical_project_directory(&options.project_directory)?;
     let container_name = format!("reporch-studio-local-{}", Uuid::now_v7().simple());
     let arguments = container_arguments(options, &project_directory, &container_name)?;
@@ -142,7 +141,7 @@ fn validate_options(options: &LocalSandboxOptions) -> Result<()> {
     Ok(())
 }
 
-fn validate_image(image: &str) -> Result<()> {
+pub(crate) fn validate_image(image: &str) -> Result<()> {
     let Some((name, digest)) = image.rsplit_once("@sha256:") else {
         bail!("sandbox image must be pinned as name@sha256:<64 lowercase hex>");
     };
@@ -228,6 +227,12 @@ async fn resolve_runtime(runtime: OciRuntime) -> Result<String> {
     .context("no requested OCI runtime is available")
 }
 
+pub async fn resolve_secure_runtime(runtime: OciRuntime) -> Result<String> {
+    let runtime = resolve_runtime(runtime).await?;
+    require_rootless(&runtime).await?;
+    Ok(runtime)
+}
+
 async fn runtime_available(runtime: &str) -> bool {
     Command::new(runtime)
         .arg("--version")
@@ -276,7 +281,7 @@ async fn require_rootless(runtime: &str) -> Result<()> {
     Ok(())
 }
 
-async fn read_bounded(
+pub(crate) async fn read_bounded(
     mut reader: impl AsyncRead + Unpin,
     limit: usize,
 ) -> Result<(Vec<u8>, bool), std::io::Error> {
