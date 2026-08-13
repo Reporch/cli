@@ -272,7 +272,7 @@ fn program_command(
     stdin: Option<&str>,
     arguments: &[String],
 ) -> Result<Vec<String>> {
-    let input = stdin.unwrap_or("");
+    let input = stdin.unwrap_or("-");
     let mut command = match language {
         "python" => interpreted_command("python3", source, input),
         "pypy" => interpreted_command("pypy3", source, input),
@@ -308,7 +308,7 @@ fn interpreted_command(interpreter: &str, source: &str, input: &str) -> Vec<Stri
     vec![
         "sh".into(),
         "-c".into(),
-        "input=$1; shift; if [ -n \"$input\" ]; then exec \"$@\" < \"$input\"; else exec \"$@\"; fi".into(),
+        "input=$1; shift; if [ \"$input\" != - ]; then exec \"$@\" < \"$input\"; else exec \"$@\"; fi".into(),
         "reporch".into(),
         input.into(),
         interpreter.into(),
@@ -321,7 +321,7 @@ fn compiled_command(compiler: &str, source: &str, input: &str) -> Vec<String> {
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; src=$1; input=$2; shift 2; {compiler}; if [ -n \"$input\" ]; then exec /run/reporch/program \"$@\" < \"$input\"; else exec /run/reporch/program \"$@\"; fi"
+            "set -eu; src=$1; input=$2; shift 2; {compiler}; if [ \"$input\" != - ]; then exec /run/reporch/program \"$@\" < \"$input\"; else exec /run/reporch/program \"$@\"; fi"
         ),
         "reporch".into(),
         source.into(),
@@ -345,7 +345,7 @@ fn java_command(source: &str, input: &str) -> Result<Vec<String>> {
     Ok(vec![
         "sh".into(),
         "-c".into(),
-        "set -eu; src=$1; input=$2; class=$3; shift 3; mkdir -p /run/reporch/classes; javac -d /run/reporch/classes \"$src\"; if [ -n \"$input\" ]; then exec java -cp /run/reporch/classes \"$class\" \"$@\" < \"$input\"; else exec java -cp /run/reporch/classes \"$class\" \"$@\"; fi".into(),
+        "set -eu; src=$1; input=$2; class=$3; shift 3; mkdir -p /run/reporch/classes; javac -d /run/reporch/classes \"$src\"; if [ \"$input\" != - ]; then exec java -cp /run/reporch/classes \"$class\" \"$@\" < \"$input\"; else exec java -cp /run/reporch/classes \"$class\" \"$@\"; fi".into(),
         "reporch".into(),
         source.into(),
         input.into(),
@@ -357,7 +357,7 @@ fn csharp_command(source: &str, input: &str) -> Vec<String> {
     vec![
         "sh".into(),
         "-c".into(),
-        "set -eu; src=$1; input=$2; shift 2; mkdir -p /run/reporch/app; printf '%s\n' '<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>' > /run/reporch/app/app.csproj; cp \"$src\" /run/reporch/app/Program.cs; dotnet build /run/reporch/app/app.csproj --nologo --verbosity quiet -o /run/reporch/out >/dev/null; if [ -n \"$input\" ]; then exec dotnet /run/reporch/out/app.dll \"$@\" < \"$input\"; else exec dotnet /run/reporch/out/app.dll \"$@\"; fi".into(),
+        "set -eu; src=$1; input=$2; shift 2; mkdir -p /run/reporch/app; printf '%s\n' '<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>' > /run/reporch/app/app.csproj; cp \"$src\" /run/reporch/app/Program.cs; dotnet build /run/reporch/app/app.csproj --nologo --verbosity quiet -o /run/reporch/out >/dev/null; if [ \"$input\" != - ]; then exec dotnet /run/reporch/out/app.dll \"$@\" < \"$input\"; else exec dotnet /run/reporch/out/app.dll \"$@\"; fi".into(),
         "reporch".into(),
         source.into(),
         input.into(),
