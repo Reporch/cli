@@ -30,6 +30,10 @@ use studio_native_auth::qualification_keyring_canary;
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use uuid::Uuid;
 
+#[derive(Debug, thiserror::Error)]
+#[error("operation interrupted by SIGINT")]
+struct CliInterrupted;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "reporch",
@@ -572,6 +576,9 @@ async fn main() {
     let output = CliOutput::new(format, arguments.quiet, arguments.color);
     let command = command_name(&arguments.command);
     if let Err(error) = run(arguments, &output).await {
+        if error.downcast_ref::<CliInterrupted>().is_some() {
+            std::process::exit(130);
+        }
         let exit_code = output.emit_error(command, &error);
         std::process::exit(exit_code as i32);
     }
@@ -988,6 +995,9 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     )
                 })
                 .await?;
+                if watched.interrupted {
+                    return Err(CliInterrupted.into());
+                }
                 if bounded {
                     output.emit(
                         "events watch",
