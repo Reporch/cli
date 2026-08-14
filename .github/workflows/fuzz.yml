@@ -34,7 +34,8 @@ jobs:
           components: clippy, rustfmt
       - name: Install pinned cargo-fuzz
         run: |
-          rustc --version | grep -F 'nightly-2026-08-11'
+          rustup show active-toolchain | grep -F 'nightly-2026-08-11'
+          rustc --version
           cargo install --locked cargo-fuzz --version 0.13.2
       - name: Check fuzz harnesses
         run: |
