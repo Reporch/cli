@@ -189,3 +189,181 @@ jobs:
           else
             gh release edit "$RELEASE_TAG" --draft=false --latest
           fi
+
+  qualify-published-artifacts:
+    needs: [verify-source, publish]
+    permissions:
+      contents: read
+      attestations: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive_kind: tar
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_kind: tar
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive_kind: tar
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_kind: tar
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive_kind: zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.verify-source.outputs.version }}
+      RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      ARCHIVE_KIND: ${{ matrix.archive_kind }}
+    steps:
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+
+      - name: Download and exercise the published Unix artifacts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/release-assets"
+          install_dir="$RUNNER_TEMP/native-install"
+          npm_dir="$RUNNER_TEMP/npm-install"
+          project="$RUNNER_TEMP/authoring-project"
+          mkdir "$assets" "$install_dir" "$npm_dir"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$assets"
+          if command -v sha256sum >/dev/null; then
+            (cd "$assets" && sha256sum --check --strict SHA256SUMS)
+          else
+            (cd "$assets" && shasum -a 256 --check SHA256SUMS)
+          fi
+          archive="$assets/reporch-v${VERSION}-${TARGET}.tar.gz"
+          test -f "$archive"
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          tar -xzf "$archive" -C "$install_dir"
+          native="$install_dir/reporch-v${VERSION}-${TARGET}/reporch"
+          test -x "$native"
+          test "$("$native" --version)" = "reporch $VERSION"
+
+          cd "$npm_dir"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "@reporch/cli@$VERSION"
+          npm_binary="$npm_dir/node_modules/.bin/reporch"
+          test -x "$npm_binary"
+          test "$("$npm_binary" --version)" = "reporch $VERSION"
+
+          run_flow() {
+            local binary=$1
+            local evidence=$2
+            "$binary" qualification-self-test > "$evidence"
+            jq -e --arg version "$VERSION" '
+              .schema == "reporch.cli-installed-self-test.v1"
+              and .version == $version
+              and .credential_store_round_trip == true
+              and .generated_manifest_valid == true
+              and .generated_authoring_spec_valid == true
+              and .problem_type_count == 6
+              and .passed == true
+            ' "$evidence" >/dev/null
+          }
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y dbus-x11 gnome-keyring
+            export native npm_binary VERSION
+            # The single-quoted child script intentionally receives exported variables.
+            # shellcheck disable=SC2016
+            dbus-run-session -- bash -euo pipefail -c '
+              eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+              "$native" qualification-self-test > "$RUNNER_TEMP/native-self-test.json"
+              "$npm_binary" qualification-self-test > "$RUNNER_TEMP/npm-self-test.json"
+              "$native" --format json auth status > "$RUNNER_TEMP/auth-status.json"
+            '
+            for evidence in "$RUNNER_TEMP/native-self-test.json" "$RUNNER_TEMP/npm-self-test.json"; do
+              jq -e --arg version "$VERSION" '
+                .schema == "reporch.cli-installed-self-test.v1"
+                and .version == $version
+                and .credential_store_round_trip == true
+                and .generated_manifest_valid == true
+                and .generated_authoring_spec_valid == true
+                and .problem_type_count == 6
+                and .passed == true
+              ' "$evidence" >/dev/null
+            done
+          else
+            run_flow "$native" "$RUNNER_TEMP/native-self-test.json"
+            run_flow "$npm_binary" "$RUNNER_TEMP/npm-self-test.json"
+            "$native" --format json auth status > "$RUNNER_TEMP/auth-status.json"
+          fi
+
+          "$native" --format json project init --title "RC qualification" --directory "$project" \
+            > "$RUNNER_TEMP/project-init.json"
+          "$native" --cwd "$project" --format json check > "$RUNNER_TEMP/project-check.json"
+          jq -e '.schema == "reporch.cli-result.v1" and .command == "project init"' \
+            "$RUNNER_TEMP/project-init.json" >/dev/null
+          jq -e '.schema == "reporch.cli-result.v1" and .command == "check"' \
+            "$RUNNER_TEMP/project-check.json" >/dev/null
+          jq -e '.schema == "reporch.cli-result.v1" and .data.authenticated == false' \
+            "$RUNNER_TEMP/auth-status.json" >/dev/null
+
+      - name: Download and exercise the published Windows artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = Join-Path $env:RUNNER_TEMP 'release-assets'
+          $install = Join-Path $env:RUNNER_TEMP 'native-install'
+          $npmDir = Join-Path $env:RUNNER_TEMP 'npm-install'
+          $project = Join-Path $env:RUNNER_TEMP 'authoring-project'
+          New-Item -ItemType Directory $assets, $install, $npmDir | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $assets
+          Get-Content (Join-Path $assets 'SHA256SUMS') | ForEach-Object {
+            if ($_ -notmatch '^([a-f0-9]{64})  (.+)$') { throw 'invalid checksum entry' }
+            $path = Join-Path $assets $Matches[2]
+            if ((Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant() -ne $Matches[1]) {
+              throw "checksum mismatch: $path"
+            }
+          }
+          $archive = Join-Path $assets "reporch-v$env:VERSION-$env:TARGET.zip"
+          if (!(Test-Path -LiteralPath $archive -PathType Leaf)) { throw 'native archive is missing' }
+          gh attestation verify $archive --repo $env:GITHUB_REPOSITORY
+          Expand-Archive -LiteralPath $archive -DestinationPath $install
+          $native = Join-Path $install "reporch-v$env:VERSION-$env:TARGET/reporch.exe"
+          if ((& $native --version) -ne "reporch $env:VERSION") { throw 'native version mismatch' }
+
+          Push-Location $npmDir
+          npm init --yes | Out-Null
+          npm install --ignore-scripts --no-audit --no-fund "@reporch/cli@$env:VERSION"
+          Pop-Location
+          $npmBinary = Join-Path $npmDir 'node_modules/.bin/reporch.cmd'
+          if ((& $npmBinary --version) -ne "reporch $env:VERSION") { throw 'npm version mismatch' }
+          foreach ($entry in @(
+            @{ Binary = $native; Evidence = (Join-Path $env:RUNNER_TEMP 'native-self-test.json') },
+            @{ Binary = $npmBinary; Evidence = (Join-Path $env:RUNNER_TEMP 'npm-self-test.json') }
+          )) {
+            & $entry.Binary qualification-self-test | Set-Content -Encoding utf8 $entry.Evidence
+            if ($LASTEXITCODE -ne 0) { throw 'installed qualification self-test failed' }
+            $result = Get-Content -Raw $entry.Evidence | ConvertFrom-Json
+            if (!$result.passed -or !$result.credential_store_round_trip -or !$result.generated_manifest_valid -or !$result.generated_authoring_spec_valid -or $result.version -ne $env:VERSION) {
+              throw 'installed qualification evidence mismatch'
+            }
+          }
+          & $native --format json project init --title 'RC qualification' --directory $project |
+            Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'project-init.json')
+          if ($LASTEXITCODE -ne 0) { throw 'project initialization failed' }
+          & $native --cwd $project --format json check |
+            Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'project-check.json')
+          if ($LASTEXITCODE -ne 0) { throw 'project check failed' }
+          & $native --format json auth status |
+            Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'auth-status.json')
+          if ($LASTEXITCODE -ne 0) { throw 'auth status failed' }
+          $status = Get-Content -Raw (Join-Path $env:RUNNER_TEMP 'auth-status.json') | ConvertFrom-Json
+          if ($status.schema -ne 'reporch.cli-result.v1' -or $status.data.authenticated) {
+            throw 'auth status contract mismatch'
+          }
