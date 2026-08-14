@@ -43,6 +43,13 @@ export const TARGETS = Object.freeze([
   }
 ]);
 
+export function npmTagForVersion(version) {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/.test(version)) {
+    throw new Error(`invalid release version: ${version}`);
+  }
+  return version.includes("-") ? "next" : "latest";
+}
+
 export function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
