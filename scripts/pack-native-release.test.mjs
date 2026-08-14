@@ -53,7 +53,7 @@ test(
       const files = readdirSync(first.output).sort();
       assert.deepEqual(files, [
         "native-release-manifest.json",
-        ...TARGETS.map((target) => nativeArchiveName("0.9.0", target))
+        ...TARGETS.map((target) => nativeArchiveName(first.version, target))
       ].sort());
       const manifest = JSON.parse(
         readFileSync(join(first.output, "native-release-manifest.json"), "utf8")
