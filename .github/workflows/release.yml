@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -15,6 +16,8 @@ concurrency:
 jobs:
   verify-source:
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -45,6 +48,20 @@ jobs:
             test "$GITHUB_REF_NAME" = "$tag"
           else
             test "$GITHUB_REF" = refs/heads/main
+          fi
+          if [ "$version" = 1.0.0 ]; then
+            gh issue list --state closed --limit 100 --json title,createdAt,closedAt \
+              > "$RUNNER_TEMP/beta-issues.json"
+            jq -e '
+              [.[] | select(.title == "Reporch CLI 1.0.0-rc.1 — 30-day stability window")]
+              | length == 1 and .[0].closedAt != null
+            ' "$RUNNER_TEMP/beta-issues.json" >/dev/null
+            started=$(jq -er '.[] | select(.title == "Reporch CLI 1.0.0-rc.1 — 30-day stability window") | .createdAt' "$RUNNER_TEMP/beta-issues.json")
+            completed=$(jq -er '.[] | select(.title == "Reporch CLI 1.0.0-rc.1 — 30-day stability window") | .closedAt' "$RUNNER_TEMP/beta-issues.json")
+            STARTED_AT="$started" COMPLETED_AT="$completed" node -e '
+              const elapsed = Date.parse(process.env.COMPLETED_AT) - Date.parse(process.env.STARTED_AT);
+              if (!Number.isFinite(elapsed) || elapsed < 30 * 24 * 60 * 60 * 1000) process.exit(1);
+            '
           fi
           {
             echo "version=$version"
@@ -113,6 +130,7 @@ jobs:
       attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       VERSION: ${{ needs.verify-source.outputs.version }}
       RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
       IS_PRERELEASE: ${{ needs.verify-source.outputs.prerelease }}
@@ -367,3 +385,34 @@ jobs:
           if ($status.schema -ne 'reporch.cli-result.v1' -or $status.data.authenticated) {
             throw 'auth status contract mismatch'
           }
+
+  start-beta-window:
+    needs: [verify-source, qualify-published-artifacts]
+    if: needs.verify-source.outputs.prerelease == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.verify-source.outputs.version }}
+    steps:
+      - name: Start the auditable 30-day stability window after qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$VERSION" = 1.0.0-rc.1
+          title='Reporch CLI 1.0.0-rc.1 — 30-day stability window'
+          gh issue list --state all --limit 100 --json number,title,state > "$RUNNER_TEMP/issues.json"
+          count=$(jq --arg title "$title" '[.[] | select(.title == $title)] | length' "$RUNNER_TEMP/issues.json")
+          test "$count" -le 1
+          if [ "$count" = 0 ]; then
+            started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            earliest=$(date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)
+            gh issue create --title "$title" --body "RC qualification completed in workflow run $GITHUB_RUN_ID.\n\nStart: $started\nEarliest eligible completion: $earliest\n\nDo not close this issue before 30 full days have elapsed. Close it only after confirming zero critical security, data-loss, or duplicate-publication incidents and attaching the daily/incident evidence. The stable 1.0.0 release workflow verifies both the elapsed time and this issue's closed state."
+          else
+            number=$(jq -er --arg title "$title" '.[] | select(.title == $title) | .number' "$RUNNER_TEMP/issues.json")
+            state=$(jq -er --arg title "$title" '.[] | select(.title == $title) | .state' "$RUNNER_TEMP/issues.json")
+            test "$state" = OPEN
+            gh issue comment "$number" --body "Published-artifact qualification passed again in workflow run $GITHUB_RUN_ID."
+          fi
