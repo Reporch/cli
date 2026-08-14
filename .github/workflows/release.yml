@@ -50,17 +50,16 @@ jobs:
             test "$GITHUB_REF" = refs/heads/main
           fi
           if [ "$version" = 1.0.0 ]; then
-            gh issue list --state closed --limit 100 --json title,createdAt,closedAt \
+            gh issue list --state all --limit 100 --json title,createdAt,closedAt \
               > "$RUNNER_TEMP/beta-issues.json"
-            jq -e '
-              [.[] | select(.title == "Reporch CLI 1.0.0-rc.1 — 30-day stability window")]
-              | length == 1 and .[0].closedAt != null
-            ' "$RUNNER_TEMP/beta-issues.json" >/dev/null
-            started=$(jq -er '.[] | select(.title == "Reporch CLI 1.0.0-rc.1 — 30-day stability window") | .createdAt' "$RUNNER_TEMP/beta-issues.json")
-            completed=$(jq -er '.[] | select(.title == "Reporch CLI 1.0.0-rc.1 — 30-day stability window") | .closedAt' "$RUNNER_TEMP/beta-issues.json")
-            STARTED_AT="$started" COMPLETED_AT="$completed" node -e '
-              const elapsed = Date.parse(process.env.COMPLETED_AT) - Date.parse(process.env.STARTED_AT);
-              if (!Number.isFinite(elapsed) || elapsed < 30 * 24 * 60 * 60 * 1000) process.exit(1);
+            BETA_ISSUES="$RUNNER_TEMP/beta-issues.json" node -e '
+              const fs = require("node:fs");
+              const candidates = JSON.parse(fs.readFileSync(process.env.BETA_ISSUES, "utf8"))
+                .filter((issue) => /^Reporch CLI 1\.0\.0-rc\.[0-9A-Za-z.-]+ — 30-day stability window$/.test(issue.title))
+                .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
+              const latest = candidates[0];
+              const elapsed = latest && Date.parse(latest.closedAt) - Date.parse(latest.createdAt);
+              if (!latest || !latest.closedAt || !Number.isFinite(elapsed) || elapsed < 30 * 24 * 60 * 60 * 1000) process.exit(1);
             '
           fi
           {
@@ -401,8 +400,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$VERSION" = 1.0.0-rc.1
-          title='Reporch CLI 1.0.0-rc.1 — 30-day stability window'
+          [[ "$VERSION" =~ ^1\.0\.0-rc\.[0-9A-Za-z.-]+$ ]]
+          title="Reporch CLI $VERSION — 30-day stability window"
           gh issue list --state all --limit 100 --json number,title,state > "$RUNNER_TEMP/issues.json"
           count=$(jq --arg title "$title" '[.[] | select(.title == $title)] | length' "$RUNNER_TEMP/issues.json")
           test "$count" -le 1
