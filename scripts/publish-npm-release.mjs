@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { waitForExpectedIntegrity } from "./npm-registry.mjs";
+import { npmTagForVersion } from "./release-lib.mjs";
 
 const [releaseDirectory = "dist"] = process.argv.slice(2);
 const manifest = JSON.parse(
@@ -11,6 +12,10 @@ const manifest = JSON.parse(
 );
 assert.equal(manifest.schema, "reporch.cli-npm-pack.v1");
 assert.equal(manifest.packages.length, 6);
+const versions = new Set(manifest.packages.map((item) => item.version));
+assert.equal(versions.size, 1, "all npm packages must have one release version");
+const [version] = versions;
+const npmTag = npmTagForVersion(version);
 
 function command(commandName, args) {
   return spawnSync(commandName, args, {
@@ -36,7 +41,14 @@ for (const item of manifest.packages) {
   }
   assert.match(existing.stderr, /E404|not in this registry|No match found/i, existing.stderr);
   const tarball = join(releaseDirectory, "tarballs", item.filename);
-  const published = command("npm", ["publish", tarball, "--access", "public"]);
+  const published = command("npm", [
+    "publish",
+    tarball,
+    "--access",
+    "public",
+    "--tag",
+    npmTag
+  ]);
   assert.equal(published.status, 0, `${spec} publish failed\n${published.stdout}\n${published.stderr}`);
   await waitForExpectedIntegrity({
     lookup: () =>

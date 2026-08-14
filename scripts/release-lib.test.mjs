@@ -4,12 +4,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { TARGETS, assertReleaseBinary, validateOutputArgument } from "./release-lib.mjs";
+import {
+  TARGETS,
+  assertReleaseBinary,
+  npmTagForVersion,
+  validateOutputArgument
+} from "./release-lib.mjs";
 
 test("release target set is exact and unique", () => {
   assert.equal(TARGETS.length, 5);
   assert.equal(new Set(TARGETS.map((item) => item.target)).size, 5);
   assert.equal(new Set(TARGETS.map((item) => item.packageName)).size, 5);
+});
+
+test("prereleases never move the npm latest tag", () => {
+  assert.equal(npmTagForVersion("1.0.0-rc.1"), "next");
+  assert.equal(npmTagForVersion("1.0.0"), "latest");
+  assert.throws(() => npmTagForVersion("1.0"), /invalid release version/);
 });
 
 test("unsafe release outputs and tiny binaries fail closed", () => {

@@ -18,6 +18,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -36,13 +37,20 @@ jobs:
           node scripts/check-workflows.mjs
           version=$(node -p 'require("./npm/cli/package.json").version')
           tag="v$version"
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
           if [ "$GITHUB_EVENT_NAME" = push ]; then
             test "$GITHUB_REF_NAME" = "$tag"
           else
             test "$GITHUB_REF" = refs/heads/main
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: verify-source
@@ -107,6 +115,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.verify-source.outputs.version }}
       RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
+      IS_PRERELEASE: ${{ needs.verify-source.outputs.prerelease }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -160,7 +169,11 @@ jobs:
             test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
             gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA"
           else
-            gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" \
+            release_flags=()
+            if [ "$IS_PRERELEASE" = true ]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" "${release_flags[@]}" \
               --title "Reporch CLI $VERSION" \
               --notes $'Official Apache-2.0 Reporch CLI release.\n\nInstall with `npm install --global @reporch/cli`, or download the standalone archive for your target and verify it with `SHA256SUMS`. Every release asset has GitHub artifact provenance; manifests and an SPDX SBOM are included.'
           fi
@@ -168,4 +181,11 @@ jobs:
       - name: Publish exact npm tarballs with OIDC and provenance
         run: node scripts/publish-npm-release.mjs dist
       - name: Publish GitHub release after npm verification
-        run: gh release edit "$RELEASE_TAG" --draft=false --latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$IS_PRERELEASE" = true ]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --latest
+          fi
