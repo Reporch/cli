@@ -120,10 +120,10 @@ meaning and file hashes. The backup is never overwritten.
 ## Package compatibility
 
 ```bash
-reporch manifest compatibility reporch.problem.json \
+reporch manifest compatibility reporch.yaml \
   --profile icpc202509 --strict
 
-reporch package export reporch.problem.json problem.zip \
+reporch package export reporch.yaml problem.zip \
   --profile domjudge-zip
 
 reporch package import polygon-package.zip ./imported \
@@ -131,10 +131,12 @@ reporch package import polygon-package.zip ./imported \
 ```
 
 Run `reporch <command> --help` for every option. `reporch.yaml` is the source of
-truth; compatibility commands report unsupported or lossy features instead of
-silently discarding them. After an approved release is built, publication is
-always explicit: `reporch publication publish` asks for confirmation, or
-requires `--yes` in CI.
+truth, and compatibility/package export commands compile it in memory without
+replacing the last immutable `reporch.problem.json` baseline. Pass an immutable
+JSON manifest instead when reproducing an existing commit. Compatibility
+commands report unsupported or lossy features instead of silently discarding
+them. After an approved release is built, publication is always explicit:
+`reporch publication publish` asks for confirmation, or requires `--yes` in CI.
 
 Shell completion scripts are generated from the exact installed command tree:
 

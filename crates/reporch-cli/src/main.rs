@@ -1842,7 +1842,29 @@ fn compatibility(
 
 fn read_versioned_manifest(path: &Path) -> Result<VersionedReleaseManifest> {
     let bytes = reporch_cli::local_project::read_bounded_regular_file(path, 16 * 1024 * 1024)?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+    if let Ok(manifest) = serde_json::from_slice(&bytes) {
+        return Ok(manifest);
+    }
+
+    let source_root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match reporch_format::parse_versioned_authoring_spec(&bytes).with_context(|| {
+        format!(
+            "parse {} as an immutable manifest or authoring spec",
+            path.display()
+        )
+    })? {
+        reporch_format::VersionedAuthoringSpec::V1(spec) => Ok(
+            reporch_cli::local_project::compile_authoring_spec(source_root, &spec, Uuid::nil())?
+                .into(),
+        ),
+        reporch_format::VersionedAuthoringSpec::V2(spec) => Ok(
+            reporch_cli::local_project_v2::compile_authoring_spec(source_root, &spec, Uuid::nil())?
+                .into(),
+        ),
+    }
 }
 
 #[cfg(test)]
