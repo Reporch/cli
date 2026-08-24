@@ -584,6 +584,12 @@ pub enum ManifestError {
     DuplicatePath(String),
     #[error("manifest references a missing file: {0}")]
     MissingFileReference(String),
+    #[error("duplicate manifest identity: {0}")]
+    DuplicateIdentity(String),
+    #[error("manifest references a missing identity: {0}")]
+    MissingIdentityReference(String),
+    #[error("invalid manifest configuration: {0}")]
+    InvalidConfiguration(String),
     #[error("manifest serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 }

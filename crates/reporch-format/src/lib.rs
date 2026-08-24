@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use studio_core::{
-    JudgingSpec, ManifestError, ManifestFile, OutputSubmissionSpec, PackageProfile, ProblemType,
-    PublicationSpecV1, RELEASE_MANIFEST_SCHEMA_V1, ReleaseManifestV1, SolutionSpec,
-    SourceAttribution, validate_relative_path,
+    ExecutionSpecV2, JudgingSpec, ManifestError, ManifestFile, OutputSubmissionSpec,
+    OutputSubmissionSpecV2, PackageProfile, ProblemType, PublicationSpecV1,
+    RELEASE_MANIFEST_SCHEMA_V1, RELEASE_MANIFEST_SCHEMA_V2, ReleaseManifestV1, ReleaseManifestV2,
+    SolutionSpec, SourceAttribution, TestingSpecV2, validate_relative_path,
 };
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
@@ -15,6 +16,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 pub const AUTHORING_SPEC_SCHEMA_V1: &str = "reporch.authoring-spec.v1";
+pub const AUTHORING_SPEC_SCHEMA_V2: &str = "reporch.authoring-spec.v2";
 pub const MAX_AUTHORING_SPEC_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -50,6 +52,48 @@ pub struct AuthoringSpecV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication: Option<PublicationSpecV1>,
     pub policy_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoringFileV2 {
+    pub path: String,
+    pub media_type: String,
+    #[serde(default)]
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoringSpecV2 {
+    pub schema: String,
+    pub project_id: Uuid,
+    pub problem_type: ProblemType,
+    pub package_profile: PackageProfile,
+    pub default_locale: String,
+    pub title: BTreeMap<String, String>,
+    pub statements: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tutorials: BTreeMap<String, String>,
+    #[serde(default)]
+    pub files: Vec<AuthoringFileV2>,
+    #[serde(default)]
+    pub toolchains: BTreeMap<String, String>,
+    pub testing: TestingSpecV2,
+    #[serde(default)]
+    pub execution: ExecutionSpecV2,
+    #[serde(default)]
+    pub output_submissions: Vec<OutputSubmissionSpecV2>,
+    #[serde(default)]
+    pub sources: Vec<SourceAttribution>,
+    pub publication: Option<PublicationSpecV1>,
+    pub policy_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VersionedAuthoringSpec {
+    V1(AuthoringSpecV1),
+    V2(AuthoringSpecV2),
 }
 
 impl AuthoringSpecV1 {
@@ -152,7 +196,144 @@ impl AuthoringSpecV1 {
     }
 }
 
+impl AuthoringSpecV2 {
+    pub fn from_manifest(manifest: &ReleaseManifestV2) -> Self {
+        Self {
+            schema: AUTHORING_SPEC_SCHEMA_V2.into(),
+            project_id: manifest.project_id,
+            problem_type: manifest.problem_type,
+            package_profile: manifest.package_profile,
+            default_locale: manifest.default_locale.clone(),
+            title: manifest.title.clone(),
+            statements: manifest.statements.clone(),
+            tutorials: manifest.tutorials.clone(),
+            files: manifest
+                .files
+                .iter()
+                .map(|file| AuthoringFileV2 {
+                    path: file.path.clone(),
+                    media_type: file.media_type.clone(),
+                    executable: file.executable,
+                })
+                .collect(),
+            toolchains: manifest.toolchains.clone(),
+            testing: manifest.testing.clone(),
+            execution: manifest.execution.clone(),
+            output_submissions: manifest.output_submissions.clone(),
+            sources: manifest.sources.clone(),
+            publication: manifest.publication.clone(),
+            policy_version: manifest.policy_version.clone(),
+        }
+    }
+
+    pub fn validate_references(&self) -> Result<(), AuthoringSpecError> {
+        if self.schema != AUTHORING_SPEC_SCHEMA_V2 {
+            return Err(AuthoringSpecError::UnsupportedSchema(self.schema.clone()));
+        }
+        let mut normalized_paths = BTreeSet::new();
+        for file in &self.files {
+            validate_relative_path(&file.path)?;
+            let normalized: String = file.path.nfc().collect();
+            if !normalized_paths.insert(normalized) {
+                return Err(AuthoringSpecError::DuplicatePath(file.path.clone()));
+            }
+        }
+        self.materialize_unchecked(
+            Uuid::nil(),
+            self.files
+                .iter()
+                .map(|file| ManifestFile {
+                    path: file.path.clone(),
+                    sha256: studio_core::Sha256Digest::from_bytes(&[]),
+                    size_bytes: 0,
+                    media_type: file.media_type.clone(),
+                    executable: file.executable,
+                })
+                .collect(),
+        )
+        .validate_references()?;
+        Ok(())
+    }
+
+    pub fn materialize(
+        &self,
+        commit_id: Uuid,
+        files: Vec<ManifestFile>,
+    ) -> Result<ReleaseManifestV2, AuthoringSpecError> {
+        self.validate_references()?;
+        validate_materialized_inventory_v2(&self.files, &files)?;
+        let manifest = self.materialize_unchecked(commit_id, files);
+        manifest.validate_references()?;
+        Ok(manifest)
+    }
+
+    fn materialize_unchecked(
+        &self,
+        commit_id: Uuid,
+        files: Vec<ManifestFile>,
+    ) -> ReleaseManifestV2 {
+        ReleaseManifestV2 {
+            schema: RELEASE_MANIFEST_SCHEMA_V2.into(),
+            project_id: self.project_id,
+            commit_id,
+            problem_type: self.problem_type,
+            package_profile: self.package_profile,
+            default_locale: self.default_locale.clone(),
+            title: self.title.clone(),
+            statements: self.statements.clone(),
+            tutorials: self.tutorials.clone(),
+            files,
+            toolchains: self.toolchains.clone(),
+            testing: self.testing.clone(),
+            execution: self.execution.clone(),
+            output_submissions: self.output_submissions.clone(),
+            sources: self.sources.clone(),
+            publication: self.publication.clone(),
+            policy_version: self.policy_version.clone(),
+        }
+    }
+}
+
 pub fn parse_authoring_spec(bytes: &[u8]) -> Result<AuthoringSpecV1, AuthoringSpecError> {
+    let text = checked_yaml_text(bytes)?;
+    let spec: AuthoringSpecV1 = serde_yaml_ng::from_str(text)?;
+    spec.validate_references()?;
+    Ok(spec)
+}
+
+pub fn parse_authoring_spec_v2(bytes: &[u8]) -> Result<AuthoringSpecV2, AuthoringSpecError> {
+    let text = checked_yaml_text(bytes)?;
+    let spec: AuthoringSpecV2 = serde_yaml_ng::from_str(text)?;
+    spec.validate_references()?;
+    Ok(spec)
+}
+
+pub fn parse_versioned_authoring_spec(
+    bytes: &[u8],
+) -> Result<VersionedAuthoringSpec, AuthoringSpecError> {
+    let text = checked_yaml_text(bytes)?;
+    let header: AuthoringSchemaHeader = serde_yaml_ng::from_str(text)?;
+    match header.schema.as_str() {
+        AUTHORING_SPEC_SCHEMA_V1 => {
+            let spec: AuthoringSpecV1 = serde_yaml_ng::from_str(text)?;
+            spec.validate_references()?;
+            Ok(VersionedAuthoringSpec::V1(spec))
+        }
+        AUTHORING_SPEC_SCHEMA_V2 => {
+            let spec: AuthoringSpecV2 = serde_yaml_ng::from_str(text)?;
+            spec.validate_references()?;
+            Ok(VersionedAuthoringSpec::V2(spec))
+        }
+        _ => Err(AuthoringSpecError::UnsupportedSchema(header.schema)),
+    }
+}
+
+#[derive(Deserialize)]
+struct AuthoringSchemaHeader {
+    schema: String,
+}
+
+fn checked_yaml_text(bytes: &[u8]) -> Result<&str, AuthoringSpecError> {
     if bytes.len() > MAX_AUTHORING_SPEC_BYTES {
         return Err(AuthoringSpecError::TooLarge {
             actual: bytes.len(),
@@ -170,10 +351,7 @@ pub fn parse_authoring_spec(bytes: &[u8]) -> Result<AuthoringSpecV1, AuthoringSp
     if documents.next().is_some() {
         return Err(AuthoringSpecError::MultipleDocuments);
     }
-
-    let spec: AuthoringSpecV1 = serde_yaml_ng::from_str(text)?;
-    spec.validate_references()?;
-    Ok(spec)
+    Ok(text)
 }
 
 pub fn to_authoring_yaml(spec: &AuthoringSpecV1) -> Result<Vec<u8>, AuthoringSpecError> {
@@ -185,8 +363,45 @@ pub fn to_authoring_yaml(spec: &AuthoringSpecV1) -> Result<Vec<u8>, AuthoringSpe
     Ok(yaml.into_bytes())
 }
 
+pub fn to_authoring_yaml_v2(spec: &AuthoringSpecV2) -> Result<Vec<u8>, AuthoringSpecError> {
+    spec.validate_references()?;
+    let mut yaml = serde_yaml_ng::to_string(spec)?;
+    if !yaml.ends_with('\n') {
+        yaml.push('\n');
+    }
+    Ok(yaml.into_bytes())
+}
+
 fn validate_materialized_inventory(
     authoring: &[AuthoringFileV1],
+    materialized: &[ManifestFile],
+) -> Result<(), AuthoringSpecError> {
+    let expected: BTreeMap<&str, (&str, bool)> = authoring
+        .iter()
+        .map(|file| {
+            (
+                file.path.as_str(),
+                (file.media_type.as_str(), file.executable),
+            )
+        })
+        .collect();
+    let actual: BTreeMap<&str, (&str, bool)> = materialized
+        .iter()
+        .map(|file| {
+            (
+                file.path.as_str(),
+                (file.media_type.as_str(), file.executable),
+            )
+        })
+        .collect();
+    if expected != actual || authoring.len() != materialized.len() {
+        return Err(AuthoringSpecError::InventoryMismatch);
+    }
+    Ok(())
+}
+
+fn validate_materialized_inventory_v2(
+    authoring: &[AuthoringFileV2],
     materialized: &[ManifestFile],
 ) -> Result<(), AuthoringSpecError> {
     let expected: BTreeMap<&str, (&str, bool)> = authoring
@@ -439,11 +654,84 @@ mod tests {
         }
     }
 
+    fn minimal_spec_v2() -> AuthoringSpecV2 {
+        AuthoringSpecV2 {
+            schema: AUTHORING_SPEC_SCHEMA_V2.into(),
+            project_id: Uuid::now_v7(),
+            problem_type: ProblemType::Standard,
+            package_profile: PackageProfile::ReporchNative,
+            default_locale: "ko".into(),
+            title: BTreeMap::from([("ko".into(), "합".into())]),
+            statements: BTreeMap::from([("ko".into(), "statements/ko.md".into())]),
+            tutorials: BTreeMap::new(),
+            files: vec![AuthoringFileV2 {
+                path: "statements/ko.md".into(),
+                media_type: "text/markdown".into(),
+                executable: false,
+            }],
+            toolchains: BTreeMap::new(),
+            testing: studio_core::TestingSpecV2 {
+                limits: ResourceLimits {
+                    time_ms: 1_000,
+                    memory_mib: 256,
+                    output_kib: 65_536,
+                },
+                groups: vec![],
+                tests: vec![],
+                generators: vec![],
+                validators: studio_core::ValidatorSetSpecV2::default(),
+                checker: studio_core::CheckerConfigSpecV2 {
+                    checker: CheckerSpec::Token,
+                    unit_tests: vec![],
+                    mutation: studio_core::CheckerMutationSpecV2::default(),
+                },
+                solutions: vec![],
+                stress_suites: vec![],
+                detect_duplicates: true,
+                verify_determinism: true,
+            },
+            execution: ExecutionSpecV2::default(),
+            output_submissions: vec![],
+            sources: vec![],
+            publication: None,
+            policy_version: "studio-policy-v2".into(),
+        }
+    }
+
     #[test]
     fn yaml_round_trip_preserves_the_authoring_contract() {
         let expected = minimal_spec();
         let bytes = to_authoring_yaml(&expected).unwrap();
         assert_eq!(parse_authoring_spec(&bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn v2_yaml_round_trip_and_materialization_preserve_the_complete_contract() {
+        let expected = minimal_spec_v2();
+        let bytes = to_authoring_yaml_v2(&expected).unwrap();
+        assert_eq!(parse_authoring_spec_v2(&bytes).unwrap(), expected);
+        assert!(matches!(
+            parse_versioned_authoring_spec(&bytes).unwrap(),
+            VersionedAuthoringSpec::V2(_)
+        ));
+        let files = vec![ManifestFile {
+            path: "statements/ko.md".into(),
+            sha256: studio_core::Sha256Digest::from_bytes(b"statement"),
+            size_bytes: 9,
+            media_type: "text/markdown".into(),
+            executable: false,
+        }];
+        let manifest = expected.materialize(Uuid::now_v7(), files).unwrap();
+        assert_eq!(manifest.schema, RELEASE_MANIFEST_SCHEMA_V2);
+    }
+
+    #[test]
+    fn versioned_parser_keeps_v1_compatibility() {
+        let bytes = to_authoring_yaml(&minimal_spec()).unwrap();
+        assert!(matches!(
+            parse_versioned_authoring_spec(&bytes).unwrap(),
+            VersionedAuthoringSpec::V1(_)
+        ));
     }
 
     #[test]
