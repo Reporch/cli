@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use reporch_format::{VersionedAuthoringSpec, parse_versioned_authoring_spec};
 use studio_core::{
-    GeneratedCaseRefV2, GeneratorMatrixStrategyV2, GeneratorRecipeSpecV2, ScoreAggregationV2,
-    TestCaseOriginV2, TestCaseRoleV2, TestCaseSpecV2, TestGroupSpecV2,
+    GeneratedCaseRefV2, GeneratorMatrixStrategyV2, GeneratorRecipeSpecV2, GeneratorSpecV2,
+    ProgramSpec, ProgramSpecV2, ScoreAggregationV2, TestCaseOriginV2, TestCaseRoleV2,
+    TestCaseSpecV2, TestGroupSpecV2,
 };
 use uuid::Uuid;
 
@@ -489,6 +490,281 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
     }
 }
 
+pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        GeneratorCommand::List => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            output.emit(
+                "generator list",
+                &spec.testing.generators,
+                &format!("{} generator(s)", spec.testing.generators.len()),
+            )
+        }
+        GeneratorCommand::Add(options) => {
+            let source = relative_string(&options.source)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .generators
+                            .iter()
+                            .any(|generator| generator.program.name == options.id),
+                        "generator already exists: {}",
+                        options.id
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&options.language),
+                        false,
+                    )?;
+                    spec.testing.generators.push(GeneratorSpecV2 {
+                        program: ProgramSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: normalize_name(&options.id)?,
+                            source_path: source.clone(),
+                            language: options.language.clone(),
+                            arguments: options.arguments.clone(),
+                        },
+                        recipes: Vec::new(),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "generator add",
+                &spec.testing.generators,
+                &format!("Added generator {}", options.id),
+            )
+        }
+        GeneratorCommand::Run(options) => {
+            let seed = options
+                .seed
+                .context("generator run requires --seed for deterministic replay")?;
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let group_ids = resolve_group_ids(&spec, &options.groups)?;
+            let generator = find_generator(&spec, &options.id)?.clone();
+            let path = relative_string(&options.output)?;
+            let name = normalize_name(options.name.as_deref().unwrap_or(&options.id))?;
+            ensure_unique_test_name(&spec, &name, None)?;
+            let run_options = options.runtime.into_run_options();
+            let program = legacy_program(&generator.program);
+            let bytes = materialize_generator(
+                &root,
+                &program,
+                &options.arguments,
+                Some(seed),
+                &run_options,
+            )
+            .await?;
+            write_project_bytes_atomic(&root, &path, &bytes)?;
+            let test_id = Uuid::now_v7();
+            let recipe_id = Uuid::now_v7();
+            let updated =
+                reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
+                    ensure_unique_test_name(spec, &name, None)?;
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &path,
+                        "text/plain",
+                        false,
+                    )?;
+                    let target = spec
+                        .testing
+                        .generators
+                        .iter_mut()
+                        .find(|candidate| candidate.program.id == generator.program.id)
+                        .context("generator was removed during materialization")?;
+                    target.recipes.push(GeneratorRecipeSpecV2 {
+                        id: recipe_id,
+                        name: format!("case-{name}"),
+                        argument_template: options.arguments.clone(),
+                        parameters: Default::default(),
+                        matrix: GeneratorMatrixStrategyV2::Cartesian,
+                        seed_start: seed,
+                        seed_step: 1,
+                        count: 1,
+                        group_ids: group_ids.clone(),
+                    });
+                    spec.testing.tests.push(TestCaseSpecV2 {
+                        id: test_id,
+                        name: name.clone(),
+                        role: inferred_role(&name),
+                        origin: TestCaseOriginV2::Generated,
+                        input_file: path.clone(),
+                        answer_file: None,
+                        group_ids: group_ids.clone(),
+                        points: None,
+                        generated: Some(GeneratedCaseRefV2 {
+                            generator_id: generator.program.id,
+                            recipe_id,
+                            ordinal: 0,
+                            seed,
+                        }),
+                    });
+                    Ok(())
+                })?;
+            let result = GeneratorMaterialization {
+                generator_id: generator.program.name,
+                test_ids: vec![test_id],
+                paths: vec![path],
+                sha256: vec![hex::encode(Sha256::digest(&bytes))],
+            };
+            output.emit(
+                "generator run",
+                &result,
+                &format!(
+                    "Generated {} ({test_id})",
+                    updated.testing.tests.last().unwrap().name
+                ),
+            )
+        }
+        GeneratorCommand::Recipe(options) => {
+            ensure!(
+                (1..=10_000).contains(&options.count),
+                "recipe count must be between 1 and 10000"
+            );
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let group_ids = resolve_group_ids(&spec, &options.groups)?;
+            let generator = find_generator(&spec, &options.id)?.clone();
+            let prefix = normalize_name(&options.name_prefix)?;
+            let directory = relative_string(&options.output_directory)?;
+            let run_options = options.runtime.into_run_options();
+            let program = legacy_program(&generator.program);
+            let recipe_id = Uuid::now_v7();
+            let mut materialized = Vec::with_capacity(options.count as usize);
+            for index in 0..options.count {
+                let seed = options
+                    .seed_start
+                    .checked_add(u64::from(index))
+                    .context("recipe seed range overflows u64")?;
+                let name = format!("{prefix}-{}", index + 1);
+                ensure_unique_test_name(&spec, &name, None)?;
+                let path = format!("{directory}/{}.in", index + 1);
+                let bytes = materialize_generator(
+                    &root,
+                    &program,
+                    &options.arguments,
+                    Some(seed),
+                    &run_options,
+                )
+                .await?;
+                materialized.push((Uuid::now_v7(), name, path, seed, bytes));
+            }
+            for (_, _, path, _, bytes) in &materialized {
+                write_project_bytes_atomic(&root, path, bytes)?;
+            }
+            reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
+                for (_, name, _, _, _) in &materialized {
+                    ensure_unique_test_name(spec, name, None)?;
+                }
+                let target = spec
+                    .testing
+                    .generators
+                    .iter_mut()
+                    .find(|candidate| candidate.program.id == generator.program.id)
+                    .context("generator was removed during materialization")?;
+                target.recipes.push(GeneratorRecipeSpecV2 {
+                    id: recipe_id,
+                    name: prefix.clone(),
+                    argument_template: options.arguments.clone(),
+                    parameters: Default::default(),
+                    matrix: GeneratorMatrixStrategyV2::Cartesian,
+                    seed_start: options.seed_start,
+                    seed_step: 1,
+                    count: options.count,
+                    group_ids: group_ids.clone(),
+                });
+                for (ordinal, (id, name, path, seed, _)) in materialized.iter().enumerate() {
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        path,
+                        "text/plain",
+                        false,
+                    )?;
+                    spec.testing.tests.push(TestCaseSpecV2 {
+                        id: *id,
+                        name: name.clone(),
+                        role: inferred_role(name),
+                        origin: TestCaseOriginV2::Generated,
+                        input_file: path.clone(),
+                        answer_file: None,
+                        group_ids: group_ids.clone(),
+                        points: None,
+                        generated: Some(GeneratedCaseRefV2 {
+                            generator_id: generator.program.id,
+                            recipe_id,
+                            ordinal: u32::try_from(ordinal)
+                                .context("recipe ordinal exceeds u32")?,
+                            seed: *seed,
+                        }),
+                    });
+                }
+                Ok(())
+            })?;
+            let result = GeneratorMaterialization {
+                generator_id: generator.program.name,
+                test_ids: materialized.iter().map(|entry| entry.0).collect(),
+                paths: materialized.iter().map(|entry| entry.2.clone()).collect(),
+                sha256: materialized
+                    .iter()
+                    .map(|entry| hex::encode(Sha256::digest(&entry.4)))
+                    .collect(),
+            };
+            output.emit(
+                "generator recipe",
+                &result,
+                &format!("Generated {} deterministic test case(s)", options.count),
+            )
+        }
+        GeneratorCommand::Remove { id } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let generator_id = find_generator(spec, &id)?.program.id;
+                    ensure!(
+                        !spec.testing.tests.iter().any(|test| test
+                            .generated
+                            .as_ref()
+                            .is_some_and(|generated| generated.generator_id == generator_id)),
+                        "generator is still used by a test case"
+                    );
+                    ensure!(
+                        !spec
+                            .testing
+                            .stress_suites
+                            .iter()
+                            .any(|suite| suite.generator_id == generator_id),
+                        "generator is still used by a stress suite"
+                    );
+                    let before = spec.testing.generators.len();
+                    spec.testing
+                        .generators
+                        .retain(|generator| generator.program.id != generator_id);
+                    ensure!(
+                        before != spec.testing.generators.len(),
+                        "generator was not found"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "generator remove",
+                &spec.testing.generators,
+                &format!("Removed generator {id}"),
+            )
+        }
+    }
+}
+
 fn inferred_role(name: &str) -> TestCaseRoleV2 {
     if name.to_ascii_lowercase().starts_with("sample") {
         TestCaseRoleV2::Sample
@@ -534,4 +810,25 @@ fn find_group<'a>(
         .iter()
         .find(|group| group.name == value || parsed == Some(group.id))
         .with_context(|| format!("unknown group: {value}"))
+}
+
+fn find_generator<'a>(
+    spec: &'a reporch_format::AuthoringSpecV2,
+    value: &str,
+) -> Result<&'a GeneratorSpecV2> {
+    let parsed = Uuid::parse_str(value).ok();
+    spec.testing
+        .generators
+        .iter()
+        .find(|generator| generator.program.name == value || parsed == Some(generator.program.id))
+        .with_context(|| format!("generator was not found: {value}"))
+}
+
+fn legacy_program(program: &ProgramSpecV2) -> ProgramSpec {
+    ProgramSpec {
+        id: program.name.clone(),
+        source_path: program.source_path.clone(),
+        language: program.language.clone(),
+        arguments: program.arguments.clone(),
+    }
 }

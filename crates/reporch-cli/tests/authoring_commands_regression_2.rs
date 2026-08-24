@@ -424,3 +424,70 @@ fn signed_rootless_execution_wires_generators_validators_checkers_interactors_an
     );
     assert!(graded.status.success(), "{graded:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn v2_generator_materialization_persists_a_replayable_recipe_and_seed() {
+    let runtime = tempfile::tempdir().unwrap();
+    fake_rootless_runtime(runtime.path());
+    let log = runtime.path().join("v2-generator.log");
+    let project = tempfile::tempdir().unwrap();
+    init(project.path(), None);
+    reporch_cli::local_project_v2::migrate_v1_authoring_file(project.path()).unwrap();
+
+    let added = run_json(
+        project.path(),
+        &[
+            "generator",
+            "add",
+            "--id",
+            "gen",
+            "--source",
+            "solutions/accepted.py",
+            "--language",
+            "python3",
+        ],
+    );
+    assert!(added.status.success(), "{added:?}");
+    let generated = fake_runtime_command(
+        runtime.path(),
+        project.path(),
+        &[
+            "generator",
+            "run",
+            "gen",
+            "--output",
+            "tests/v2-generated.in",
+            "--name",
+            "generated-v2",
+            "--seed",
+            "17",
+            "--runtime",
+            "podman",
+        ],
+        "17\n",
+        &log,
+    );
+    assert!(generated.status.success(), "{generated:?}");
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(project.path()).unwrap();
+    let generator = spec
+        .testing
+        .generators
+        .iter()
+        .find(|generator| generator.program.name == "gen")
+        .unwrap();
+    let test = spec
+        .testing
+        .tests
+        .iter()
+        .find(|test| test.name == "generated-v2")
+        .unwrap();
+    let generated = test.generated.as_ref().unwrap();
+    assert_eq!(generated.generator_id, generator.program.id);
+    assert_eq!(generated.seed, 17);
+    assert_eq!(generator.recipes[0].id, generated.recipe_id);
+    assert_eq!(
+        fs::read(project.path().join(&test.input_file)).unwrap(),
+        b"17\n"
+    );
+}

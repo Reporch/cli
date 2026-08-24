@@ -931,6 +931,9 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
 }
 
 pub async fn generator(options: GeneratorOptions, output: &CliOutput) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::generator(options, output).await;
+    }
     match options.command {
         GeneratorCommand::List => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
