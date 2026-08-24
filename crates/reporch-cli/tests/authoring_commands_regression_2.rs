@@ -901,11 +901,19 @@ fn grader_set_can_build_a_complete_profile_without_ambiguous_source_roles() {
     let project = tempfile::tempdir().unwrap();
     init(project.path(), Some("grader"));
     reporch_cli::local_project_v2::migrate_v1_authoring_file(project.path()).unwrap();
-    reporch_cli::local_project_v2::update_authoring_spec(project.path(), |_root, spec| {
-        spec.execution.harness.as_mut().unwrap().profiles.clear();
-        Ok(())
-    })
+    fs::create_dir_all(project.path().join("c")).unwrap();
+    fs::write(
+        project.path().join("c/grader.c"),
+        b"int grade(void){return 0;}\n",
+    )
     .unwrap();
+    fs::write(
+        project.path().join("c/solution.c"),
+        b"int solve(void){return 0;}\n",
+    )
+    .unwrap();
+    fs::write(project.path().join("c/compile.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(project.path().join("c/run.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
 
     let configured = run_json(
         project.path(),
@@ -913,29 +921,29 @@ fn grader_set_can_build_a_complete_profile_without_ambiguous_source_roles() {
             "grader",
             "set",
             "--source",
-            "cpp/grader.cpp",
+            "c/grader.c",
             "--language",
-            "cpp",
+            "c",
             "--submission-template",
-            "cpp/solution.cpp",
+            "c/solution.c",
             "--compile-script",
-            "cpp/compile.sh",
+            "c/compile.sh",
             "--run-script",
-            "cpp/run.sh",
+            "c/run.sh",
         ],
     );
     assert!(configured.status.success(), "{configured:?}");
 
     let spec = reporch_cli::local_project_v2::read_authoring_spec(project.path()).unwrap();
     let harness = spec.execution.harness.unwrap();
-    let profile = &harness.profiles["cpp"];
-    assert_eq!(profile.source_path, "cpp/grader.cpp");
+    let profile = &harness.profiles["c"];
+    assert_eq!(profile.source_path, "c/grader.c");
     assert_eq!(
         profile.submission_source_path.as_deref(),
-        Some("cpp/solution.cpp")
+        Some("c/solution.c")
     );
-    assert!(harness.private_files.contains(&"cpp/grader.cpp".into()));
-    assert!(profile.asset_paths.contains(&"cpp/solution.cpp".into()));
-    assert!(profile.asset_paths.contains(&"cpp/grader.cpp".into()));
+    assert!(harness.private_files.contains(&"c/grader.c".into()));
+    assert!(profile.asset_paths.contains(&"c/solution.c".into()));
+    assert!(profile.asset_paths.contains(&"c/grader.c".into()));
     assert!(run_json(project.path(), &["check"]).status.success());
 }
