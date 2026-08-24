@@ -1517,6 +1517,14 @@ async fn submit_project(options: SubmitOptions, output: &CliOutput) -> Result<()
         detail.status == studio_contracts::ValidationRunStatus::Passed,
         "Studio validation did not pass"
     );
+    // submit passes explicit IDs to the shared validation operation, so that
+    // operation cannot infer which local checkout should receive the durable
+    // resume pointer. Persist it here before the review request; a transient
+    // review failure must not make the successful official evidence disappear
+    // from local state.
+    let mut state = reporch_cli::local_project::read_local_state(&root)?;
+    state.last_validation_run_id = Some(detail.id);
+    reporch_cli::local_project::write_local_state(&root, &state)?;
     let review = studio_remote::submit_review_operation(&studio_remote::SubmitReviewOptions {
         connection: options.connection,
         project_id: Some(push.commit.project_id),

@@ -3276,11 +3276,11 @@ fn resolve_local_candidate(
     }
     let root = crate::local_project::discover_project(Path::new("."))
         .context("project and commit IDs were omitted and no local project was found")?;
-    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let spec = read_versioned_authoring_spec(&root)?;
     let state = crate::local_project::read_local_state(&root)?;
-    let resolved_project_id = project_id.unwrap_or(spec.project_id);
+    let resolved_project_id = project_id.unwrap_or(spec.project_id());
     ensure!(
-        resolved_project_id == spec.project_id,
+        resolved_project_id == spec.project_id(),
         "explicit project ID does not match reporch.yaml"
     );
     if let Some(remote) = &state.remote {
@@ -3301,16 +3301,16 @@ fn resolve_local_project_id(project_id: Option<Uuid>) -> Result<Uuid> {
     }
     let root = crate::local_project::discover_project(Path::new("."))
         .context("project ID was omitted and no local project was found")?;
-    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let spec = read_versioned_authoring_spec(&root)?;
     let state = crate::local_project::read_local_state(&root)?;
     let remote = state
         .remote
         .context("project is not linked; run reporch project link")?;
     ensure!(
-        remote.project_id == spec.project_id,
+        remote.project_id == spec.project_id(),
         "local link and reporch.yaml project IDs differ"
     );
-    Ok(spec.project_id)
+    Ok(spec.project_id())
 }
 
 pub fn current_project_id(project_id: Option<Uuid>) -> Result<Uuid> {

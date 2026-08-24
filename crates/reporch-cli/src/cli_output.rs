@@ -153,13 +153,11 @@ struct ClassifiedError {
 
 fn classify_error(error: &Error) -> ClassifiedError {
     if let Some(remote) = crate::studio_remote::remote_error_metadata(error) {
-        let exit_code = match remote.status.map(|status| status.as_u16()) {
-            Some(401) => ExitCode::AuthenticationRequired,
-            Some(403 | 429) => ExitCode::PermissionDenied,
-            Some(409 | 412 | 428) => ExitCode::Conflict,
-            Some(500..=599) | None if remote.retryable => ExitCode::InfrastructureFailure,
-            _ => ExitCode::InvalidInput,
-        };
+        let exit_code = classify_remote_error(
+            &remote.error_code,
+            remote.status.map(|status| status.as_u16()),
+            remote.retryable,
+        );
         return ClassifiedError {
             exit_code,
             error_code: remote.error_code,
@@ -246,6 +244,39 @@ fn classify_error(error: &Error) -> ClassifiedError {
     }
 }
 
+fn classify_remote_error(error_code: &str, status: Option<u16>, retryable: bool) -> ExitCode {
+    match error_code {
+        "auth.session_required" => return ExitCode::AuthenticationRequired,
+        "auth.forbidden"
+        | "auth.organization_forbidden"
+        | "authoring.action_restricted"
+        | "quota.monthly_cpu_exceeded"
+        | "quota.concurrent_validations_exceeded"
+        | "review.approval_required"
+        | "review.separation_required"
+        | "review_pool.assignment_required"
+        | "waiver.separation_required" => return ExitCode::PermissionDenied,
+        "release.not_ready" | "waiver.required" => return ExitCode::DomainFailure,
+        "collaboration.path_conflict"
+        | "concurrency.conflict"
+        | "concurrency.if_match_required"
+        | "idempotency.key_reused"
+        | "review_pool.already_claimed"
+        | "review_pool.candidate_stale"
+        | "trust_appeal.conflict"
+        | "webhook.event_conflict"
+        | "working_copy.revision_conflict" => return ExitCode::Conflict,
+        _ => {}
+    }
+    match status {
+        Some(401) => ExitCode::AuthenticationRequired,
+        Some(403 | 429) => ExitCode::PermissionDenied,
+        Some(409 | 412 | 428) => ExitCode::Conflict,
+        Some(500..=599) | None if retryable => ExitCode::InfrastructureFailure,
+        _ => ExitCode::InvalidInput,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +313,26 @@ mod tests {
         assert_eq!(classified.exit_code, ExitCode::Conflict);
         assert_eq!(classified.error_code, "working_copy.revision_conflict");
         assert_eq!(classified.trace_id.as_deref(), Some("server-trace-id"));
+    }
+
+    #[test]
+    fn policy_and_domain_errors_follow_the_stable_exit_contract() {
+        assert_eq!(
+            classify_remote_error("review.separation_required", Some(422), false),
+            ExitCode::PermissionDenied
+        );
+        assert_eq!(
+            classify_remote_error("quota.monthly_cpu_exceeded", Some(429), false),
+            ExitCode::PermissionDenied
+        );
+        assert_eq!(
+            classify_remote_error("release.not_ready", Some(422), false),
+            ExitCode::DomainFailure
+        );
+        assert_eq!(
+            classify_remote_error("review_pool.candidate_stale", Some(409), false),
+            ExitCode::Conflict
+        );
     }
 
     #[test]
