@@ -844,7 +844,30 @@ fn v2_interactive_grader_and_output_only_flows_match_expected_verdicts() {
     let grader = tempfile::tempdir().unwrap();
     init(grader.path(), Some("grader"));
     reporch_cli::local_project_v2::migrate_v1_authoring_file(grader.path()).unwrap();
+    let configured = run_json(
+        grader.path(),
+        &[
+            "grader",
+            "set",
+            "--source",
+            "cpp/grader.cpp",
+            "--language",
+            "cpp",
+        ],
+    );
+    assert!(configured.status.success(), "{configured:?}");
     let grader_spec = reporch_cli::local_project_v2::read_authoring_spec(grader.path()).unwrap();
+    let grader_profile = &grader_spec.execution.harness.as_ref().unwrap().profiles["cpp"];
+    assert_eq!(grader_profile.source_path, "cpp/grader.cpp");
+    assert_eq!(
+        grader_profile.submission_source_path.as_deref(),
+        Some("cpp/solution.cpp")
+    );
+    assert_eq!(
+        grader_profile.compile_script.as_deref(),
+        Some("cpp/compile.sh")
+    );
+    assert_eq!(grader_profile.run_script.as_deref(), Some("cpp/run.sh"));
     let grader_test = grader_spec.testing.tests[0].id.to_string();
     let graded = fake_runtime_command(
         runtime.path(),
@@ -871,4 +894,48 @@ fn v2_interactive_grader_and_output_only_flows_match_expected_verdicts() {
     assert!(tested.status.success(), "{tested:?}");
     let envelope: Value = serde_json::from_slice(&tested.stdout).unwrap();
     assert_eq!(envelope["data"]["passed"], true);
+}
+
+#[test]
+fn grader_set_can_build_a_complete_profile_without_ambiguous_source_roles() {
+    let project = tempfile::tempdir().unwrap();
+    init(project.path(), Some("grader"));
+    reporch_cli::local_project_v2::migrate_v1_authoring_file(project.path()).unwrap();
+    reporch_cli::local_project_v2::update_authoring_spec(project.path(), |_root, spec| {
+        spec.execution.harness.as_mut().unwrap().profiles.clear();
+        Ok(())
+    })
+    .unwrap();
+
+    let configured = run_json(
+        project.path(),
+        &[
+            "grader",
+            "set",
+            "--source",
+            "cpp/grader.cpp",
+            "--language",
+            "cpp",
+            "--submission-template",
+            "cpp/solution.cpp",
+            "--compile-script",
+            "cpp/compile.sh",
+            "--run-script",
+            "cpp/run.sh",
+        ],
+    );
+    assert!(configured.status.success(), "{configured:?}");
+
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(project.path()).unwrap();
+    let harness = spec.execution.harness.unwrap();
+    let profile = &harness.profiles["cpp"];
+    assert_eq!(profile.source_path, "cpp/grader.cpp");
+    assert_eq!(
+        profile.submission_source_path.as_deref(),
+        Some("cpp/solution.cpp")
+    );
+    assert!(harness.private_files.contains(&"cpp/grader.cpp".into()));
+    assert!(profile.asset_paths.contains(&"cpp/solution.cpp".into()));
+    assert!(profile.asset_paths.contains(&"cpp/grader.cpp".into()));
+    assert!(run_json(project.path(), &["check"]).status.success());
 }

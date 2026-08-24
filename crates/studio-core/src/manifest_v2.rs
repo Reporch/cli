@@ -323,7 +323,11 @@ pub enum HarnessKindV2 {
 #[serde(deny_unknown_fields)]
 pub struct HarnessProfileSpecV2 {
     pub language: String,
+    /// Judge-side grader/manager source linked with the contestant program.
     pub source_path: String,
+    /// Harmless contestant source template replaced by the submitted program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_source_path: Option<String>,
     #[serde(default)]
     pub asset_paths: Vec<String>,
     #[serde(default)]
@@ -686,6 +690,43 @@ impl ReleaseManifestV2 {
             }
         }
         if let Some(harness) = &self.execution.harness {
+            if harness.profiles.is_empty() || harness.profiles.len() > 20 {
+                return Err(ManifestError::InvalidConfiguration(
+                    "library/grader harness requires 1 to 20 language profiles".into(),
+                ));
+            }
+            let private_paths = harness
+                .private_files
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if private_paths.is_empty() {
+                return Err(ManifestError::InvalidConfiguration(
+                    "library/grader harness requires a private grader source".into(),
+                ));
+            }
+            let shared_public_paths = harness
+                .interface_files
+                .iter()
+                .chain(harness.public_files.iter())
+                .chain(harness.stub_templates.values())
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if private_paths.len() != harness.private_files.len()
+                || harness
+                    .interface_files
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != harness.interface_files.len()
+                || harness.public_files.iter().collect::<BTreeSet<_>>().len()
+                    != harness.public_files.len()
+                || !private_paths.is_disjoint(&shared_public_paths)
+            {
+                return Err(ManifestError::InvalidConfiguration(
+                    "harness visibility lists contain duplicates or private/public overlap".into(),
+                ));
+            }
             for path in harness
                 .interface_files
                 .iter()
@@ -695,8 +736,80 @@ impl ReleaseManifestV2 {
             {
                 require_file(&paths, path)?;
             }
-            for profile in harness.profiles.values() {
+            for (language, profile) in &harness.profiles {
+                if language.trim().is_empty()
+                    || language != &profile.language
+                    || profile.language.len() > 50
+                    || profile.asset_paths.is_empty()
+                    || profile.asset_paths.len() > 500
+                    || profile.asset_paths.iter().collect::<BTreeSet<_>>().len()
+                        != profile.asset_paths.len()
+                    || (profile.compile_script.is_none()
+                        && profile
+                            .compile_command
+                            .as_deref()
+                            .is_none_or(|command| command.trim().is_empty()))
+                    || (profile.run_script.is_none()
+                        && profile
+                            .run_command
+                            .as_deref()
+                            .is_none_or(|command| command.trim().is_empty()))
+                    || profile
+                        .compile_command
+                        .as_deref()
+                        .is_some_and(|command| command.trim().is_empty() || command.len() > 4_096)
+                    || profile
+                        .run_command
+                        .as_deref()
+                        .is_some_and(|command| command.trim().is_empty() || command.len() > 4_096)
+                {
+                    return Err(ManifestError::InvalidConfiguration(format!(
+                        "harness profile {language} is incomplete"
+                    )));
+                }
                 require_file(&paths, &profile.source_path)?;
+                if !private_paths.contains(profile.source_path.as_str()) {
+                    return Err(ManifestError::InvalidConfiguration(format!(
+                        "harness profile {} grader source is not private",
+                        profile.language
+                    )));
+                }
+                if let Some(path) = &profile.submission_source_path {
+                    require_file(&paths, path)?;
+                    if private_paths.contains(path.as_str()) {
+                        return Err(ManifestError::InvalidConfiguration(format!(
+                            "harness profile {} submission template is private",
+                            profile.language
+                        )));
+                    }
+                }
+                let profile_assets = profile
+                    .asset_paths
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
+                let required_assets = std::iter::once(profile.source_path.as_str())
+                    .chain(profile.submission_source_path.iter().map(String::as_str))
+                    .chain(profile.compile_script.iter().map(String::as_str))
+                    .chain(profile.run_script.iter().map(String::as_str))
+                    .chain(harness.interface_files.iter().map(String::as_str))
+                    .chain(harness.public_files.iter().map(String::as_str))
+                    .chain(
+                        harness
+                            .stub_templates
+                            .get(&profile.language)
+                            .into_iter()
+                            .map(String::as_str),
+                    );
+                if !required_assets
+                    .into_iter()
+                    .all(|path| profile_assets.contains(path))
+                {
+                    return Err(ManifestError::InvalidConfiguration(format!(
+                        "harness profile {} omits a required asset",
+                        profile.language
+                    )));
+                }
                 for path in profile
                     .asset_paths
                     .iter()
