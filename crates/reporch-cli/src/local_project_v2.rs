@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use reporch_format::{
     AuthoringFileV2, AuthoringSpecV2, parse_authoring_spec_v2, to_authoring_yaml_v2,
 };
@@ -14,6 +14,16 @@ use crate::local_project::{
 };
 
 pub const AUTHORING_V1_BACKUP_FILE_NAME: &str = "reporch.pre-v2.yaml";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MigrationOutcomeV2 {
+    pub schema: &'static str,
+    pub directory: PathBuf,
+    pub authoring_file: PathBuf,
+    pub backup_files: Vec<PathBuf>,
+    pub project_id: Uuid,
+    pub migrated: bool,
+}
 
 pub fn read_authoring_spec(directory: &Path) -> Result<AuthoringSpecV2> {
     let path = directory.join(AUTHORING_FILE_NAME);
@@ -148,6 +158,47 @@ pub fn migrate_v1_authoring_file(directory: &Path) -> Result<AuthoringSpecV2> {
     Ok(v2)
 }
 
+pub fn migrate_project(directory: &Path) -> Result<MigrationOutcomeV2> {
+    let root = ensure_real_directory(directory)?;
+    let authoring_path = root.join(AUTHORING_FILE_NAME);
+    let had_authoring = authoring_path.exists();
+    let was_v2 = if had_authoring {
+        let bytes = fs::read(&authoring_path)?;
+        parse_authoring_spec_v2(&bytes).is_ok()
+    } else {
+        false
+    };
+    let mut backup_files = Vec::new();
+    if !had_authoring {
+        let legacy = root.join(LEGACY_MANIFEST_FILE_NAME);
+        if !legacy.exists() {
+            bail!(
+                "neither {AUTHORING_FILE_NAME} nor {LEGACY_MANIFEST_FILE_NAME} exists in {}",
+                root.display()
+            );
+        }
+        let outcome = crate::local_project::migrate_legacy_project(&root)?;
+        if let Some(backup) = outcome.backup_file {
+            backup_files.push(backup);
+        }
+    }
+    let spec = migrate_v1_authoring_file(&root)?;
+    let v1_backup = root.join(AUTHORING_V1_BACKUP_FILE_NAME);
+    if v1_backup.exists() {
+        backup_files.push(v1_backup);
+    }
+    backup_files.sort();
+    backup_files.dedup();
+    Ok(MigrationOutcomeV2 {
+        schema: "reporch.migration-result.v2",
+        directory: root,
+        authoring_file: authoring_path,
+        backup_files,
+        project_id: spec.project_id,
+        migrated: !was_v2,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -232,5 +283,13 @@ mod tests {
         let manifest = compile_authoring_spec(temporary.path(), &v2, Uuid::now_v7()).unwrap();
         assert_eq!(manifest.files.len(), 1);
         assert_eq!(manifest.files[0].path, "statements/ko.md");
+    }
+
+    #[test]
+    fn project_migration_is_idempotent_after_reaching_v2() {
+        let temporary = tempfile::tempdir().unwrap();
+        write_minimal_v1(temporary.path());
+        assert!(migrate_project(temporary.path()).unwrap().migrated);
+        assert!(!migrate_project(temporary.path()).unwrap().migrated);
     }
 }

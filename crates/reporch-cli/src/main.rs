@@ -1253,7 +1253,7 @@ fn migrate(options: &MigrateOptions, yes: bool, output: &CliOutput) -> Result<()
         }
     }
 
-    let outcome = reporch_cli::local_project::migrate_legacy_project(&options.directory)?;
+    let outcome = reporch_cli::local_project_v2::migrate_project(&options.directory)?;
     let human = if outcome.migrated {
         format!("Migrated {}", outcome.directory.display())
     } else {
