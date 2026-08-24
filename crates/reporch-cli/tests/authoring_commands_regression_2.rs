@@ -212,6 +212,17 @@ fn v2_projects_can_edit_statements_tests_and_named_groups_without_internal_ids()
         .find(|test| test.name == "second")
         .unwrap();
     assert_eq!(second.group_ids, vec![easy.id]);
+    let checked = run_json(project.path(), &["check"]);
+    assert!(checked.status.success(), "{checked:?}");
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(
+        checked["data"]["authoring_schema"],
+        "reporch.authoring-spec.v2"
+    );
+    let status = run_json(project.path(), &["project", "status"]);
+    assert!(status.status.success(), "{status:?}");
+    let diff = run_json(project.path(), &["project", "diff"]);
+    assert!(diff.status.success(), "{diff:?}");
 }
 
 #[cfg(unix)]

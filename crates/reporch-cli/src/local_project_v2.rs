@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -5,12 +6,13 @@ use anyhow::{Context, Result, bail, ensure};
 use reporch_format::{
     AuthoringFileV2, AuthoringSpecV2, parse_authoring_spec_v2, to_authoring_yaml_v2,
 };
-use studio_core::{ManifestFile, ReleaseManifestV2};
+use studio_core::{ManifestFile, ReleaseManifestV1, ReleaseManifestV2};
 use uuid::Uuid;
 
 use crate::local_project::{
-    AUTHORING_FILE_NAME, LEGACY_MANIFEST_FILE_NAME, atomic_create_new, atomic_replace,
-    ensure_real_directory, hash_regular_project_file, reject_non_regular_destination,
+    AUTHORING_FILE_NAME, LEGACY_MANIFEST_FILE_NAME, ProjectDiffV1, ProjectStatusV1, RemoteLinkV1,
+    atomic_create_new, atomic_replace, ensure_real_directory, hash_regular_project_file,
+    reject_non_regular_destination,
 };
 
 pub const AUTHORING_V1_BACKUP_FILE_NAME: &str = "reporch.pre-v2.yaml";
@@ -23,6 +25,17 @@ pub struct MigrationOutcomeV2 {
     pub backup_files: Vec<PathBuf>,
     pub project_id: Uuid,
     pub migrated: bool,
+}
+
+enum GeneratedManifest {
+    V1(ReleaseManifestV1),
+    V2(ReleaseManifestV2),
+}
+
+pub fn is_v2_project(directory: &Path) -> Result<bool> {
+    let root = crate::local_project::discover_project(directory)?;
+    let bytes = fs::read(root.join(AUTHORING_FILE_NAME))?;
+    Ok(parse_authoring_spec_v2(&bytes).is_ok())
 }
 
 pub fn read_authoring_spec(directory: &Path) -> Result<AuthoringSpecV2> {
@@ -111,6 +124,170 @@ pub fn compile_authoring_spec(
         .collect::<Result<Vec<_>>>()?;
     spec.materialize(commit_id, files)
         .context("materialize immutable v2 release manifest")
+}
+
+pub fn project_status(directory: &Path) -> Result<ProjectStatusV1> {
+    let root = crate::local_project::discover_project(directory)?;
+    let spec = read_authoring_spec(&root)?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let generated = read_generated_manifest(&root)?;
+    let generated_project_id = generated.as_ref().map(|manifest| match manifest {
+        GeneratedManifest::V1(manifest) => manifest.project_id,
+        GeneratedManifest::V2(manifest) => manifest.project_id,
+    });
+    let generated_commit_id = generated.as_ref().map(|manifest| match manifest {
+        GeneratedManifest::V1(manifest) => manifest.commit_id,
+        GeneratedManifest::V2(manifest) => manifest.commit_id,
+    });
+    let commit_id = state.last_commit_id.or_else(|| {
+        (generated_project_id == Some(spec.project_id))
+            .then_some(generated_commit_id)
+            .flatten()
+    });
+    let manifest = compile_authoring_spec(&root, &spec, commit_id.unwrap_or_else(Uuid::nil))?;
+    let working_digest = manifest.digest()?.to_string();
+    let baseline_working_digest = match state.baseline_working_digest {
+        Some(digest) => Some(digest),
+        None => generated
+            .as_ref()
+            .filter(|_| generated_project_id == Some(spec.project_id))
+            .map(|manifest| match manifest {
+                GeneratedManifest::V1(manifest) => manifest.digest().map(|value| value.to_string()),
+                GeneratedManifest::V2(manifest) => manifest.digest().map(|value| value.to_string()),
+            })
+            .transpose()?,
+    };
+    Ok(ProjectStatusV1 {
+        schema: "reporch.project-status.v1",
+        root,
+        project_id: spec.project_id,
+        linked: state.remote.is_some(),
+        dirty: baseline_working_digest.as_deref() != Some(&working_digest),
+        working_digest,
+        baseline_working_digest,
+        remote: state.remote,
+        last_commit_id: state.last_commit_id,
+        last_validation_run_id: state.last_validation_run_id,
+        last_release_id: state.last_release_id,
+    })
+}
+
+pub fn project_diff(directory: &Path) -> Result<ProjectDiffV1> {
+    let root = crate::local_project::discover_project(directory)?;
+    let spec = read_authoring_spec(&root)?;
+    let baseline = read_generated_manifest(&root)?;
+    let commit_id = baseline
+        .as_ref()
+        .map_or_else(Uuid::nil, |manifest| match manifest {
+            GeneratedManifest::V1(manifest) => manifest.commit_id,
+            GeneratedManifest::V2(manifest) => manifest.commit_id,
+        });
+    let current = compile_authoring_spec(&root, &spec, commit_id)?;
+    let baseline_files = baseline
+        .as_ref()
+        .map(|manifest| match manifest {
+            GeneratedManifest::V1(manifest) => manifest_files(&manifest.files),
+            GeneratedManifest::V2(manifest) => manifest_files(&manifest.files),
+        })
+        .unwrap_or_default();
+    let current_files = manifest_files(&current.files);
+    let baseline_paths: BTreeSet<&str> = baseline_files.keys().copied().collect();
+    let current_paths: BTreeSet<&str> = current_files.keys().copied().collect();
+    let added = current_paths
+        .difference(&baseline_paths)
+        .map(|path| (*path).to_owned())
+        .collect();
+    let removed = baseline_paths
+        .difference(&current_paths)
+        .map(|path| (*path).to_owned())
+        .collect();
+    let modified = baseline_paths
+        .intersection(&current_paths)
+        .filter(|path| baseline_files.get(**path) != current_files.get(**path))
+        .map(|path| (*path).to_owned())
+        .collect();
+    let metadata_changed = baseline.as_ref().is_none_or(|baseline| match baseline {
+        GeneratedManifest::V1(_) => true,
+        GeneratedManifest::V2(baseline) => {
+            let mut baseline = baseline.clone();
+            let mut current = current.clone();
+            baseline.files.clear();
+            current.files.clear();
+            baseline != current
+        }
+    });
+    Ok(ProjectDiffV1 {
+        schema: "reporch.project-diff.v1",
+        root,
+        metadata_changed,
+        added,
+        modified,
+        removed,
+    })
+}
+
+pub fn link_project(directory: &Path, api_url: &str, project_id: Uuid) -> Result<ProjectStatusV1> {
+    let root = crate::local_project::discover_project(directory)?;
+    let mut spec = read_authoring_spec(&root)?;
+    if spec.project_id != project_id {
+        spec.project_id = project_id;
+        write_authoring_spec_atomic(&root, &spec)?;
+    }
+    let mut state = crate::local_project::read_local_state(&root)?;
+    state.remote = Some(RemoteLinkV1 {
+        api_url: api_url.trim_end_matches('/').to_owned(),
+        project_id,
+    });
+    state.baseline_working_digest = None;
+    state.base_revision = None;
+    state.last_commit_id = None;
+    state.last_validation_run_id = None;
+    state.last_release_id = None;
+    crate::local_project::write_local_state(&root, &state)?;
+    project_status(&root)
+}
+
+fn manifest_files(files: &[ManifestFile]) -> BTreeMap<&str, (&str, u64, &str, bool)> {
+    files
+        .iter()
+        .map(|file| {
+            (
+                file.path.as_str(),
+                (
+                    file.sha256.as_str(),
+                    file.size_bytes,
+                    file.media_type.as_str(),
+                    file.executable,
+                ),
+            )
+        })
+        .collect()
+}
+
+fn read_generated_manifest(directory: &Path) -> Result<Option<GeneratedManifest>> {
+    let path = directory.join(LEGACY_MANIFEST_FILE_NAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    ensure!(
+        bytes.len() <= 16 * 1024 * 1024,
+        "generated manifest is larger than 16 MiB"
+    );
+    let schema = serde_json::from_slice::<serde_json::Value>(&bytes)?
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .context("generated manifest has no schema")?
+        .to_owned();
+    match schema.as_str() {
+        studio_core::RELEASE_MANIFEST_SCHEMA_V1 => {
+            Ok(Some(GeneratedManifest::V1(serde_json::from_slice(&bytes)?)))
+        }
+        studio_core::RELEASE_MANIFEST_SCHEMA_V2 => {
+            Ok(Some(GeneratedManifest::V2(serde_json::from_slice(&bytes)?)))
+        }
+        _ => anyhow::bail!("unsupported generated manifest schema: {schema}"),
+    }
 }
 
 pub fn write_generated_manifest_atomic(

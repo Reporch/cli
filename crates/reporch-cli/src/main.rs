@@ -654,7 +654,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     project_id,
                     problem_type.into(),
                 )?;
-                let status = reporch_cli::local_project::project_status(&directory)?;
+                let status = local_project_status(&directory)?;
                 output.emit(
                     "project init",
                     &status,
@@ -673,11 +673,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                         .any(|project| project.id == project_id),
                     "Studio project {project_id} was not found or is not accessible"
                 );
-                let status = reporch_cli::local_project::link_project(
-                    Path::new("."),
-                    &connection.api_url,
-                    project_id,
-                )?;
+                let status = link_local_project(Path::new("."), &connection.api_url, project_id)?;
                 output.emit(
                     "project link",
                     &status,
@@ -730,7 +726,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 )
             }
             ProjectCommand::Status => {
-                let status = reporch_cli::local_project::project_status(Path::new("."))?;
+                let status = local_project_status(Path::new("."))?;
                 let human = format!(
                     "{} · {} · {}",
                     status.project_id,
@@ -744,7 +740,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 output.emit("project status", &status, &human)
             }
             ProjectCommand::Diff => {
-                let diff = reporch_cli::local_project::project_diff(Path::new("."))?;
+                let diff = local_project_diff(Path::new("."))?;
                 let human = format!(
                     "{} added, {} modified, {} removed{}",
                     diff.added.len(),
@@ -857,7 +853,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             let capabilities = studio_remote::capabilities_operation(&connection).await?;
             let quota = studio_remote::quota_operation(&connection).await?;
             let local = match reporch_cli::local_project::discover_project(Path::new(".")) {
-                Ok(root) => Some(reporch_cli::local_project::project_status(&root)?),
+                Ok(root) => Some(local_project_status(&root)?),
                 Err(_) => None,
             };
             let data = serde_json::json!({
@@ -1268,6 +1264,27 @@ fn migrate(options: &MigrateOptions, yes: bool, output: &CliOutput) -> Result<()
 
 fn check_project(output: &CliOutput) -> Result<()> {
     let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    if reporch_cli::local_project_v2::is_v2_project(&root)? {
+        let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+        let manifest =
+            reporch_cli::local_project_v2::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+        let digest = manifest.digest()?;
+        let data = serde_json::json!({
+            "schema": "reporch.check-result.v1",
+            "authoring_schema": spec.schema,
+            "release_schema": manifest.schema,
+            "project_id": spec.project_id,
+            "problem_type": spec.problem_type,
+            "file_count": manifest.files.len(),
+            "digest": digest,
+            "valid": true,
+        });
+        return output.emit(
+            "check",
+            &data,
+            &format!("Valid · {} file(s) · {digest}", manifest.files.len()),
+        );
+    }
     let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
     let manifest = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
     let digest = manifest.digest()?;
@@ -1284,6 +1301,34 @@ fn check_project(output: &CliOutput) -> Result<()> {
         &data,
         &format!("Valid · {} file(s) · {digest}", manifest.files.len()),
     )
+}
+
+fn local_project_status(directory: &Path) -> Result<reporch_cli::local_project::ProjectStatusV1> {
+    if reporch_cli::local_project_v2::is_v2_project(directory)? {
+        reporch_cli::local_project_v2::project_status(directory)
+    } else {
+        reporch_cli::local_project::project_status(directory)
+    }
+}
+
+fn local_project_diff(directory: &Path) -> Result<reporch_cli::local_project::ProjectDiffV1> {
+    if reporch_cli::local_project_v2::is_v2_project(directory)? {
+        reporch_cli::local_project_v2::project_diff(directory)
+    } else {
+        reporch_cli::local_project::project_diff(directory)
+    }
+}
+
+fn link_local_project(
+    directory: &Path,
+    api_url: &str,
+    project_id: Uuid,
+) -> Result<reporch_cli::local_project::ProjectStatusV1> {
+    if reporch_cli::local_project_v2::is_v2_project(directory)? {
+        reporch_cli::local_project_v2::link_project(directory, api_url, project_id)
+    } else {
+        reporch_cli::local_project::link_project(directory, api_url, project_id)
+    }
 }
 
 fn generate_completion(shell: CompletionShell, output: &CliOutput) -> Result<()> {
