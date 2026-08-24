@@ -28,8 +28,8 @@ pub struct MigrationOutcomeV2 {
 }
 
 enum GeneratedManifest {
-    V1(ReleaseManifestV1),
-    V2(ReleaseManifestV2),
+    V1(Box<ReleaseManifestV1>),
+    V2(Box<ReleaseManifestV2>),
 }
 
 pub fn is_v2_project(directory: &Path) -> Result<bool> {
@@ -209,7 +209,7 @@ pub fn project_diff(directory: &Path) -> Result<ProjectDiffV1> {
     let metadata_changed = baseline.as_ref().is_none_or(|baseline| match baseline {
         GeneratedManifest::V1(_) => true,
         GeneratedManifest::V2(baseline) => {
-            let mut baseline = baseline.clone();
+            let mut baseline = (**baseline).clone();
             let mut current = current.clone();
             baseline.files.clear();
             current.files.clear();
@@ -280,12 +280,12 @@ fn read_generated_manifest(directory: &Path) -> Result<Option<GeneratedManifest>
         .context("generated manifest has no schema")?
         .to_owned();
     match schema.as_str() {
-        studio_core::RELEASE_MANIFEST_SCHEMA_V1 => {
-            Ok(Some(GeneratedManifest::V1(serde_json::from_slice(&bytes)?)))
-        }
-        studio_core::RELEASE_MANIFEST_SCHEMA_V2 => {
-            Ok(Some(GeneratedManifest::V2(serde_json::from_slice(&bytes)?)))
-        }
+        studio_core::RELEASE_MANIFEST_SCHEMA_V1 => Ok(Some(GeneratedManifest::V1(Box::new(
+            serde_json::from_slice(&bytes)?,
+        )))),
+        studio_core::RELEASE_MANIFEST_SCHEMA_V2 => Ok(Some(GeneratedManifest::V2(Box::new(
+            serde_json::from_slice(&bytes)?,
+        )))),
         _ => anyhow::bail!("unsupported generated manifest schema: {schema}"),
     }
 }

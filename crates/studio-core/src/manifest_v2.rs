@@ -404,8 +404,8 @@ pub struct ReleaseManifestV2 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum VersionedReleaseManifest {
-    V1(crate::ReleaseManifestV1),
-    V2(ReleaseManifestV2),
+    V1(Box<crate::ReleaseManifestV1>),
+    V2(Box<ReleaseManifestV2>),
 }
 
 impl VersionedReleaseManifest {
@@ -521,13 +521,13 @@ impl VersionedReleaseManifest {
 
 impl From<crate::ReleaseManifestV1> for VersionedReleaseManifest {
     fn from(value: crate::ReleaseManifestV1) -> Self {
-        Self::V1(value)
+        Self::V1(Box::new(value))
     }
 }
 
 impl From<ReleaseManifestV2> for VersionedReleaseManifest {
     fn from(value: ReleaseManifestV2) -> Self {
-        Self::V2(value)
+        Self::V2(Box::new(value))
     }
 }
 

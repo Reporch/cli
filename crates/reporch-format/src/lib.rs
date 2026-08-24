@@ -98,18 +98,18 @@ pub struct AuthoringSpecV2 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum VersionedAuthoringSpec {
-    V1(AuthoringSpecV1),
-    V2(AuthoringSpecV2),
+    V1(Box<AuthoringSpecV1>),
+    V2(Box<AuthoringSpecV2>),
 }
 
 impl VersionedAuthoringSpec {
     pub fn from_manifest(manifest: &VersionedReleaseManifest) -> Self {
         match manifest {
             VersionedReleaseManifest::V1(manifest) => {
-                Self::V1(AuthoringSpecV1::from_manifest(manifest))
+                Self::V1(Box::new(AuthoringSpecV1::from_manifest(manifest)))
             }
             VersionedReleaseManifest::V2(manifest) => {
-                Self::V2(AuthoringSpecV2::from_manifest(manifest))
+                Self::V2(Box::new(AuthoringSpecV2::from_manifest(manifest)))
             }
         }
     }
@@ -757,12 +757,12 @@ pub fn parse_versioned_authoring_spec(
         AUTHORING_SPEC_SCHEMA_V1 => {
             let spec: AuthoringSpecV1 = serde_yaml_ng::from_str(text)?;
             spec.validate_references()?;
-            Ok(VersionedAuthoringSpec::V1(spec))
+            Ok(VersionedAuthoringSpec::V1(Box::new(spec)))
         }
         AUTHORING_SPEC_SCHEMA_V2 => {
             let spec: AuthoringSpecV2 = serde_yaml_ng::from_str(text)?;
             spec.validate_references()?;
-            Ok(VersionedAuthoringSpec::V2(spec))
+            Ok(VersionedAuthoringSpec::V2(Box::new(spec)))
         }
         _ => Err(AuthoringSpecError::UnsupportedSchema(header.schema)),
     }

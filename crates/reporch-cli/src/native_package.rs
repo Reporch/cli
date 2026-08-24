@@ -227,7 +227,7 @@ pub fn export_native_versioned(
 #[cfg(test)]
 pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1> {
     match import_native_versioned(input, directory)? {
-        VersionedReleaseManifest::V1(manifest) => Ok(manifest),
+        VersionedReleaseManifest::V1(manifest) => Ok(*manifest),
         VersionedReleaseManifest::V2(_) => bail!("native package contains a V2 manifest"),
     }
 }
