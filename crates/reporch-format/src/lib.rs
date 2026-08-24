@@ -13,7 +13,7 @@ use studio_core::{
     RELEASE_MANIFEST_SCHEMA_V1, RELEASE_MANIFEST_SCHEMA_V2, ReleaseManifestV1, ReleaseManifestV2,
     ScoreAggregationV2, SolutionRoleV2, SolutionSpec, SolutionSpecV2, SourceAttribution,
     TestCaseOriginV2, TestCaseRoleV2, TestCaseSpecV2, TestGroupSpecV2, TestingSpecV2,
-    ValidatorSetSpecV2, ValidatorUnitSpecV2, validate_relative_path,
+    ValidatorSetSpecV2, ValidatorUnitSpecV2, VersionedReleaseManifest, validate_relative_path,
 };
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
@@ -95,10 +95,52 @@ pub struct AuthoringSpecV2 {
     pub policy_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
 pub enum VersionedAuthoringSpec {
     V1(AuthoringSpecV1),
     V2(AuthoringSpecV2),
+}
+
+impl VersionedAuthoringSpec {
+    pub fn schema(&self) -> &str {
+        match self {
+            Self::V1(spec) => &spec.schema,
+            Self::V2(spec) => &spec.schema,
+        }
+    }
+
+    pub fn project_id(&self) -> Uuid {
+        match self {
+            Self::V1(spec) => spec.project_id,
+            Self::V2(spec) => spec.project_id,
+        }
+    }
+
+    pub fn problem_type(&self) -> ProblemType {
+        match self {
+            Self::V1(spec) => spec.problem_type,
+            Self::V2(spec) => spec.problem_type,
+        }
+    }
+
+    pub fn validate_references(&self) -> Result<(), AuthoringSpecError> {
+        match self {
+            Self::V1(spec) => spec.validate_references(),
+            Self::V2(spec) => spec.validate_references(),
+        }
+    }
+
+    pub fn materialize(
+        &self,
+        commit_id: Uuid,
+        files: Vec<ManifestFile>,
+    ) -> Result<VersionedReleaseManifest, AuthoringSpecError> {
+        match self {
+            Self::V1(spec) => spec.materialize(commit_id, files).map(Into::into),
+            Self::V2(spec) => spec.materialize(commit_id, files).map(Into::into),
+        }
+    }
 }
 
 impl AuthoringSpecV1 {

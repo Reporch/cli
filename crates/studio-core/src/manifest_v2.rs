@@ -395,6 +395,142 @@ pub struct ReleaseManifestV2 {
     pub policy_version: String,
 }
 
+/// Lossless wire/storage representation for immutable manifests.
+///
+/// The enum is intentionally untagged because each manifest already carries a
+/// stable `schema` discriminator. This keeps the serialized JSON byte-for-byte
+/// compatible with existing V1 consumers while allowing new clients to submit
+/// V2 without projecting away generators, stress suites, or harness metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum VersionedReleaseManifest {
+    V1(crate::ReleaseManifestV1),
+    V2(ReleaseManifestV2),
+}
+
+impl VersionedReleaseManifest {
+    pub fn schema(&self) -> &str {
+        match self {
+            Self::V1(manifest) => &manifest.schema,
+            Self::V2(manifest) => &manifest.schema,
+        }
+    }
+
+    pub fn project_id(&self) -> Uuid {
+        match self {
+            Self::V1(manifest) => manifest.project_id,
+            Self::V2(manifest) => manifest.project_id,
+        }
+    }
+
+    pub fn commit_id(&self) -> Uuid {
+        match self {
+            Self::V1(manifest) => manifest.commit_id,
+            Self::V2(manifest) => manifest.commit_id,
+        }
+    }
+
+    pub fn set_commit_id(&mut self, commit_id: Uuid) {
+        match self {
+            Self::V1(manifest) => manifest.commit_id = commit_id,
+            Self::V2(manifest) => manifest.commit_id = commit_id,
+        }
+    }
+
+    pub fn problem_type(&self) -> ProblemType {
+        match self {
+            Self::V1(manifest) => manifest.problem_type,
+            Self::V2(manifest) => manifest.problem_type,
+        }
+    }
+
+    pub fn package_profile(&self) -> PackageProfile {
+        match self {
+            Self::V1(manifest) => manifest.package_profile,
+            Self::V2(manifest) => manifest.package_profile,
+        }
+    }
+
+    pub fn default_locale(&self) -> &str {
+        match self {
+            Self::V1(manifest) => &manifest.default_locale,
+            Self::V2(manifest) => &manifest.default_locale,
+        }
+    }
+
+    pub fn title(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::V1(manifest) => &manifest.title,
+            Self::V2(manifest) => &manifest.title,
+        }
+    }
+
+    pub fn statements(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::V1(manifest) => &manifest.statements,
+            Self::V2(manifest) => &manifest.statements,
+        }
+    }
+
+    pub fn files(&self) -> &[ManifestFile] {
+        match self {
+            Self::V1(manifest) => &manifest.files,
+            Self::V2(manifest) => &manifest.files,
+        }
+    }
+
+    pub fn toolchains(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::V1(manifest) => &manifest.toolchains,
+            Self::V2(manifest) => &manifest.toolchains,
+        }
+    }
+
+    pub fn policy_version(&self) -> &str {
+        match self {
+            Self::V1(manifest) => &manifest.policy_version,
+            Self::V2(manifest) => &manifest.policy_version,
+        }
+    }
+
+    pub fn publication(&self) -> Option<&PublicationSpecV1> {
+        match self {
+            Self::V1(manifest) => manifest.publication.as_ref(),
+            Self::V2(manifest) => manifest.publication.as_ref(),
+        }
+    }
+
+    pub fn validate_references(&self) -> Result<(), ManifestError> {
+        match self {
+            Self::V1(manifest) => manifest.validate_references(),
+            Self::V2(manifest) => manifest.validate_references(),
+        }
+    }
+
+    pub fn canonical_json(&self) -> Result<Vec<u8>, ManifestError> {
+        match self {
+            Self::V1(manifest) => manifest.canonical_json(),
+            Self::V2(manifest) => manifest.canonical_json(),
+        }
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, ManifestError> {
+        Ok(Sha256Digest::from_bytes(&self.canonical_json()?))
+    }
+}
+
+impl From<crate::ReleaseManifestV1> for VersionedReleaseManifest {
+    fn from(value: crate::ReleaseManifestV1) -> Self {
+        Self::V1(value)
+    }
+}
+
+impl From<ReleaseManifestV2> for VersionedReleaseManifest {
+    fn from(value: ReleaseManifestV2) -> Self {
+        Self::V2(value)
+    }
+}
+
 impl ReleaseManifestV2 {
     pub fn canonical_json(&self) -> Result<Vec<u8>, ManifestError> {
         if self.schema != RELEASE_MANIFEST_SCHEMA_V2 {
