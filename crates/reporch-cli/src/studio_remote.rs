@@ -46,9 +46,13 @@ use zeroize::Zeroizing;
 use crate::{NativeAuthOptions, device_auth_config};
 
 const DEFAULT_API_URL: &str = "https://studio.reporch.com";
+const DEFAULT_OIDC_ISSUER: &str = "https://reporch.com/oauth";
 const MAX_JSON_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MULTIPART_BLOCKS: u32 = 50_000;
+const MAX_FILE_TRANSFER_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_PACKAGE_TRANSFER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WAIT_SECONDS: u64 = 30 * 60;
 const MAX_TRANSIENT_POLL_RETRIES: u32 = 8;
 const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
@@ -598,6 +602,7 @@ impl StudioApiClient {
             options.auth.allow_insecure_http,
             options.dev_subject.as_deref(),
         )?;
+        validate_connection_binding(&api_base, &options.auth, dev_subject.as_deref())?;
         let access_token =
             if dev_subject.is_some() {
                 Zeroizing::new(String::new())
@@ -1233,11 +1238,23 @@ impl StudioApiClient {
             part_size > 0 && part_size <= MAX_BLOCK_BYTES,
             "invalid block part size"
         );
-        ensure!(part_count > 0, "invalid block part count");
+        let metadata = tokio::fs::symlink_metadata(source)
+            .await
+            .with_context(|| format!("inspect {}", source.display()))?;
+        ensure!(
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() == upload.upload.size_bytes,
+            "upload source changed or is not a regular file"
+        );
+        validate_multipart_contract(metadata.len(), part_size, part_count)?;
         let mut file = tokio::fs::File::open(source)
             .await
             .with_context(|| format!("open {}", source.display()))?;
-        let mut block_ids = Vec::with_capacity(part_count as usize);
+        let mut block_ids = Vec::new();
+        block_ids
+            .try_reserve_exact(part_count as usize)
+            .context("reserve multipart block identifiers")?;
         for index in 0..part_count {
             let mut block = vec![0_u8; part_size as usize];
             let mut used = 0_usize;
@@ -1297,7 +1314,12 @@ impl StudioApiClient {
         expected_size: u64,
         expected_digest: &Sha256Digest,
         output: &Path,
+        maximum_size: u64,
     ) -> Result<()> {
+        ensure!(
+            expected_size <= maximum_size,
+            "object exceeds the permitted download size"
+        );
         ensure!(
             !output.exists(),
             "refusing to overwrite {}",
@@ -1985,6 +2007,20 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         "commit manifest digest mismatch"
     );
     commit.manifest.validate_references()?;
+    let mut project_bytes = 0_u64;
+    for file in commit.manifest.files() {
+        ensure!(
+            file.size_bytes <= MAX_FILE_TRANSFER_BYTES,
+            "commit file exceeds the 1 GiB transfer limit"
+        );
+        project_bytes = project_bytes
+            .checked_add(file.size_bytes)
+            .context("commit transfer size overflow")?;
+        ensure!(
+            project_bytes <= MAX_PACKAGE_TRANSFER_BYTES,
+            "commit files exceed the 5 GiB transfer limit"
+        );
+    }
 
     let staging = tempfile::Builder::new()
         .prefix(".reporch-pull-")
@@ -2004,6 +2040,7 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
                 file.size_bytes,
                 &file.sha256,
                 &output,
+                MAX_FILE_TRANSFER_BYTES,
             )
             .await?;
     }
@@ -2665,6 +2702,7 @@ async fn download_release_to(
             download.package_size_bytes,
             &download.package_digest,
             output,
+            MAX_PACKAGE_TRANSFER_BYTES,
         )
         .await?;
     Ok(PackageOperationResult {
@@ -3538,6 +3576,64 @@ fn validate_dev_subject(
     Ok(subject)
 }
 
+fn validate_connection_binding(
+    api_base: &Url,
+    auth: &NativeAuthOptions,
+    dev_subject: Option<&str>,
+) -> Result<()> {
+    if dev_subject.is_some() {
+        return Ok(());
+    }
+    let issuer = Url::parse(auth.issuer.trim()).context("invalid native OAuth issuer URL")?;
+    ensure!(
+        issuer.username().is_empty()
+            && issuer.password().is_none()
+            && issuer.query().is_none()
+            && issuer.fragment().is_none(),
+        "native OAuth issuer contains forbidden URL components"
+    );
+    let official_issuer = issuer.as_str().trim_end_matches('/') == DEFAULT_OIDC_ISSUER;
+    if official_issuer {
+        let official_api = Url::parse(DEFAULT_API_URL).expect("valid official Studio API URL");
+        ensure!(
+            same_origin(api_base, &official_api),
+            "the official Reporch OAuth credential can only be sent to {DEFAULT_API_URL}"
+        );
+    } else {
+        ensure!(
+            same_origin(api_base, &issuer),
+            "a custom OAuth issuer and Studio API must use the same origin"
+        );
+    }
+    Ok(())
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn validate_multipart_contract(size: u64, part_size: u64, part_count: u32) -> Result<()> {
+    ensure!(
+        part_size > 0
+            && part_size <= MAX_BLOCK_BYTES
+            && part_count > 0
+            && part_count <= MAX_MULTIPART_BLOCKS,
+        "invalid multipart upload shape"
+    );
+    let expected_count = size
+        .checked_add(part_size - 1)
+        .context("block count calculation overflow")?
+        / part_size;
+    ensure!(
+        expected_count == u64::from(part_count),
+        "block part count does not match the source size"
+    );
+    Ok(())
+}
+
 fn validate_signed_object_url(value: &str, allow_insecure_loopback: bool) -> Result<Url> {
     let url = Url::parse(value).context("Studio returned an invalid signed object URL")?;
     ensure!(
@@ -3667,6 +3763,39 @@ mod tests {
         let production = validate_api_url("https://studio.reporch.com", false).unwrap();
         assert!(validate_dev_subject(&production, true, Some("author")).is_err());
         assert!(validate_dev_subject(&loopback, true, Some("bad\nsubject")).is_err());
+    }
+
+    #[test]
+    fn oauth_credentials_are_bound_to_the_studio_api_origin() {
+        let production = validate_api_url(DEFAULT_API_URL, false).unwrap();
+        let official_auth = NativeAuthOptions {
+            issuer: DEFAULT_OIDC_ISSUER.into(),
+            client_id: "reporch-studio-cli".into(),
+            allow_insecure_http: false,
+        };
+        validate_connection_binding(&production, &official_auth, None).unwrap();
+        let attacker = validate_api_url("https://attacker.example", false).unwrap();
+        assert!(validate_connection_binding(&attacker, &official_auth, None).is_err());
+
+        let custom_api = validate_api_url("https://self-hosted.example", false).unwrap();
+        let custom_auth = NativeAuthOptions {
+            issuer: "https://self-hosted.example/oauth".into(),
+            client_id: "self-hosted-cli".into(),
+            allow_insecure_http: false,
+        };
+        validate_connection_binding(&custom_api, &custom_auth, None).unwrap();
+        assert!(validate_connection_binding(&production, &custom_auth, None).is_err());
+
+        let loopback = validate_api_url("http://127.0.0.1:8080", true).unwrap();
+        validate_connection_binding(&loopback, &official_auth, Some("e2e-author")).unwrap();
+    }
+
+    #[test]
+    fn multipart_contract_rejects_remote_allocation_control() {
+        validate_multipart_contract(65, 64, 2).unwrap();
+        assert!(validate_multipart_contract(65, 64, 50_000).is_err());
+        assert!(validate_multipart_contract(1, 1, MAX_MULTIPART_BLOCKS + 1).is_err());
+        assert!(validate_multipart_contract(u64::MAX, 64, 1).is_err());
     }
 
     #[test]

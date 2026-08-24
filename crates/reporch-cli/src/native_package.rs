@@ -476,6 +476,11 @@ fn ensure_valid_manifest(manifest: &VersionedReleaseManifest) -> Result<()> {
 }
 
 fn scan_archive(archive: &mut ZipArchive<File>) -> Result<Vec<ScannedEntry>> {
+    crate::archive_safety::validate_zip_resource_budget(
+        archive,
+        MAX_ARCHIVE_FILES,
+        MAX_ARCHIVE_BYTES + MAX_VALIDATION_REPORT_BYTES + MAX_MANIFEST_BYTES,
+    )?;
     ensure!(
         archive.len() <= MAX_ARCHIVE_FILES,
         "native archive exceeds the {MAX_ARCHIVE_FILES} entry limit"

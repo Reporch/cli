@@ -16,6 +16,14 @@ for (const name of workflows) {
   }
 }
 const release = readFileSync(".github/workflows/release.yml", "utf8");
+assert.doesNotMatch(
+  release,
+  /^\s*-\s+run:\s+npm install --global/m,
+  "the privileged release job must not execute an unverified registry bootstrap"
+);
+assert.match(release, /npm-11\.18\.0\.tgz/);
+assert.match(release, /NPM_TARBALL_SHA256:\s*[a-f0-9]{64}/);
+assert.match(release, /sha256sum --check --strict/);
 assert.match(release, /id-token:\s*write/, "release must mint OIDC tokens");
 assert.match(release, /attestations:\s*write/, "release must create attestations");
 assert.match(release, /environment:\s*npm-release/, "release must use a protected environment");
@@ -40,6 +48,11 @@ assert.match(
   "release checksums must remain verifiable after downloading flat release assets"
 );
 assert.match(release, /sha256sum --check --strict/, "release checksum verification must be strict");
+assert.match(
+  release,
+  /cmp "\$native" "\$npm_native"/,
+  "published npm binaries must match the independently attested GitHub release bytes"
+);
 assert.match(
   release,
   /subject-path: dist\/release-assets\/\*/,

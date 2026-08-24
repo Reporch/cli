@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use reporch_format::{
-    AuthoringFileV2, AuthoringSpecV2, parse_authoring_spec_v2, to_authoring_yaml_v2,
+    AuthoringFileV2, AuthoringSpecV2, MAX_AUTHORING_SPEC_BYTES, parse_authoring_spec_v2,
+    to_authoring_yaml_v2,
 };
 use studio_core::{ManifestFile, ReleaseManifestV1, ReleaseManifestV2};
 use uuid::Uuid;
@@ -12,7 +13,7 @@ use uuid::Uuid;
 use crate::local_project::{
     AUTHORING_FILE_NAME, LEGACY_BACKUP_FILE_NAME, LEGACY_MANIFEST_FILE_NAME, ProjectDiffV1,
     ProjectStatusV1, RemoteLinkV1, atomic_create_new, atomic_replace, ensure_real_directory,
-    hash_regular_project_file, reject_non_regular_destination,
+    hash_regular_project_file, read_bounded_regular_file, reject_non_regular_destination,
 };
 
 pub const AUTHORING_V1_BACKUP_FILE_NAME: &str = "reporch.pre-v2.yaml";
@@ -34,13 +35,16 @@ enum GeneratedManifest {
 
 pub fn is_v2_project(directory: &Path) -> Result<bool> {
     let root = crate::local_project::discover_project(directory)?;
-    let bytes = fs::read(root.join(AUTHORING_FILE_NAME))?;
+    let bytes = read_bounded_regular_file(
+        &root.join(AUTHORING_FILE_NAME),
+        MAX_AUTHORING_SPEC_BYTES as u64,
+    )?;
     Ok(parse_authoring_spec_v2(&bytes).is_ok())
 }
 
 pub fn read_authoring_spec(directory: &Path) -> Result<AuthoringSpecV2> {
     let path = directory.join(AUTHORING_FILE_NAME);
-    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = read_bounded_regular_file(&path, MAX_AUTHORING_SPEC_BYTES as u64)?;
     parse_authoring_spec_v2(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 

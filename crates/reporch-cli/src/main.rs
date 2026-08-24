@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod archive_safety;
 mod authoring;
 mod cli_output;
 mod desktop_artifact;
@@ -216,7 +217,7 @@ struct MigrateOptions {
 
 #[derive(Debug, Subcommand)]
 enum DesktopCommand {
-    /// Stream and verify one Tauri updater artifact with the production trust root.
+    /// Compatibility alias for caller-key Minisign verification; it does not establish official Reporch trust.
     VerifyUpdaterArtifact(desktop_artifact::VerifyDesktopArtifactOptions),
 }
 
@@ -1662,6 +1663,7 @@ fn import_package(
     profile: PackageProfile,
     output: &CliOutput,
 ) -> Result<()> {
+    ensure!(!directory.exists(), "import destination already exists");
     let manifest: VersionedReleaseManifest = if profile != PackageProfile::ReporchNative
         && versioned_package::contains_v2_sidecar(input)?
     {
@@ -1683,6 +1685,7 @@ fn import_package(
             }
         }
     };
+    let mut cleanup = ImportCleanup::new(directory);
     match &manifest {
         VersionedReleaseManifest::V1(manifest) => {
             reporch_cli::local_project::write_authoring_spec_create_new(
@@ -1697,6 +1700,7 @@ fn import_package(
             )?;
         }
     }
+    cleanup.finish();
     let data = serde_json::json!({
         "schema": "reporch.package-import-result.v1",
         "profile": profile,
@@ -1710,6 +1714,32 @@ fn import_package(
         &data,
         &format!("Imported package into {}", directory.display()),
     )
+}
+
+struct ImportCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ImportCleanup {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ImportCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 fn export_package(
@@ -1811,7 +1841,7 @@ fn compatibility(
 }
 
 fn read_versioned_manifest(path: &Path) -> Result<VersionedReleaseManifest> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = reporch_cli::local_project::read_bounded_regular_file(path, 16 * 1024 * 1024)?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 

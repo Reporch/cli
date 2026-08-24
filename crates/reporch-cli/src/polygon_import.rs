@@ -26,6 +26,7 @@ const MAX_ARCHIVE_FILES: usize = 50_000;
 const MAX_ARCHIVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONTROL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TEST_RECORDS: usize = 10_000;
 
 #[derive(Debug)]
 struct ScannedEntry {
@@ -396,6 +397,12 @@ fn import_sidecar_free_package(
         testset.test_count
     };
     ensure!(test_count > 0, "Polygon package contains no tests");
+    ensure!(
+        test_count <= MAX_TEST_RECORDS
+            && testset.tests.values.len() <= MAX_TEST_RECORDS
+            && testset.groups.values.len() <= MAX_TEST_RECORDS,
+        "Polygon testset exceeds the {MAX_TEST_RECORDS} record limit"
+    );
     ensure!(
         testset.tests.values.len() <= test_count,
         "problem.xml declares more test records than test-count"
@@ -1018,6 +1025,10 @@ fn import_validator_tests(
     paths: &BTreeSet<&str>,
 ) -> Result<Vec<ValidatorTestSpec>> {
     let count = testset.test_count.max(testset.tests.values.len());
+    ensure!(
+        count <= MAX_TEST_RECORDS,
+        "Polygon validator tests exceed the {MAX_TEST_RECORDS} record limit"
+    );
     (1..=count)
         .map(|index| {
             let input_file = expand_test_pattern(&testset.input_path_pattern, index)?;
@@ -1049,6 +1060,10 @@ fn import_checker_tests(
     paths: &BTreeSet<&str>,
 ) -> Result<Vec<CheckerTestSpec>> {
     let count = testset.test_count.max(testset.tests.values.len());
+    ensure!(
+        count <= MAX_TEST_RECORDS,
+        "Polygon checker tests exceed the {MAX_TEST_RECORDS} record limit"
+    );
     (1..=count)
         .map(|index| {
             let input_file = expand_test_pattern(&testset.input_path_pattern, index)?;
@@ -1113,6 +1128,11 @@ fn interactive_harness(
 }
 
 fn scan_archive(archive: &mut ZipArchive<File>) -> Result<Vec<ScannedEntry>> {
+    crate::archive_safety::validate_zip_resource_budget(
+        archive,
+        MAX_ARCHIVE_FILES,
+        MAX_ARCHIVE_BYTES,
+    )?;
     ensure!(
         archive.len() <= MAX_ARCHIVE_FILES,
         "archive exceeds the {MAX_ARCHIVE_FILES} entry limit"

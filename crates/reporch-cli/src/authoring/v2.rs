@@ -18,7 +18,10 @@ use super::*;
 pub(super) fn is_active_project() -> Result<bool> {
     let root = reporch_cli::local_project::discover_project(Path::new("."))?;
     let path = root.join(reporch_cli::local_project::AUTHORING_FILE_NAME);
-    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = reporch_cli::local_project::read_bounded_regular_file(
+        &path,
+        reporch_format::MAX_AUTHORING_SPEC_BYTES as u64,
+    )?;
     Ok(matches!(
         parse_versioned_authoring_spec(&bytes)?,
         VersionedAuthoringSpec::V2(_)
@@ -65,7 +68,13 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
                 .statements
                 .get(&locale)
                 .with_context(|| format!("no statement for locale {locale}"))?;
-            open::that(root.join(path)).context("open statement in the default application")?;
+            let file = spec
+                .files
+                .iter()
+                .find(|file| file.path == *path)
+                .with_context(|| format!("statement file is not declared: {path}"))?;
+            let checked = checked_statement_path(&root, path, &file.media_type, file.executable)?;
+            open::that(checked).context("open statement in the default application")?;
             output.emit(
                 "statement open",
                 &serde_json::json!({ "locale": locale, "path": path }),
@@ -76,8 +85,14 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
             let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
             for (locale, path) in &spec.statements {
-                let contents = fs::read_to_string(root.join(path))
-                    .with_context(|| format!("read {locale} statement {path}"))?;
+                let file = spec
+                    .files
+                    .iter()
+                    .find(|file| file.path == *path)
+                    .with_context(|| format!("statement file is not declared: {path}"))?;
+                let contents =
+                    read_statement_markdown(&root, path, &file.media_type, file.executable)
+                        .with_context(|| format!("read {locale} statement {path}"))?;
                 ensure!(!contents.trim().is_empty(), "{locale} statement is empty");
             }
             output.emit(
@@ -98,12 +113,18 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
                 .statements
                 .get(&locale)
                 .with_context(|| format!("no statement for locale {locale}"))?;
-            let markdown = fs::read_to_string(root.join(source))
-                .with_context(|| format!("read {locale} statement {source}"))?;
+            let file = spec
+                .files
+                .iter()
+                .find(|file| file.path == *source)
+                .with_context(|| format!("statement file is not declared: {source}"))?;
+            let markdown =
+                read_statement_markdown(&root, source, &file.media_type, file.executable)
+                    .with_context(|| format!("read {locale} statement {source}"))?;
             let rendered = match render_format {
                 StatementRenderFormat::Markdown => markdown,
                 StatementRenderFormat::Latex => crate::statement_tex::markdown_to_tex(&markdown),
-                StatementRenderFormat::Html => safe_statement_html(&markdown),
+                StatementRenderFormat::Html => safe_statement_html(&markdown)?,
             };
             let destination = destination.as_deref().map(relative_string).transpose()?;
             if let Some(path) = &destination {

@@ -131,6 +131,11 @@ pub fn compatibility_v2(
 pub fn contains_v2_sidecar(input: &Path) -> Result<bool> {
     let file = File::open(input).with_context(|| format!("open {}", input.display()))?;
     let mut archive = ZipArchive::new(file).context("read package ZIP")?;
+    crate::archive_safety::validate_zip_resource_budget(
+        &mut archive,
+        MAX_ENTRIES + 20_000,
+        MAX_TOTAL_BYTES + 2 * MAX_SIDECAR_BYTES,
+    )?;
     Ok(archive.by_name(SIDECAR_PATH).is_ok())
 }
 
@@ -242,8 +247,21 @@ pub fn import_v2_sidecar(
             &directory.join("reporch.problem.json"),
             &serde_json::to_vec_pretty(&sidecar.manifest)?,
         )?;
-        let report = read_named_limited(&mut archive, REPORT_PATH, MAX_SIDECAR_BYTES)?;
-        write_new(&directory.join("reporch.import-report.json"), &report)?;
+        let archived_report = read_named_limited(&mut archive, REPORT_PATH, MAX_SIDECAR_BYTES)?;
+        let archived_report: CompatibilityReportV1 = serde_json::from_slice(&archived_report)
+            .context("parse external V2 compatibility report")?;
+        let VersionedReleaseManifest::V2(manifest) = &sidecar.manifest else {
+            unreachable!("V2 sidecar version was checked before extraction")
+        };
+        let canonical_report = compatibility_v2(manifest, expected_profile)?;
+        ensure!(
+            archived_report == canonical_report,
+            "external V2 compatibility report is not bound to the validated manifest"
+        );
+        write_new(
+            &directory.join("reporch.import-report.json"),
+            &serde_json::to_vec_pretty(&canonical_report)?,
+        )?;
         Ok(())
     })();
     if let Err(error) = result {

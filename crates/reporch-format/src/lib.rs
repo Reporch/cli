@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -947,14 +947,16 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
     where
         A: MapAccess<'de>,
     {
-        let mut keys = Vec::<serde_yaml_ng::Value>::new();
+        let mut keys = HashSet::<String>::new();
         while let Some(key) = mapping.next_key::<serde_yaml_ng::Value>()? {
-            if keys.contains(&key) {
+            let serde_yaml_ng::Value::String(key) = key else {
+                return Err(de::Error::custom("YAML mapping keys must be strings"));
+            };
+            if !keys.insert(key.clone()) {
                 return Err(de::Error::custom(format!(
                     "duplicate YAML mapping key: {key:?}"
                 )));
             }
-            keys.push(key);
             mapping.next_value_seed(UniqueValue)?;
         }
         Ok(())

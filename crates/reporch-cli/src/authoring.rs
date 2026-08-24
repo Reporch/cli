@@ -588,7 +588,13 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
                 .statements
                 .get(&locale)
                 .with_context(|| format!("no statement for locale {locale}"))?;
-            open::that(root.join(path)).context("open statement in the default application")?;
+            let file = spec
+                .files
+                .iter()
+                .find(|file| file.path == *path)
+                .with_context(|| format!("statement file is not declared: {path}"))?;
+            let checked = checked_statement_path(&root, path, &file.media_type, file.executable)?;
+            open::that(checked).context("open statement in the default application")?;
             output.emit(
                 "statement open",
                 &serde_json::json!({ "locale": locale, "path": path }),
@@ -599,8 +605,14 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
             let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
             for (locale, path) in &spec.statements {
-                let contents = fs::read_to_string(root.join(path))
-                    .with_context(|| format!("read {locale} statement {path}"))?;
+                let file = spec
+                    .files
+                    .iter()
+                    .find(|file| file.path == *path)
+                    .with_context(|| format!("statement file is not declared: {path}"))?;
+                let contents =
+                    read_statement_markdown(&root, path, &file.media_type, file.executable)
+                        .with_context(|| format!("read {locale} statement {path}"))?;
                 ensure!(!contents.trim().is_empty(), "{locale} statement is empty");
             }
             output.emit(
@@ -621,12 +633,18 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
                 .statements
                 .get(&locale)
                 .with_context(|| format!("no statement for locale {locale}"))?;
-            let markdown = fs::read_to_string(root.join(source))
-                .with_context(|| format!("read {locale} statement {source}"))?;
+            let file = spec
+                .files
+                .iter()
+                .find(|file| file.path == *source)
+                .with_context(|| format!("statement file is not declared: {source}"))?;
+            let markdown =
+                read_statement_markdown(&root, source, &file.media_type, file.executable)
+                    .with_context(|| format!("read {locale} statement {source}"))?;
             let rendered = match render_format {
                 StatementRenderFormat::Markdown => markdown,
                 StatementRenderFormat::Latex => crate::statement_tex::markdown_to_tex(&markdown),
-                StatementRenderFormat::Html => safe_statement_html(&markdown),
+                StatementRenderFormat::Html => safe_statement_html(&markdown)?,
             };
             let destination = destination.as_deref().map(relative_string).transpose()?;
             if let Some(path) = &destination {
@@ -657,17 +675,17 @@ struct StatementRenderResult<'a> {
     contents: String,
 }
 
-fn safe_statement_html(markdown: &str) -> String {
-    use pulldown_cmark::{Event, Options, Parser, html};
-
-    let events = Parser::new_ext(
-        markdown,
-        Options::ENABLE_MATH | Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
-    )
-    .filter(|event| !matches!(event, Event::Html(_) | Event::InlineHtml(_)));
-    let mut html_output = String::new();
-    html::push_html(&mut html_output, events);
-    html_output
+fn safe_statement_html(markdown: &str) -> Result<String> {
+    studio_core::render_statement_html(markdown).map_err(|issues| {
+        anyhow::anyhow!(
+            "statement Markdown is unsafe: {}",
+            issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })
 }
 
 pub fn tests(options: TestOptions, output: &CliOutput, no_input: bool) -> Result<()> {
@@ -2328,7 +2346,40 @@ async fn checker_accepts_bytes(
     .await
 }
 
-fn read_project_bytes(root: &Path, path: &str) -> Result<Vec<u8>> {
+pub(super) fn checked_statement_path(
+    root: &Path,
+    path: &str,
+    media_type: &str,
+    executable: bool,
+) -> Result<PathBuf> {
+    ensure!(
+        !executable
+            && matches!(media_type, "text/markdown" | "text/x-markdown")
+            && matches!(
+                Path::new(path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("md" | "markdown")
+            ),
+        "statement must be a declared, non-executable Markdown file: {path}"
+    );
+    checked_project_file_path(root, path)
+}
+
+pub(super) fn read_statement_markdown(
+    root: &Path,
+    path: &str,
+    media_type: &str,
+    executable: bool,
+) -> Result<String> {
+    let checked = checked_statement_path(root, path, media_type, executable)?;
+    let bytes = fs::read(&checked).with_context(|| format!("read project file {path}"))?;
+    String::from_utf8(bytes).with_context(|| format!("statement is not UTF-8: {path}"))
+}
+
+fn checked_project_file_path(root: &Path, path: &str) -> Result<PathBuf> {
     let normalized = studio_core::normalize_relative_path(path)?;
     let candidate = root.join(&normalized);
     ensure_no_symlink_parents(root, Path::new(&normalized))?;
@@ -2345,7 +2396,12 @@ fn read_project_bytes(root: &Path, path: &str) -> Result<Vec<u8>> {
         canonical.starts_with(root),
         "project file escapes the project: {normalized}"
     );
-    fs::read(canonical).with_context(|| format!("read project file {normalized}"))
+    Ok(canonical)
+}
+
+fn read_project_bytes(root: &Path, path: &str) -> Result<Vec<u8>> {
+    let canonical = checked_project_file_path(root, path)?;
+    fs::read(canonical).with_context(|| format!("read project file {path}"))
 }
 
 fn write_project_bytes_atomic(root: &Path, path: &str, bytes: &[u8]) -> Result<()> {

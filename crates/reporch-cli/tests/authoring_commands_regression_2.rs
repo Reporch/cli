@@ -85,7 +85,7 @@ fn renderer_and_standard_checker_flows_are_deterministic_safe_and_non_overwritin
     init(standard.path(), None);
     fs::write(
         standard.path().join("statements/ko.md"),
-        "# Safe\n\n<script>alert(1)</script>\n\n1 < 2\n",
+        "# Safe\n\n1 < 2\n",
     )
     .unwrap();
     let rendered = run_json(
@@ -103,7 +103,7 @@ fn renderer_and_standard_checker_flows_are_deterministic_safe_and_non_overwritin
     );
     assert!(rendered.status.success(), "{rendered:?}");
     let html = fs::read_to_string(standard.path().join("rendered/ko.html")).unwrap();
-    assert!(!html.contains("<script>"), "{html}");
+    assert!(html.contains("Content-Security-Policy"), "{html}");
     assert!(html.contains("1 &lt; 2"), "{html}");
 
     let overwrite = run_json(
@@ -122,6 +122,25 @@ fn renderer_and_standard_checker_flows_are_deterministic_safe_and_non_overwritin
         fs::read_to_string(standard.path().join("rendered/ko.html")).unwrap(),
         html
     );
+
+    fs::write(
+        standard.path().join("statements/ko.md"),
+        "[unsafe](javascript:alert(1))\n",
+    )
+    .unwrap();
+    let unsafe_render = run_json(
+        standard.path(),
+        &[
+            "statement",
+            "render",
+            "--locale",
+            "ko",
+            "--render-format",
+            "html",
+        ],
+    );
+    assert_eq!(unsafe_render.status.code(), Some(2), "{unsafe_render:?}");
+    fs::write(standard.path().join("statements/ko.md"), "# Safe\n").unwrap();
 
     let unit = run_json(
         standard.path(),
@@ -167,6 +186,32 @@ fn renderer_and_standard_checker_flows_are_deterministic_safe_and_non_overwritin
     assert_eq!(envelope["data"]["passed"], true);
     assert_eq!(envelope["data"]["submissions"][0]["score"], 100.0);
     assert_eq!(envelope["data"]["submissions"][1]["score"], 0.0);
+}
+
+#[cfg(unix)]
+#[test]
+fn statement_operations_reject_symlinks_outside_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(outside.path(), "# outside\n").unwrap();
+    init(project.path(), None);
+    let statement = project.path().join("statements/ko.md");
+    fs::remove_file(&statement).unwrap();
+    symlink(outside.path(), &statement).unwrap();
+
+    for arguments in [
+        vec!["statement", "check"],
+        vec!["statement", "render", "--locale", "ko"],
+    ] {
+        let output = run_json(project.path(), &arguments);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("non-symlink"),
+            "{output:?}"
+        );
+    }
 }
 
 #[test]
