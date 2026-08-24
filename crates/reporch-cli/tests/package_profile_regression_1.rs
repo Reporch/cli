@@ -148,15 +148,36 @@ fn every_external_v2_sidecar_restores_the_exact_manifest_and_files() {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
     }
-    let manifest = project.join("reporch.problem.json");
-    let previous: studio_core::ReleaseManifestV2 =
-        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let generated_baseline = project.join("reporch.problem.json");
+    let baseline_bytes = fs::read(&generated_baseline).unwrap();
+    let manifest = project.join("reporch.yaml");
     let spec = reporch_cli::local_project_v2::read_authoring_spec(&project).unwrap();
     let current =
-        reporch_cli::local_project_v2::compile_authoring_spec(&project, &spec, previous.commit_id)
+        reporch_cli::local_project_v2::compile_authoring_spec(&project, &spec, uuid::Uuid::nil())
             .unwrap();
-    fs::write(&manifest, serde_json::to_vec_pretty(&current).unwrap()).unwrap();
+    let expected_manifest = serde_json::to_value(&current).unwrap();
+
+    let compatibility = reporch()
+        .args([
+            "--format",
+            "json",
+            "manifest",
+            "compatibility",
+            manifest.to_str().unwrap(),
+            "--profile",
+            "icpc202509",
+            "--strict",
+        ])
+        .output()
+        .unwrap();
+    assert!(compatibility.status.success(), "{compatibility:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&compatibility.stdout).unwrap()["data"]["exportable"],
+        true
+    );
+
     for (name, profile) in [
+        ("native", "reporch-native"),
         ("polygon", "polygon-compatible"),
         ("icpc", "icpc202509"),
         ("legacy", "icpc-legacy"),
@@ -199,7 +220,7 @@ fn every_external_v2_sidecar_restores_the_exact_manifest_and_files() {
                 &fs::read(imported.join("reporch.problem.json")).unwrap()
             )
             .unwrap(),
-            serde_json::from_slice::<Value>(&fs::read(&manifest).unwrap()).unwrap(),
+            expected_manifest,
             "{profile}"
         );
         assert_eq!(
@@ -208,4 +229,11 @@ fn every_external_v2_sidecar_restores_the_exact_manifest_and_files() {
             "{profile}"
         );
     }
+    assert_eq!(fs::read(generated_baseline).unwrap(), baseline_bytes);
+    assert!(
+        reporch_cli::local_project_v2::project_status(&project)
+            .unwrap()
+            .dirty,
+        "packaging the current authoring spec must not replace the immutable baseline"
+    );
 }
