@@ -6,9 +6,10 @@ use anyhow::{Context, Result, ensure};
 use reporch_format::{VersionedAuthoringSpec, parse_versioned_authoring_spec};
 use studio_core::{
     CheckerSpec, CheckerUnitSpecV2, GeneratedCaseRefV2, GeneratorMatrixStrategyV2,
-    GeneratorRecipeSpecV2, GeneratorSpecV2, ProgramSpec, ProgramSpecV2, ScoreAggregationV2,
-    SolutionRoleV2, SolutionSpecV2, TestCaseOriginV2, TestCaseRoleV2, TestCaseSpecV2,
-    TestGroupSpecV2, ValidatorUnitSpecV2,
+    GeneratorRecipeSpecV2, GeneratorSpecV2, HarnessKindV2, HarnessProfileSpecV2, HarnessSpecV2,
+    InteractiveSpecV2, OutputSubmissionSpecV2, ProblemType, ProgramSpec, ProgramSpecV2,
+    ScoreAggregationV2, SolutionRoleV2, SolutionSpecV2, TestCaseOriginV2, TestCaseRoleV2,
+    TestCaseSpecV2, TestGroupSpecV2, ValidatorUnitSpecV2,
 };
 use uuid::Uuid;
 
@@ -1223,6 +1224,511 @@ fn emit_solutions(command: &'static str, output: &CliOutput) -> Result<()> {
         &spec.testing.solutions,
         &format!("{} solution expectation(s)", spec.testing.solutions.len()),
     )
+}
+
+pub(super) async fn interactor(options: InteractorOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        InteractorCommand::Set { source, language } => {
+            let source = relative_string(&source)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        spec.problem_type == ProblemType::Interactive,
+                        "interactor can only be configured for an interactive problem"
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&language),
+                        false,
+                    )?;
+                    spec.execution.interactive = Some(InteractiveSpecV2 {
+                        interactor: ProgramSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: "interactor".into(),
+                            source_path: source.clone(),
+                            language: language.clone(),
+                            arguments: Vec::new(),
+                        },
+                        idle_timeout_ms: 2_000,
+                        transcript_limit_kib: 1_024,
+                        unit_tests: Vec::new(),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "interactor set",
+                &spec.execution.interactive,
+                "Configured interactor",
+            )
+        }
+        InteractorCommand::Run(options) => run_interactor(options, false, output).await,
+        InteractorCommand::Transcript(options) => run_interactor(options, true, output).await,
+    }
+}
+
+async fn run_interactor(
+    options: RuntimeProgramRunOptions,
+    transcript: bool,
+    output: &CliOutput,
+) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let interactive = spec
+        .execution
+        .interactive
+        .as_ref()
+        .context("no interactor is configured")?;
+    let solution = find_solution(&spec, &options.solution)?;
+    let test = spec
+        .testing
+        .tests
+        .iter()
+        .find(|test| test.id == options.test)
+        .with_context(|| format!("test case was not found: {}", options.test))?;
+    let run_options = options.runtime.into_run_options();
+    let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
+        run_options.toolchain_id.as_deref(),
+        &interactive.interactor.language,
+    )?;
+    let solution_toolchain = reporch_cli::toolchain::resolve_for_language(
+        run_options.toolchain_id.as_deref(),
+        &solution.program.language,
+    )?;
+    ensure!(
+        interactor_toolchain.language == solution_toolchain.language,
+        "local interactive pairing requires matching toolchain languages; use Studio verification for cross-language pairing"
+    );
+    let result = reporch_cli::authoring_runtime::run_interactive_pair(
+        &reporch_cli::authoring_runtime::InteractivePairRequest {
+            project_directory: &root,
+            solver_source_path: &solution.program.source_path,
+            interactor_source_path: &interactive.interactor.source_path,
+            language: &interactive.interactor.language,
+            input_path: &test.input_file,
+            options: &run_options,
+        },
+    )
+    .await?;
+    if let Some(path) = options.output.as_deref() {
+        let path = relative_string(path)?;
+        write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
+    }
+    let expected_accepted = solution.expected_verdict == studio_core::ExpectedVerdict::Accepted;
+    let report = RuntimeProgramReport {
+        solution: solution.program.name.clone(),
+        test_id: test.id,
+        expected: if expected_accepted {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        actual: if result.exit_code == 0 {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        passed: (result.exit_code == 0) == expected_accepted,
+        exit_code: result.exit_code,
+        duration_ms: result.duration_ms,
+        transcript: transcript.then_some(result.stdout),
+        stderr: result.stderr,
+    };
+    ensure!(
+        report.passed,
+        "interactive validation did not pass: expected {}, got {}",
+        report.expected,
+        report.actual
+    );
+    output.emit(
+        if transcript {
+            "interactor transcript"
+        } else {
+            "interactor run"
+        },
+        &report,
+        if transcript {
+            report.transcript.as_deref().unwrap_or("")
+        } else {
+            "Interactive run matched the expected verdict"
+        },
+    )
+}
+
+pub(super) async fn grader(options: GraderOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        GraderCommand::Set { source, language } => {
+            let source = relative_string(&source)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        matches!(
+                            spec.problem_type,
+                            ProblemType::Library | ProblemType::Grader
+                        ),
+                        "grader can only be configured for a library or grader problem"
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&language),
+                        false,
+                    )?;
+                    let kind = if spec.problem_type == ProblemType::Library {
+                        HarnessKindV2::Library
+                    } else {
+                        HarnessKindV2::Grader
+                    };
+                    let harness = spec.execution.harness.get_or_insert_with(|| HarnessSpecV2 {
+                        kind,
+                        interface_files: Vec::new(),
+                        public_files: Vec::new(),
+                        private_files: Vec::new(),
+                        stub_templates: Default::default(),
+                        profiles: Default::default(),
+                    });
+                    harness.kind = kind;
+                    if !harness.private_files.contains(&source) {
+                        harness.private_files.push(source.clone());
+                    }
+                    harness.profiles.insert(
+                        language.clone(),
+                        HarnessProfileSpecV2 {
+                            language: language.clone(),
+                            source_path: source.clone(),
+                            asset_paths: vec![source.clone()],
+                            include_dirs: Vec::new(),
+                            compile_script: None,
+                            run_script: None,
+                            compile_command: None,
+                            run_command: None,
+                        },
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit("grader set", &spec.execution.harness, "Configured grader")
+        }
+        GraderCommand::Run(options) => run_grader(options, output).await,
+    }
+}
+
+async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let harness = spec
+        .execution
+        .harness
+        .as_ref()
+        .context("no grader is configured")?;
+    let solution = find_solution(&spec, &options.solution)?;
+    let profile = harness
+        .profiles
+        .get(&solution.program.language)
+        .or_else(|| harness.profiles.values().next())
+        .context("configured grader has no language profile")?;
+    ensure!(
+        reporch_cli::toolchain::resolve_for_language(None, &profile.language)?.language
+            == reporch_cli::toolchain::resolve_for_language(None, &solution.program.language)?
+                .language,
+        "local grader linking requires the solution and grader to use the same C or C++ toolchain"
+    );
+    let test = spec
+        .testing
+        .tests
+        .iter()
+        .find(|test| test.id == options.test)
+        .with_context(|| format!("test case was not found: {}", options.test))?;
+    let answer_path = test
+        .answer_file
+        .as_deref()
+        .context("grader test has no answer file")?;
+    let run_options = options.runtime.into_run_options();
+    let result = reporch_cli::authoring_runtime::run_linked_pair(
+        &reporch_cli::authoring_runtime::LinkedPairRequest {
+            project_directory: &root,
+            first_source_path: &solution.program.source_path,
+            second_source_path: &profile.source_path,
+            language: &profile.language,
+            stdin_path: &test.input_file,
+            options: &run_options,
+        },
+    )
+    .await?;
+    let actual_accepted = if result.exit_code == 0 {
+        checker_accepts_bytes(
+            &root,
+            &spec.testing.checker.checker,
+            &test.input_file,
+            answer_path,
+            &result.stdout_bytes,
+            &run_options,
+        )
+        .await?
+    } else {
+        false
+    };
+    if let Some(path) = options.output.as_deref() {
+        let path = relative_string(path)?;
+        write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
+    }
+    let expected_accepted = solution.expected_verdict == studio_core::ExpectedVerdict::Accepted;
+    let report = RuntimeProgramReport {
+        solution: solution.program.name.clone(),
+        test_id: test.id,
+        expected: if expected_accepted {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        actual: if actual_accepted {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        passed: actual_accepted == expected_accepted,
+        exit_code: result.exit_code,
+        duration_ms: result.duration_ms,
+        transcript: None,
+        stderr: result.stderr,
+    };
+    ensure!(
+        report.passed,
+        "grader validation did not pass: expected {}, got {}",
+        report.expected,
+        report.actual
+    );
+    output.emit(
+        "grader run",
+        &report,
+        "Grader run matched the expected verdict",
+    )
+}
+
+pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        OutputCommand::List => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            output.emit(
+                "output list",
+                &spec.output_submissions,
+                &format!("{} output submission(s)", spec.output_submissions.len()),
+            )
+        }
+        OutputCommand::Add {
+            name,
+            expected,
+            mappings,
+            minimum_score,
+            maximum_score,
+        } => {
+            ensure!(!mappings.is_empty(), "at least one --map is required");
+            let expected_score = score_range(minimum_score, maximum_score, expected)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .output_submissions
+                            .iter()
+                            .any(|submission| submission.name == name),
+                        "output submission already exists: {name}"
+                    );
+                    let mut outputs = std::collections::BTreeMap::new();
+                    for (test_id, path) in &mappings {
+                        ensure!(
+                            spec.testing.tests.iter().any(|test| test.id == *test_id),
+                            "unknown test case: {test_id}"
+                        );
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            path,
+                            "text/plain",
+                            false,
+                        )?;
+                        ensure!(
+                            outputs.insert(*test_id, path.clone()).is_none(),
+                            "duplicate test mapping: {test_id}"
+                        );
+                    }
+                    spec.output_submissions.push(OutputSubmissionSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: normalize_name(&name)?,
+                        outputs,
+                        expected_verdict: expected.into(),
+                        expected_score: expected_score.clone(),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "output add",
+                &spec.output_submissions,
+                &format!("Added output submission {name}"),
+            )
+        }
+        OutputCommand::Remove { name } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let before = spec.output_submissions.len();
+                    spec.output_submissions
+                        .retain(|submission| submission.name != name);
+                    ensure!(
+                        before != spec.output_submissions.len(),
+                        "output submission was not found"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "output remove",
+                &spec.output_submissions,
+                &format!("Removed output submission {name}"),
+            )
+        }
+        OutputCommand::Test { name, runtime } => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let submissions =
+                selected_by_name(&spec.output_submissions, name.as_deref(), |submission| {
+                    submission.name.as_str()
+                })?;
+            ensure!(
+                !submissions.is_empty(),
+                "no output submissions are configured"
+            );
+            let run_options = runtime.into_run_options();
+            let mut reports = Vec::new();
+            for submission in submissions {
+                let mut cases = Vec::new();
+                for test in &spec.testing.tests {
+                    let actual_path = submission.outputs.get(&test.id).with_context(|| {
+                        format!(
+                            "output submission {} has no mapping for test {}",
+                            submission.name, test.id
+                        )
+                    })?;
+                    let answer_path = test
+                        .answer_file
+                        .as_deref()
+                        .context("output-only test has no answer file")?;
+                    let accepted = checker_accepts_path(
+                        &root,
+                        &spec.testing.checker.checker,
+                        &test.input_file,
+                        answer_path,
+                        actual_path,
+                        &run_options,
+                    )
+                    .await?;
+                    cases.push(OutputCaseResult {
+                        test_id: test.id,
+                        name: test.name.clone(),
+                        accepted,
+                    });
+                }
+                let score = output_score(&spec.testing.groups, &spec.testing.tests, &cases)?;
+                let actual_verdict = if cases.iter().all(|case| case.accepted) {
+                    studio_core::ExpectedVerdict::Accepted
+                } else if score > 0.0 {
+                    studio_core::ExpectedVerdict::Partial
+                } else {
+                    studio_core::ExpectedVerdict::WrongAnswer
+                };
+                let score_matches = submission
+                    .expected_score
+                    .as_ref()
+                    .is_none_or(|range| score >= range.minimum && score <= range.maximum);
+                reports.push(OutputSubmissionResult {
+                    name: submission.name.clone(),
+                    expected: verdict_name(submission.expected_verdict),
+                    actual: verdict_name(actual_verdict),
+                    score,
+                    passed: actual_verdict == submission.expected_verdict && score_matches,
+                    cases,
+                });
+            }
+            let report = OutputTestReport {
+                passed: reports.iter().all(|report| report.passed),
+                submissions: reports,
+            };
+            ensure!(
+                report.passed,
+                "output validation did not pass: one or more submissions disagreed with the expected verdict"
+            );
+            output.emit(
+                "output test",
+                &report,
+                "All output submissions matched their expected verdicts",
+            )
+        }
+    }
+}
+
+fn output_score(
+    groups: &[TestGroupSpecV2],
+    tests: &[TestCaseSpecV2],
+    cases: &[OutputCaseResult],
+) -> Result<f64> {
+    if groups.is_empty() {
+        return Ok(if cases.iter().all(|case| case.accepted) {
+            100.0
+        } else {
+            0.0
+        });
+    }
+    let accepted = cases
+        .iter()
+        .map(|case| (case.test_id, case.accepted))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut resolved = std::collections::BTreeMap::<Uuid, bool>::new();
+    while resolved.len() < groups.len() {
+        let before = resolved.len();
+        for group in groups {
+            if resolved.contains_key(&group.id)
+                || group
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !resolved.contains_key(dependency))
+            {
+                continue;
+            }
+            let dependencies_passed = group
+                .depends_on
+                .iter()
+                .all(|dependency| resolved.get(dependency) == Some(&true));
+            let group_tests = tests
+                .iter()
+                .filter(|test| test.group_ids.contains(&group.id))
+                .collect::<Vec<_>>();
+            ensure!(
+                !group_tests.is_empty(),
+                "score group has no test cases: {}",
+                group.name
+            );
+            let tests_passed = group_tests
+                .iter()
+                .all(|test| accepted.get(&test.id) == Some(&true));
+            resolved.insert(group.id, dependencies_passed && tests_passed);
+        }
+        ensure!(
+            resolved.len() > before,
+            "score group dependencies contain a cycle or unknown group"
+        );
+    }
+    Ok(groups
+        .iter()
+        .filter(|group| resolved.get(&group.id) == Some(&true))
+        .map(|group| group.points)
+        .sum())
 }
 
 fn inferred_role(name: &str) -> TestCaseRoleV2 {

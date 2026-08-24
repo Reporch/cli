@@ -596,3 +596,66 @@ fn v2_validator_checker_and_solution_flows_execute_and_persist() {
             .any(|solution| solution.program.name == "third-accepted")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn v2_interactive_grader_and_output_only_flows_match_expected_verdicts() {
+    let runtime = tempfile::tempdir().unwrap();
+    fake_rootless_runtime(runtime.path());
+    let log = runtime.path().join("v2-specialized.log");
+
+    let interactive = tempfile::tempdir().unwrap();
+    init(interactive.path(), Some("interactive"));
+    reporch_cli::local_project_v2::migrate_v1_authoring_file(interactive.path()).unwrap();
+    let interactive_spec =
+        reporch_cli::local_project_v2::read_authoring_spec(interactive.path()).unwrap();
+    let interactive_test = interactive_spec.testing.tests[0].id.to_string();
+    let transcript = fake_runtime_command(
+        runtime.path(),
+        interactive.path(),
+        &[
+            "interactor",
+            "transcript",
+            "--solution",
+            "accepted",
+            "--test",
+            &interactive_test,
+            "--runtime",
+            "podman",
+        ],
+        "solver -> interactor\n",
+        &log,
+    );
+    assert!(transcript.status.success(), "{transcript:?}");
+
+    let grader = tempfile::tempdir().unwrap();
+    init(grader.path(), Some("grader"));
+    reporch_cli::local_project_v2::migrate_v1_authoring_file(grader.path()).unwrap();
+    let grader_spec = reporch_cli::local_project_v2::read_authoring_spec(grader.path()).unwrap();
+    let grader_test = grader_spec.testing.tests[0].id.to_string();
+    let graded = fake_runtime_command(
+        runtime.path(),
+        grader.path(),
+        &[
+            "grader",
+            "run",
+            "--solution",
+            "accepted",
+            "--test",
+            &grader_test,
+            "--runtime",
+            "podman",
+        ],
+        "3\n",
+        &log,
+    );
+    assert!(graded.status.success(), "{graded:?}");
+
+    let output_only = tempfile::tempdir().unwrap();
+    init(output_only.path(), Some("output-only"));
+    reporch_cli::local_project_v2::migrate_v1_authoring_file(output_only.path()).unwrap();
+    let tested = run_json(output_only.path(), &["output", "test"]);
+    assert!(tested.status.success(), "{tested:?}");
+    let envelope: Value = serde_json::from_slice(&tested.stdout).unwrap();
+    assert_eq!(envelope["data"]["passed"], true);
+}

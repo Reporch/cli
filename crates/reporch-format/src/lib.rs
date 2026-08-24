@@ -656,7 +656,11 @@ fn migrate_execution_v1(spec: &AuthoringSpecV1) -> Result<ExecutionSpecV2, Autho
                             language.clone(),
                             HarnessProfileSpecV2 {
                                 language: language.clone(),
-                                source_path: profile.source_path.clone(),
+                                source_path: spec
+                                    .judging
+                                    .grader_path
+                                    .clone()
+                                    .unwrap_or_else(|| profile.source_path.clone()),
                                 asset_paths: profile.asset_paths.clone(),
                                 include_dirs: Vec::new(),
                                 compile_script: profile.compile_script.clone(),

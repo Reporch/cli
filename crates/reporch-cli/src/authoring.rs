@@ -1597,6 +1597,9 @@ pub fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
 }
 
 pub async fn interactor(options: InteractorOptions, output: &CliOutput) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::interactor(options, output).await;
+    }
     match options.command {
         InteractorCommand::Set { source, language } => {
             set_runtime_program(source, language, true, output)
@@ -1607,6 +1610,9 @@ pub async fn interactor(options: InteractorOptions, output: &CliOutput) -> Resul
 }
 
 pub async fn grader(options: GraderOptions, output: &CliOutput) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::grader(options, output).await;
+    }
     match options.command {
         GraderCommand::Set { source, language } => {
             set_runtime_program(source, language, false, output)
@@ -1864,6 +1870,9 @@ fn set_runtime_program(
 }
 
 pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::output_submission(options, output).await;
+    }
     match options.command {
         OutputCommand::List => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
