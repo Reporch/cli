@@ -330,10 +330,31 @@ enum InteractorCommand {
 #[derive(Debug, Subcommand)]
 enum GraderCommand {
     Set {
+        /// Judge-side grader or manager source.
         #[arg(long)]
         source: PathBuf,
         #[arg(long)]
         language: String,
+        /// Harmless contestant source template replaced by submissions.
+        #[arg(long)]
+        submission_template: Option<PathBuf>,
+        #[arg(long, conflicts_with = "compile_command")]
+        compile_script: Option<PathBuf>,
+        #[arg(long, conflicts_with = "compile_script")]
+        compile_command: Option<String>,
+        #[arg(long, conflicts_with = "run_command")]
+        run_script: Option<PathBuf>,
+        #[arg(long, conflicts_with = "run_script")]
+        run_command: Option<String>,
+        /// Additional judge-side build/runtime asset.
+        #[arg(long)]
+        asset: Vec<PathBuf>,
+        /// Interface file visible to every supported contestant language.
+        #[arg(long)]
+        interface_file: Vec<PathBuf>,
+        /// Additional contestant-visible resource.
+        #[arg(long)]
+        public_file: Vec<PathBuf>,
     },
     Run(RuntimeProgramRunOptions),
 }
@@ -1710,9 +1731,9 @@ pub async fn grader(options: GraderOptions, output: &CliOutput) -> Result<()> {
         return v2::grader(options, output).await;
     }
     match options.command {
-        GraderCommand::Set { source, language } => {
-            set_runtime_program(source, language, false, output)
-        }
+        GraderCommand::Set {
+            source, language, ..
+        } => set_runtime_program(source, language, false, output),
         GraderCommand::Run(options) => run_grader(options, output).await,
     }
 }

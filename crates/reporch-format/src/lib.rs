@@ -714,6 +714,7 @@ fn migrate_execution_v1(spec: &AuthoringSpecV1) -> Result<ExecutionSpecV2, Autho
                                     .grader_path
                                     .clone()
                                     .unwrap_or_else(|| profile.source_path.clone()),
+                                submission_source_path: Some(profile.source_path.clone()),
                                 asset_paths: profile.asset_paths.clone(),
                                 include_dirs: Vec::new(),
                                 compile_script: profile.compile_script.clone(),
@@ -1194,6 +1195,57 @@ mod tests {
             parse_versioned_authoring_spec(&bytes).unwrap(),
             VersionedAuthoringSpec::V2(_)
         ));
+    }
+
+    #[test]
+    fn grader_migration_separates_private_grader_from_submission_template() {
+        let mut v1 = minimal_spec();
+        v1.problem_type = ProblemType::Grader;
+        for (path, executable) in [
+            ("cpp/grader.cpp", false),
+            ("cpp/solution.cpp", false),
+            ("cpp/compile.sh", true),
+            ("cpp/run.sh", true),
+        ] {
+            v1.files.push(AuthoringFileV1 {
+                path: path.into(),
+                media_type: "text/plain".into(),
+                executable,
+            });
+        }
+        v1.judging.grader_path = Some("cpp/grader.cpp".into());
+        v1.judging.grader_language = Some("cpp".into());
+        v1.judging.harness = Some(studio_core::ExecutionHarnessV1::CustomImpl {
+            profiles: BTreeMap::from([(
+                "cpp".into(),
+                studio_core::CustomImplProfileV1 {
+                    source_path: "cpp/solution.cpp".into(),
+                    asset_paths: vec![
+                        "cpp/solution.cpp".into(),
+                        "cpp/grader.cpp".into(),
+                        "cpp/compile.sh".into(),
+                        "cpp/run.sh".into(),
+                    ],
+                    compile_script: Some("cpp/compile.sh".into()),
+                    run_script: Some("cpp/run.sh".into()),
+                    compile_command: None,
+                    run_command: None,
+                },
+            )]),
+            input_mode: studio_core::CustomImplInputMode::Raw,
+            expected_output_mode: studio_core::CustomImplExpectedOutputMode::Raw,
+        });
+
+        let v2 = AuthoringSpecV2::migrate_v1(&v1).unwrap();
+        let harness = v2.execution.harness.as_ref().unwrap();
+        let profile = &harness.profiles["cpp"];
+
+        assert_eq!(profile.source_path, "cpp/grader.cpp");
+        assert_eq!(
+            profile.submission_source_path.as_deref(),
+            Some("cpp/solution.cpp")
+        );
+        assert_eq!(harness.private_files, ["cpp/grader.cpp"]);
     }
 
     #[test]

@@ -577,19 +577,24 @@ fn project_harness_v1(manifest: &ReleaseManifestV2) -> Result<Option<ExecutionHa
             .profiles
             .iter()
             .map(|(language, profile)| {
-                (
+                Ok((
                     language.clone(),
                     CustomImplProfileV1 {
-                        source_path: profile.source_path.clone(),
+                        source_path: profile
+                            .submission_source_path
+                            .clone()
+                            .context(
+                                "V2 harness profile requires a contestant submission template for external projection",
+                            )?,
                         asset_paths: profile.asset_paths.clone(),
                         compile_script: profile.compile_script.clone(),
                         run_script: profile.run_script.clone(),
                         compile_command: profile.compile_command.clone(),
                         run_command: profile.run_command.clone(),
                     },
-                )
+                ))
             })
-            .collect(),
+            .collect::<Result<_>>()?,
         input_mode: CustomImplInputMode::Raw,
         expected_output_mode: CustomImplExpectedOutputMode::Raw,
     }))
