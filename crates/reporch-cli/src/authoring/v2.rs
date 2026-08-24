@@ -1,0 +1,2414 @@
+use std::fs;
+use std::io::IsTerminal as _;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, ensure};
+use reporch_format::{VersionedAuthoringSpec, parse_versioned_authoring_spec};
+use studio_core::{
+    CheckerSpec, CheckerUnitSpecV2, GeneratedCaseRefV2, GeneratorMatrixStrategyV2,
+    GeneratorRecipeSpecV2, GeneratorSpecV2, HarnessKindV2, HarnessProfileSpecV2, HarnessSpecV2,
+    InteractiveSpecV2, OutputSubmissionSpecV2, ProblemType, ProgramSpec, ProgramSpecV2,
+    ScoreAggregationV2, SolutionRoleV2, SolutionSpecV2, StressSuiteSpecV2, TestCaseOriginV2,
+    TestCaseRoleV2, TestCaseSpecV2, TestGroupSpecV2, ValidatorUnitSpecV2,
+};
+use uuid::Uuid;
+
+use super::*;
+
+pub(super) fn is_active_project() -> Result<bool> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let path = root.join(reporch_cli::local_project::AUTHORING_FILE_NAME);
+    let bytes = reporch_cli::local_project::read_bounded_regular_file(
+        &path,
+        reporch_format::MAX_AUTHORING_SPEC_BYTES as u64,
+    )?;
+    Ok(matches!(
+        parse_versioned_authoring_spec(&bytes)?,
+        VersionedAuthoringSpec::V2(_)
+    ))
+}
+
+pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        StatementCommand::Add {
+            locale,
+            path,
+            title,
+        } => {
+            let relative = relative_string(&path)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &relative,
+                        "text/markdown",
+                        false,
+                    )?;
+                    spec.statements.insert(locale.clone(), relative.clone());
+                    if let Some(title) = &title {
+                        ensure!(!title.trim().is_empty(), "title cannot be empty");
+                        spec.title.insert(locale.clone(), title.trim().to_owned());
+                    }
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "statement add",
+                &spec.statements,
+                &format!("Added {locale} statement"),
+            )
+        }
+        StatementCommand::Open { locale } => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let locale = locale.unwrap_or(spec.default_locale);
+            let path = spec
+                .statements
+                .get(&locale)
+                .with_context(|| format!("no statement for locale {locale}"))?;
+            let file = spec
+                .files
+                .iter()
+                .find(|file| file.path == *path)
+                .with_context(|| format!("statement file is not declared: {path}"))?;
+            let checked = checked_statement_path(&root, path, &file.media_type, file.executable)?;
+            open::that(checked).context("open statement in the default application")?;
+            output.emit(
+                "statement open",
+                &serde_json::json!({ "locale": locale, "path": path }),
+                &format!("Opened {path}"),
+            )
+        }
+        StatementCommand::Check => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            for (locale, path) in &spec.statements {
+                let file = spec
+                    .files
+                    .iter()
+                    .find(|file| file.path == *path)
+                    .with_context(|| format!("statement file is not declared: {path}"))?;
+                let contents =
+                    read_statement_markdown(&root, path, &file.media_type, file.executable)
+                        .with_context(|| format!("read {locale} statement {path}"))?;
+                ensure!(!contents.trim().is_empty(), "{locale} statement is empty");
+            }
+            output.emit(
+                "statement check",
+                &spec.statements,
+                &format!("{} statement(s) are readable", spec.statements.len()),
+            )
+        }
+        StatementCommand::Render {
+            locale,
+            render_format,
+            output: destination,
+        } => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let locale = locale.unwrap_or(spec.default_locale);
+            let source = spec
+                .statements
+                .get(&locale)
+                .with_context(|| format!("no statement for locale {locale}"))?;
+            let file = spec
+                .files
+                .iter()
+                .find(|file| file.path == *source)
+                .with_context(|| format!("statement file is not declared: {source}"))?;
+            let markdown =
+                read_statement_markdown(&root, source, &file.media_type, file.executable)
+                    .with_context(|| format!("read {locale} statement {source}"))?;
+            let rendered = match render_format {
+                StatementRenderFormat::Markdown => markdown,
+                StatementRenderFormat::Latex => crate::statement_tex::markdown_to_tex(&markdown),
+                StatementRenderFormat::Html => safe_statement_html(&markdown)?,
+            };
+            let destination = destination.as_deref().map(relative_string).transpose()?;
+            if let Some(path) = &destination {
+                write_project_bytes_atomic(&root, path, rendered.as_bytes())?;
+            }
+            let data = StatementRenderResult {
+                locale,
+                format: match render_format {
+                    StatementRenderFormat::Markdown => "markdown",
+                    StatementRenderFormat::Html => "html",
+                    StatementRenderFormat::Latex => "latex",
+                },
+                source,
+                output: destination,
+                contents: rendered.clone(),
+            };
+            output.emit("statement render", &data, &rendered)
+        }
+    }
+}
+
+pub(super) fn tests(options: TestOptions, output: &CliOutput, no_input: bool) -> Result<()> {
+    match options.command {
+        None => guided_test_case(output, no_input),
+        Some(TestCommand::Case { command }) => test_case(command, output),
+        Some(TestCommand::Group { command }) => test_group(command, output),
+    }
+}
+
+fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
+    ensure!(
+        !no_input && std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        "test guide requires an interactive terminal; use test case add in CI"
+    );
+    let name = prompt("Test name", "sample-1")?;
+    let input = prompt("Input file", "tests/1.in")?;
+    let answer = prompt("Answer file (blank for none)", "tests/1.ans")?;
+    test_case(
+        TestCaseCommand::Add(TestCaseAddOptions {
+            name,
+            input: PathBuf::from(input),
+            answer: (!answer.is_empty()).then(|| PathBuf::from(answer)),
+            groups: vec![],
+            generated_by: None,
+            seed: None,
+        }),
+        output,
+    )
+}
+
+fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
+    match command {
+        TestCaseCommand::List => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            output.emit(
+                "test case list",
+                &spec.testing.tests,
+                &format!("{} test case(s)", spec.testing.tests.len()),
+            )
+        }
+        TestCaseCommand::Add(options) => {
+            let input = relative_string(&options.input)?;
+            let answer = options.answer.as_deref().map(relative_string).transpose()?;
+            let test_id = Uuid::now_v7();
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure_unique_test_name(spec, &options.name, None)?;
+                    let group_ids = resolve_group_ids(spec, &options.groups)?;
+                    let generated = if let Some(generator_name) = &options.generated_by {
+                        let seed = options
+                            .seed
+                            .context("a generated test requires --seed so it can be reproduced")?;
+                        let generator = spec
+                            .testing
+                            .generators
+                            .iter_mut()
+                            .find(|generator| generator.program.name == *generator_name)
+                            .with_context(|| format!("unknown generator: {generator_name}"))?;
+                        let recipe_id = Uuid::now_v7();
+                        generator.recipes.push(GeneratorRecipeSpecV2 {
+                            id: recipe_id,
+                            name: format!("case-{}", normalize_name(&options.name)?),
+                            argument_template: Vec::new(),
+                            parameters: Default::default(),
+                            matrix: GeneratorMatrixStrategyV2::Cartesian,
+                            seed_start: seed,
+                            seed_step: 1,
+                            count: 1,
+                            group_ids: group_ids.clone(),
+                        });
+                        Some(GeneratedCaseRefV2 {
+                            generator_id: generator.program.id,
+                            recipe_id,
+                            ordinal: 0,
+                            seed,
+                        })
+                    } else {
+                        None
+                    };
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &input,
+                        "text/plain",
+                        false,
+                    )?;
+                    if let Some(answer) = &answer {
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            answer,
+                            "text/plain",
+                            false,
+                        )?;
+                    }
+                    spec.testing.tests.push(TestCaseSpecV2 {
+                        id: test_id,
+                        name: normalize_name(&options.name)?,
+                        role: inferred_role(&options.name),
+                        origin: if generated.is_some() {
+                            TestCaseOriginV2::Generated
+                        } else {
+                            TestCaseOriginV2::Manual
+                        },
+                        input_file: input.clone(),
+                        answer_file: answer.clone(),
+                        group_ids,
+                        points: None,
+                        generated,
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "test case add",
+                &spec.testing.tests,
+                &format!("Added test case {test_id}"),
+            )
+        }
+        TestCaseCommand::Import(options) => import_test_cases(options, output),
+        TestCaseCommand::Update(options) => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let group_ids = if options.groups.is_empty() {
+                        None
+                    } else {
+                        Some(resolve_group_ids(spec, &options.groups)?)
+                    };
+                    if let Some(name) = &options.name {
+                        ensure_unique_test_name(spec, name, Some(options.id))?;
+                    }
+                    let test = spec
+                        .testing
+                        .tests
+                        .iter_mut()
+                        .find(|test| test.id == options.id)
+                        .context("test case was not found")?;
+                    if let Some(name) = &options.name {
+                        test.name = normalize_name(name)?;
+                    }
+                    if let Some(group_ids) = group_ids {
+                        test.group_ids = group_ids;
+                    }
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "test case update",
+                &spec.testing.tests,
+                &format!("Updated test case {}", options.id),
+            )
+        }
+        TestCaseCommand::Remove { id } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let before = spec.testing.tests.len();
+                    spec.testing.tests.retain(|test| test.id != id);
+                    ensure!(
+                        before != spec.testing.tests.len(),
+                        "test case was not found"
+                    );
+                    for submission in &mut spec.output_submissions {
+                        submission.outputs.remove(&id);
+                    }
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "test case remove",
+                &spec.testing.tests,
+                &format!("Removed test case {id}"),
+            )
+        }
+    }
+}
+
+fn import_test_cases(options: TestCaseImportOptions, output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let directory = fs::canonicalize(&options.directory)
+        .with_context(|| format!("resolve {}", options.directory.display()))?;
+    ensure!(
+        directory.starts_with(&root),
+        "import directory must be inside the project"
+    );
+    let mut inputs = fs::read_dir(&directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "in"))
+        .collect::<Vec<_>>();
+    inputs.sort();
+    ensure!(!inputs.is_empty(), "no .in files were found");
+    let mut imported = Vec::new();
+    let spec = reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
+        let group_ids = resolve_group_ids(spec, &options.groups)?;
+        for input_path in &inputs {
+            let input = project_relative(root, input_path)?;
+            let answer_path = input_path.with_extension("ans");
+            let answer = answer_path
+                .is_file()
+                .then(|| project_relative(root, &answer_path))
+                .transpose()?;
+            let stem = input_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("test input has a non-Unicode file name")?;
+            let name = normalize_name(stem)?;
+            ensure_unique_test_name(spec, &name, None)?;
+            reporch_cli::local_project_v2::declare_project_file(
+                root,
+                spec,
+                &input,
+                "text/plain",
+                false,
+            )?;
+            if let Some(answer) = &answer {
+                reporch_cli::local_project_v2::declare_project_file(
+                    root,
+                    spec,
+                    answer,
+                    "text/plain",
+                    false,
+                )?;
+            }
+            let id = Uuid::now_v7();
+            imported.push(id);
+            spec.testing.tests.push(TestCaseSpecV2 {
+                id,
+                name: name.clone(),
+                role: inferred_role(&name),
+                origin: TestCaseOriginV2::Uploaded,
+                input_file: input,
+                answer_file: answer,
+                group_ids: group_ids.clone(),
+                points: None,
+                generated: None,
+            });
+        }
+        Ok(())
+    })?;
+    output.emit(
+        "test case import",
+        &serde_json::json!({ "imported_ids": imported, "tests": spec.testing.tests }),
+        &format!("Imported {} test case(s)", imported.len()),
+    )
+}
+
+fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
+    match command {
+        TestGroupCommand::List => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            output.emit(
+                "test group list",
+                &spec.testing.groups,
+                &format!("{} group(s)", spec.testing.groups.len()),
+            )
+        }
+        TestGroupCommand::Add(options) => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    validate_group_id(&options.id)?;
+                    ensure!(
+                        !spec
+                            .testing
+                            .groups
+                            .iter()
+                            .any(|group| group.name == options.id),
+                        "group already exists: {}",
+                        options.id
+                    );
+                    let depends_on = resolve_group_ids(spec, &options.depends_on)?;
+                    spec.testing.groups.push(TestGroupSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: options.id.clone(),
+                        points: options.points,
+                        depends_on,
+                        feedback_policy: studio_core::GroupFeedbackPolicyV1::Complete,
+                        aggregation: if spec.problem_type == studio_core::ProblemType::Scored {
+                            ScoreAggregationV2::GroupMinimum
+                        } else {
+                            ScoreAggregationV2::AllOrNothing
+                        },
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "test group add",
+                &spec.testing.groups,
+                &format!("Added group {}", options.id),
+            )
+        }
+        TestGroupCommand::Update(options) => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let current_id = find_group(spec, &options.id)?.id;
+                    let depends_on = if options.depends_on.is_empty() {
+                        None
+                    } else {
+                        let ids = resolve_group_ids(spec, &options.depends_on)?;
+                        ensure!(
+                            !ids.contains(&current_id),
+                            "a group cannot depend on itself"
+                        );
+                        Some(ids)
+                    };
+                    let group = spec
+                        .testing
+                        .groups
+                        .iter_mut()
+                        .find(|group| group.id == current_id)
+                        .context("group was not found")?;
+                    if let Some(points) = options.points {
+                        group.points = points;
+                    }
+                    if let Some(depends_on) = depends_on {
+                        group.depends_on = depends_on;
+                    }
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "test group update",
+                &spec.testing.groups,
+                &format!("Updated group {}", options.id),
+            )
+        }
+        TestGroupCommand::Remove { id } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let group_id = find_group(spec, &id)?.id;
+                    ensure!(
+                        !spec
+                            .testing
+                            .tests
+                            .iter()
+                            .any(|test| test.group_ids.contains(&group_id)),
+                        "group is still used by a test case"
+                    );
+                    ensure!(
+                        !spec
+                            .testing
+                            .groups
+                            .iter()
+                            .any(|group| group.depends_on.contains(&group_id)),
+                        "another group still depends on this group"
+                    );
+                    let before = spec.testing.groups.len();
+                    spec.testing.groups.retain(|group| group.id != group_id);
+                    ensure!(before != spec.testing.groups.len(), "group was not found");
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "test group remove",
+                &spec.testing.groups,
+                &format!("Removed group {id}"),
+            )
+        }
+    }
+}
+
+pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        GeneratorCommand::List => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            output.emit(
+                "generator list",
+                &spec.testing.generators,
+                &format!("{} generator(s)", spec.testing.generators.len()),
+            )
+        }
+        GeneratorCommand::Add(options) => {
+            let source = relative_string(&options.source)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .generators
+                            .iter()
+                            .any(|generator| generator.program.name == options.id),
+                        "generator already exists: {}",
+                        options.id
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&options.language),
+                        false,
+                    )?;
+                    spec.testing.generators.push(GeneratorSpecV2 {
+                        program: ProgramSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: normalize_name(&options.id)?,
+                            source_path: source.clone(),
+                            language: options.language.clone(),
+                            arguments: options.arguments.clone(),
+                        },
+                        recipes: Vec::new(),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "generator add",
+                &spec.testing.generators,
+                &format!("Added generator {}", options.id),
+            )
+        }
+        GeneratorCommand::Run(options) => {
+            let seed = options
+                .seed
+                .context("generator run requires --seed for deterministic replay")?;
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let group_ids = resolve_group_ids(&spec, &options.groups)?;
+            let generator = find_generator(&spec, &options.id)?.clone();
+            let path = relative_string(&options.output)?;
+            let name = normalize_name(options.name.as_deref().unwrap_or(&options.id))?;
+            ensure_unique_test_name(&spec, &name, None)?;
+            let run_options = options.runtime.into_run_options();
+            let program = legacy_program(&generator.program);
+            let bytes = materialize_generator(
+                &root,
+                &program,
+                &options.arguments,
+                Some(seed),
+                &run_options,
+            )
+            .await?;
+            write_project_bytes_atomic(&root, &path, &bytes)?;
+            let test_id = Uuid::now_v7();
+            let recipe_id = Uuid::now_v7();
+            let updated =
+                reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
+                    ensure_unique_test_name(spec, &name, None)?;
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &path,
+                        "text/plain",
+                        false,
+                    )?;
+                    let target = spec
+                        .testing
+                        .generators
+                        .iter_mut()
+                        .find(|candidate| candidate.program.id == generator.program.id)
+                        .context("generator was removed during materialization")?;
+                    target.recipes.push(GeneratorRecipeSpecV2 {
+                        id: recipe_id,
+                        name: format!("case-{name}"),
+                        argument_template: options.arguments.clone(),
+                        parameters: Default::default(),
+                        matrix: GeneratorMatrixStrategyV2::Cartesian,
+                        seed_start: seed,
+                        seed_step: 1,
+                        count: 1,
+                        group_ids: group_ids.clone(),
+                    });
+                    spec.testing.tests.push(TestCaseSpecV2 {
+                        id: test_id,
+                        name: name.clone(),
+                        role: inferred_role(&name),
+                        origin: TestCaseOriginV2::Generated,
+                        input_file: path.clone(),
+                        answer_file: None,
+                        group_ids: group_ids.clone(),
+                        points: None,
+                        generated: Some(GeneratedCaseRefV2 {
+                            generator_id: generator.program.id,
+                            recipe_id,
+                            ordinal: 0,
+                            seed,
+                        }),
+                    });
+                    Ok(())
+                })?;
+            let result = GeneratorMaterialization {
+                generator_id: generator.program.name,
+                test_ids: vec![test_id],
+                paths: vec![path],
+                sha256: vec![hex::encode(Sha256::digest(&bytes))],
+            };
+            output.emit(
+                "generator run",
+                &result,
+                &format!(
+                    "Generated {} ({test_id})",
+                    updated.testing.tests.last().unwrap().name
+                ),
+            )
+        }
+        GeneratorCommand::Recipe(options) => {
+            ensure!(
+                (1..=10_000).contains(&options.count),
+                "recipe count must be between 1 and 10000"
+            );
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let group_ids = resolve_group_ids(&spec, &options.groups)?;
+            let generator = find_generator(&spec, &options.id)?.clone();
+            let prefix = normalize_name(&options.name_prefix)?;
+            let directory = relative_string(&options.output_directory)?;
+            let run_options = options.runtime.into_run_options();
+            let program = legacy_program(&generator.program);
+            let recipe_id = Uuid::now_v7();
+            let mut materialized = Vec::with_capacity(options.count as usize);
+            for index in 0..options.count {
+                let seed = options
+                    .seed_start
+                    .checked_add(u64::from(index))
+                    .context("recipe seed range overflows u64")?;
+                let name = format!("{prefix}-{}", index + 1);
+                ensure_unique_test_name(&spec, &name, None)?;
+                let path = format!("{directory}/{}.in", index + 1);
+                let bytes = materialize_generator(
+                    &root,
+                    &program,
+                    &options.arguments,
+                    Some(seed),
+                    &run_options,
+                )
+                .await?;
+                materialized.push((Uuid::now_v7(), name, path, seed, bytes));
+            }
+            for (_, _, path, _, bytes) in &materialized {
+                write_project_bytes_atomic(&root, path, bytes)?;
+            }
+            reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
+                for (_, name, _, _, _) in &materialized {
+                    ensure_unique_test_name(spec, name, None)?;
+                }
+                let target = spec
+                    .testing
+                    .generators
+                    .iter_mut()
+                    .find(|candidate| candidate.program.id == generator.program.id)
+                    .context("generator was removed during materialization")?;
+                target.recipes.push(GeneratorRecipeSpecV2 {
+                    id: recipe_id,
+                    name: prefix.clone(),
+                    argument_template: options.arguments.clone(),
+                    parameters: Default::default(),
+                    matrix: GeneratorMatrixStrategyV2::Cartesian,
+                    seed_start: options.seed_start,
+                    seed_step: 1,
+                    count: options.count,
+                    group_ids: group_ids.clone(),
+                });
+                for (ordinal, (id, name, path, seed, _)) in materialized.iter().enumerate() {
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        path,
+                        "text/plain",
+                        false,
+                    )?;
+                    spec.testing.tests.push(TestCaseSpecV2 {
+                        id: *id,
+                        name: name.clone(),
+                        role: inferred_role(name),
+                        origin: TestCaseOriginV2::Generated,
+                        input_file: path.clone(),
+                        answer_file: None,
+                        group_ids: group_ids.clone(),
+                        points: None,
+                        generated: Some(GeneratedCaseRefV2 {
+                            generator_id: generator.program.id,
+                            recipe_id,
+                            ordinal: u32::try_from(ordinal)
+                                .context("recipe ordinal exceeds u32")?,
+                            seed: *seed,
+                        }),
+                    });
+                }
+                Ok(())
+            })?;
+            let result = GeneratorMaterialization {
+                generator_id: generator.program.name,
+                test_ids: materialized.iter().map(|entry| entry.0).collect(),
+                paths: materialized.iter().map(|entry| entry.2.clone()).collect(),
+                sha256: materialized
+                    .iter()
+                    .map(|entry| hex::encode(Sha256::digest(&entry.4)))
+                    .collect(),
+            };
+            output.emit(
+                "generator recipe",
+                &result,
+                &format!("Generated {} deterministic test case(s)", options.count),
+            )
+        }
+        GeneratorCommand::Remove { id } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let generator_id = find_generator(spec, &id)?.program.id;
+                    ensure!(
+                        !spec.testing.tests.iter().any(|test| test
+                            .generated
+                            .as_ref()
+                            .is_some_and(|generated| generated.generator_id == generator_id)),
+                        "generator is still used by a test case"
+                    );
+                    ensure!(
+                        !spec
+                            .testing
+                            .stress_suites
+                            .iter()
+                            .any(|suite| suite.generator_id == generator_id),
+                        "generator is still used by a stress suite"
+                    );
+                    let before = spec.testing.generators.len();
+                    spec.testing
+                        .generators
+                        .retain(|generator| generator.program.id != generator_id);
+                    ensure!(
+                        before != spec.testing.generators.len(),
+                        "generator was not found"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "generator remove",
+                &spec.testing.generators,
+                &format!("Removed generator {id}"),
+            )
+        }
+    }
+}
+
+pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        ValidatorCommand::Set {
+            source,
+            language,
+            extra,
+        } => {
+            let source = relative_string(&source)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&language),
+                        false,
+                    )?;
+                    let program = ProgramSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: if extra {
+                            format!("extra-{}", spec.testing.validators.extra.len() + 1)
+                        } else {
+                            "primary".into()
+                        },
+                        source_path: source.clone(),
+                        language: language.clone(),
+                        arguments: Vec::new(),
+                    };
+                    if extra {
+                        spec.testing.validators.extra.push(program);
+                    } else {
+                        spec.testing.validators.primary = Some(program);
+                    }
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "validator set",
+                &spec.testing.validators,
+                &format!("Configured validator {source}"),
+            )
+        }
+        ValidatorCommand::UnitAdd {
+            name,
+            input,
+            expected,
+        } => {
+            let input = relative_string(&input)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .validators
+                            .unit_tests
+                            .iter()
+                            .any(|unit| unit.name == name),
+                        "validator unit already exists: {name}"
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &input,
+                        "text/plain",
+                        false,
+                    )?;
+                    spec.testing
+                        .validators
+                        .unit_tests
+                        .push(ValidatorUnitSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: normalize_name(&name)?,
+                            input_file: input.clone(),
+                            expected_valid: matches!(expected, ValidityExpectation::Valid),
+                        });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "validator unit-add",
+                &spec.testing.validators.unit_tests,
+                &format!("Added validator unit {name}"),
+            )
+        }
+        ValidatorCommand::Run { name, runtime } => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let validators = spec
+                .testing
+                .validators
+                .primary
+                .iter()
+                .chain(spec.testing.validators.extra.iter())
+                .collect::<Vec<_>>();
+            ensure!(!validators.is_empty(), "no validator is configured");
+            let units = selected_by_name(
+                &spec.testing.validators.unit_tests,
+                name.as_deref(),
+                |unit| unit.name.as_str(),
+            )?;
+            ensure!(!units.is_empty(), "no validator unit tests are configured");
+            let run_options = runtime.into_run_options();
+            let mut cases = Vec::new();
+            for validator in validators {
+                for unit in &units {
+                    let result = reporch_cli::authoring_runtime::run_program(
+                        &reporch_cli::authoring_runtime::ProgramRequest {
+                            project_directory: &root,
+                            source_path: &validator.source_path,
+                            language: &validator.language,
+                            arguments: &validator.arguments,
+                            stdin_path: Some(&unit.input_file),
+                            options: &run_options,
+                        },
+                    )
+                    .await?;
+                    let actual_valid = result.exit_code == 0;
+                    cases.push(ProgramUnitResult {
+                        program: validator.name.clone(),
+                        name: unit.name.clone(),
+                        expected: if unit.expected_valid {
+                            "valid"
+                        } else {
+                            "invalid"
+                        },
+                        actual: if actual_valid { "valid" } else { "invalid" },
+                        passed: actual_valid == unit.expected_valid,
+                        exit_code: result.exit_code,
+                        duration_ms: result.duration_ms,
+                        stderr: result.stderr,
+                    });
+                }
+            }
+            emit_unit_report("validator run", cases, output)
+        }
+    }
+}
+
+pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        CheckerCommand::ListStandard => output.emit(
+            "checker list-standard",
+            &["exact", "token", "case-insensitive", "floating", "custom"],
+            "exact, token, case-insensitive, floating, custom",
+        ),
+        CheckerCommand::Set {
+            kind,
+            source,
+            language,
+            absolute_error,
+            relative_error,
+        } => {
+            let source = source.as_deref().map(relative_string).transpose()?;
+            let checker = match kind {
+                CheckerKind::Exact => CheckerSpec::Exact,
+                CheckerKind::Token => CheckerSpec::Token,
+                CheckerKind::CaseInsensitive => CheckerSpec::CaseInsensitive,
+                CheckerKind::Floating => CheckerSpec::Floating {
+                    absolute_error: absolute_error.context("--absolute-error is required")?,
+                    relative_error: relative_error.context("--relative-error is required")?,
+                },
+                CheckerKind::Custom => CheckerSpec::Custom {
+                    source_path: source.clone().context("--source is required")?,
+                    language: language.clone().context("--language is required")?,
+                },
+            };
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    if let (Some(source), Some(language)) = (&source, &language) {
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            source,
+                            source_media_type(language),
+                            false,
+                        )?;
+                    }
+                    spec.testing.checker.checker = checker.clone();
+                    Ok(())
+                },
+            )?;
+            output.emit("checker set", &spec.testing.checker, "Configured checker")
+        }
+        CheckerCommand::UnitAdd {
+            name,
+            input,
+            answer,
+            output: actual_output,
+            expected,
+        } => {
+            let input = relative_string(&input)?;
+            let answer = relative_string(&answer)?;
+            let actual_output = relative_string(&actual_output)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .checker
+                            .unit_tests
+                            .iter()
+                            .any(|unit| unit.name == name),
+                        "checker unit already exists: {name}"
+                    );
+                    for path in [&input, &answer, &actual_output] {
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            path,
+                            "text/plain",
+                            false,
+                        )?;
+                    }
+                    spec.testing.checker.unit_tests.push(CheckerUnitSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: normalize_name(&name)?,
+                        input_file: input.clone(),
+                        answer_file: answer.clone(),
+                        output_file: actual_output.clone(),
+                        expected_accepted: matches!(expected, CheckerExpectation::Accept),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "checker unit-add",
+                &spec.testing.checker.unit_tests,
+                &format!("Added checker unit {name}"),
+            )
+        }
+        CheckerCommand::Run { name, runtime } => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let units =
+                selected_by_name(&spec.testing.checker.unit_tests, name.as_deref(), |unit| {
+                    unit.name.as_str()
+                })?;
+            ensure!(!units.is_empty(), "no checker unit tests are configured");
+            let run_options = runtime.into_run_options();
+            let mut cases = Vec::new();
+            for unit in units {
+                let (actual_accepted, exit_code, duration_ms, stderr) =
+                    if let CheckerSpec::Custom {
+                        source_path,
+                        language,
+                    } = &spec.testing.checker.checker
+                    {
+                        let arguments = vec![
+                            unit.input_file.clone(),
+                            unit.output_file.clone(),
+                            unit.answer_file.clone(),
+                        ];
+                        let result = reporch_cli::authoring_runtime::run_program(
+                            &reporch_cli::authoring_runtime::ProgramRequest {
+                                project_directory: &root,
+                                source_path,
+                                language,
+                                arguments: &arguments,
+                                stdin_path: None,
+                                options: &run_options,
+                            },
+                        )
+                        .await?;
+                        (
+                            result.exit_code == 0,
+                            result.exit_code,
+                            result.duration_ms,
+                            result.stderr,
+                        )
+                    } else {
+                        let answer = read_project_bytes(&root, &unit.answer_file)?;
+                        let actual = read_project_bytes(&root, &unit.output_file)?;
+                        (
+                            reporch_cli::authoring_runtime::standard_checker_matches(
+                                &spec.testing.checker.checker,
+                                &answer,
+                                &actual,
+                            )?,
+                            0,
+                            0,
+                            String::new(),
+                        )
+                    };
+                cases.push(ProgramUnitResult {
+                    program: "checker".into(),
+                    name: unit.name.clone(),
+                    expected: if unit.expected_accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    actual: if actual_accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    passed: actual_accepted == unit.expected_accepted,
+                    exit_code,
+                    duration_ms,
+                    stderr,
+                });
+            }
+            emit_unit_report("checker run", cases, output)
+        }
+    }
+}
+
+pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        SolutionCommand::List => emit_solutions("solution list", output),
+        SolutionCommand::Matrix => emit_solutions("solution matrix", output),
+        SolutionCommand::Add(options) => {
+            let source = relative_string(&options.source)?;
+            let expected_score = score_range(
+                options.minimum_score,
+                options.maximum_score,
+                options.expected,
+            )?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .solutions
+                            .iter()
+                            .any(|solution| solution.program.name == options.name),
+                        "solution already exists: {}",
+                        options.name
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&options.language),
+                        false,
+                    )?;
+                    let expected_verdict = options.expected.into();
+                    let role = match expected_verdict {
+                        studio_core::ExpectedVerdict::Accepted
+                            if !spec
+                                .testing
+                                .solutions
+                                .iter()
+                                .any(|solution| solution.role == SolutionRoleV2::Reference) =>
+                        {
+                            SolutionRoleV2::Reference
+                        }
+                        studio_core::ExpectedVerdict::WrongAnswer => SolutionRoleV2::KnownWrong,
+                        _ => SolutionRoleV2::Alternative,
+                    };
+                    spec.testing.solutions.push(SolutionSpecV2 {
+                        program: ProgramSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: normalize_name(&options.name)?,
+                            source_path: source.clone(),
+                            language: options.language.clone(),
+                            arguments: Vec::new(),
+                        },
+                        role,
+                        expected_verdict,
+                        expected_score: expected_score.clone(),
+                        group_expectations: Vec::new(),
+                        tags: Vec::new(),
+                        notes: String::new(),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "solution add",
+                &spec.testing.solutions,
+                &format!("Added solution {}", options.name),
+            )
+        }
+        SolutionCommand::Update(options) => {
+            let expected_score = match options.expected {
+                Some(expected) => {
+                    score_range(options.minimum_score, options.maximum_score, expected)?
+                }
+                None => None,
+            };
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let solution = spec
+                        .testing
+                        .solutions
+                        .iter_mut()
+                        .find(|solution| solution.program.name == options.name)
+                        .context("solution was not found")?;
+                    if let Some(expected) = options.expected {
+                        solution.expected_verdict = expected.into();
+                        solution.expected_score = expected_score.clone();
+                    }
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "solution update",
+                &spec.testing.solutions,
+                &format!("Updated solution {}", options.name),
+            )
+        }
+        SolutionCommand::Remove { name } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let solution_id = find_solution(spec, &name)?.program.id;
+                    ensure!(
+                        !spec.testing.stress_suites.iter().any(|suite| {
+                            suite.oracle_solution_id == solution_id
+                                || suite.candidate_solution_ids.contains(&solution_id)
+                        }),
+                        "solution is still used by a stress suite"
+                    );
+                    ensure!(
+                        !spec
+                            .execution
+                            .interactive
+                            .iter()
+                            .flat_map(|interactive| interactive.unit_tests.iter())
+                            .any(|unit| unit.solution_id == solution_id),
+                        "solution is still used by an interactive unit"
+                    );
+                    let before = spec.testing.solutions.len();
+                    spec.testing
+                        .solutions
+                        .retain(|solution| solution.program.id != solution_id);
+                    ensure!(
+                        before != spec.testing.solutions.len(),
+                        "solution was not found"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "solution remove",
+                &spec.testing.solutions,
+                &format!("Removed solution {name}"),
+            )
+        }
+    }
+}
+
+fn emit_solutions(command: &'static str, output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    output.emit(
+        command,
+        &spec.testing.solutions,
+        &format!("{} solution expectation(s)", spec.testing.solutions.len()),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedAnswerResult {
+    test_id: Uuid,
+    test_name: String,
+    path: String,
+    sha256: String,
+}
+
+pub(super) async fn answer(options: AnswerOptions, output: &CliOutput) -> Result<()> {
+    let AnswerCommand::Generate {
+        solution,
+        test,
+        missing_only,
+        runtime,
+    } = options.command;
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let solution = find_solution(&spec, &solution)?.clone();
+    ensure!(
+        solution.expected_verdict == studio_core::ExpectedVerdict::Accepted
+            && matches!(
+                solution.role,
+                SolutionRoleV2::Reference | SolutionRoleV2::Oracle
+            ),
+        "answer generation requires an accepted reference or oracle solution"
+    );
+    let selected = spec
+        .testing
+        .tests
+        .iter()
+        .filter(|candidate| test.is_none_or(|test| candidate.id == test))
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(!selected.is_empty(), "no matching test case was found");
+    let run_options = runtime.into_run_options();
+    let mut generated = Vec::new();
+    for test in selected {
+        if test.answer_file.is_some() {
+            ensure!(
+                missing_only,
+                "test {} already has an answer file; use --missing-only to skip it",
+                test.name
+            );
+            continue;
+        }
+        let answer_path = answer_path_for(&test.input_file)?;
+        let result = reporch_cli::authoring_runtime::run_program(
+            &reporch_cli::authoring_runtime::ProgramRequest {
+                project_directory: &root,
+                source_path: &solution.program.source_path,
+                language: &solution.program.language,
+                arguments: &solution.program.arguments,
+                stdin_path: Some(&test.input_file),
+                options: &run_options,
+            },
+        )
+        .await?;
+        ensure!(
+            result.exit_code == 0,
+            "reference solution failed on {} with exit {}: {}",
+            test.name,
+            result.exit_code,
+            result.stderr.trim()
+        );
+        generated.push((test, answer_path, result.stdout_bytes));
+    }
+    for (_, path, bytes) in &generated {
+        write_project_bytes_atomic(&root, path, bytes)?;
+    }
+    reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
+        for (test, path, _) in &generated {
+            reporch_cli::local_project_v2::declare_project_file(
+                root,
+                spec,
+                path,
+                "text/plain",
+                false,
+            )?;
+            let target = spec
+                .testing
+                .tests
+                .iter_mut()
+                .find(|candidate| candidate.id == test.id)
+                .context("test disappeared while saving generated answers")?;
+            target.answer_file = Some(path.clone());
+        }
+        Ok(())
+    })?;
+    let results = generated
+        .into_iter()
+        .map(|(test, path, bytes)| GeneratedAnswerResult {
+            test_id: test.id,
+            test_name: test.name,
+            path,
+            sha256: hex::encode(Sha256::digest(bytes)),
+        })
+        .collect::<Vec<_>>();
+    output.emit(
+        "answer generate",
+        &results,
+        &format!("Generated {} answer file(s)", results.len()),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct StressCandidateResult {
+    candidate: String,
+    expected_counterexample: bool,
+    counterexample_seed: Option<u64>,
+    input_path: Option<String>,
+    passed: bool,
+}
+
+pub(super) async fn stress(options: StressOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        StressCommand::List => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            output.emit(
+                "stress list",
+                &spec.testing.stress_suites,
+                &format!("{} stress suite(s)", spec.testing.stress_suites.len()),
+            )
+        }
+        StressCommand::Add {
+            name,
+            generator,
+            recipe,
+            oracle,
+            candidates,
+            seed_start,
+            cases,
+            timeout_ms,
+            minimize_failure,
+        } => {
+            ensure!(
+                (1..=100_000).contains(&cases),
+                "cases must be between 1 and 100000"
+            );
+            ensure!(
+                (10..=600_000).contains(&timeout_ms),
+                "timeout must be between 10 and 600000 ms"
+            );
+            let normalized_name = normalize_name(&name)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .stress_suites
+                            .iter()
+                            .any(|suite| suite.name == normalized_name),
+                        "stress suite already exists: {normalized_name}"
+                    );
+                    let generator = find_generator(spec, &generator)?;
+                    let recipe_id = Uuid::parse_str(&recipe).ok();
+                    let recipe = generator
+                        .recipes
+                        .iter()
+                        .find(|candidate| {
+                            candidate.name == recipe || recipe_id == Some(candidate.id)
+                        })
+                        .with_context(|| format!("generator recipe was not found: {recipe}"))?;
+                    let oracle = find_solution(spec, &oracle)?;
+                    ensure!(
+                        oracle.expected_verdict == studio_core::ExpectedVerdict::Accepted,
+                        "stress oracle must be expected accepted"
+                    );
+                    let candidate_ids = candidates
+                        .iter()
+                        .map(|candidate| Ok(find_solution(spec, candidate)?.program.id))
+                        .collect::<Result<Vec<_>>>()?;
+                    ensure!(
+                        !candidate_ids.contains(&oracle.program.id),
+                        "the oracle cannot also be a stress candidate"
+                    );
+                    let mut unique = std::collections::BTreeSet::new();
+                    ensure!(
+                        candidate_ids.iter().all(|id| unique.insert(*id)),
+                        "stress candidates must be unique"
+                    );
+                    spec.testing.stress_suites.push(StressSuiteSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: normalized_name.clone(),
+                        generator_id: generator.program.id,
+                        recipe_id: recipe.id,
+                        oracle_solution_id: oracle.program.id,
+                        candidate_solution_ids: candidate_ids,
+                        seed_start,
+                        cases,
+                        timeout_ms,
+                        minimize_failure,
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "stress add",
+                &spec.testing.stress_suites,
+                &format!("Added stress suite {normalized_name}"),
+            )
+        }
+        StressCommand::Remove { name } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let parsed = Uuid::parse_str(&name).ok();
+                    let before = spec.testing.stress_suites.len();
+                    spec.testing
+                        .stress_suites
+                        .retain(|suite| suite.name != name && parsed != Some(suite.id));
+                    ensure!(
+                        before != spec.testing.stress_suites.len(),
+                        "stress suite was not found"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "stress remove",
+                &spec.testing.stress_suites,
+                &format!("Removed stress suite {name}"),
+            )
+        }
+        StressCommand::Run { name, runtime } => run_stress_suite(&name, runtime, output).await,
+    }
+}
+
+async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let parsed = Uuid::parse_str(name).ok();
+    let suite = spec
+        .testing
+        .stress_suites
+        .iter()
+        .find(|suite| suite.name == name || parsed == Some(suite.id))
+        .with_context(|| format!("stress suite was not found: {name}"))?
+        .clone();
+    let generator = spec
+        .testing
+        .generators
+        .iter()
+        .find(|generator| generator.program.id == suite.generator_id)
+        .context("stress generator is missing")?;
+    let recipe = generator
+        .recipes
+        .iter()
+        .find(|recipe| recipe.id == suite.recipe_id)
+        .context("stress generator recipe is missing")?;
+    let oracle = spec
+        .testing
+        .solutions
+        .iter()
+        .find(|solution| solution.program.id == suite.oracle_solution_id)
+        .context("stress oracle is missing")?;
+    let candidates = suite
+        .candidate_solution_ids
+        .iter()
+        .map(|id| {
+            spec.testing
+                .solutions
+                .iter()
+                .find(|solution| solution.program.id == *id)
+                .context("stress candidate is missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut run_options = runtime.into_run_options();
+    run_options.timeout = std::time::Duration::from_millis(suite.timeout_ms);
+    let scratch_parent = root.join(".reporch").join("stress-tmp");
+    fs::create_dir_all(&scratch_parent)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(&scratch_parent)?;
+    let mut first_mismatch =
+        std::collections::BTreeMap::<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>::new();
+    for ordinal in 0..suite.cases {
+        let seed = suite
+            .seed_start
+            .checked_add(u64::from(ordinal))
+            .context("stress seed range overflows u64")?;
+        let input = materialize_generator(
+            &root,
+            &legacy_program(&generator.program),
+            &recipe.argument_template,
+            Some(seed),
+            &run_options,
+        )
+        .await?;
+        let input_path = scratch.path().join(format!("{seed}.in"));
+        fs::write(&input_path, &input)?;
+        let input_relative = input_path
+            .strip_prefix(&root)?
+            .to_str()
+            .context("stress scratch path is not valid Unicode")?
+            .to_owned();
+        let oracle_result = run_solution(&root, oracle, &input_relative, &run_options).await?;
+        ensure!(
+            oracle_result.exit_code == 0,
+            "stress oracle failed for seed {seed}: {}",
+            oracle_result.stderr.trim()
+        );
+        for candidate in &candidates {
+            if first_mismatch.contains_key(&candidate.program.id) {
+                continue;
+            }
+            let candidate_result =
+                run_solution(&root, candidate, &input_relative, &run_options).await?;
+            let matches = candidate_result.exit_code == 0
+                && stress_outputs_match(
+                    &root,
+                    scratch.path(),
+                    &input_relative,
+                    seed,
+                    candidate,
+                    &spec.testing.checker.checker,
+                    &oracle_result.stdout_bytes,
+                    &candidate_result.stdout_bytes,
+                    &run_options,
+                )
+                .await?;
+            if !matches {
+                let (input, oracle_output, candidate_output) = if suite.minimize_failure {
+                    minimize_counterexample(
+                        &root,
+                        scratch.path(),
+                        seed,
+                        candidate,
+                        oracle,
+                        &spec.testing.checker.checker,
+                        input.clone(),
+                        oracle_result.stdout_bytes.clone(),
+                        candidate_result.stdout_bytes,
+                        &run_options,
+                    )
+                    .await?
+                } else {
+                    (
+                        input.clone(),
+                        oracle_result.stdout_bytes.clone(),
+                        candidate_result.stdout_bytes,
+                    )
+                };
+                first_mismatch.insert(
+                    candidate.program.id,
+                    (seed, input, oracle_output, candidate_output),
+                );
+            }
+        }
+    }
+    let mut results = Vec::new();
+    for candidate in candidates {
+        let mismatch = first_mismatch.remove(&candidate.program.id);
+        let expected_counterexample =
+            candidate.expected_verdict != studio_core::ExpectedVerdict::Accepted;
+        let passed = mismatch.is_some() == expected_counterexample;
+        let (counterexample_seed, input_path) =
+            if let Some((seed, input, oracle, actual)) = mismatch {
+                let base = format!("stress-failures/{}-{seed}", suite.name);
+                write_project_bytes_once_or_same(&root, &format!("{base}.in"), &input)?;
+                write_project_bytes_once_or_same(&root, &format!("{base}.oracle"), &oracle)?;
+                write_project_bytes_once_or_same(
+                    &root,
+                    &format!("{base}.{}.out", candidate.program.name),
+                    &actual,
+                )?;
+                (Some(seed), Some(format!("{base}.in")))
+            } else {
+                (None, None)
+            };
+        results.push(StressCandidateResult {
+            candidate: candidate.program.name.clone(),
+            expected_counterexample,
+            counterexample_seed,
+            input_path,
+            passed,
+        });
+    }
+    ensure!(
+        results.iter().all(|result| result.passed),
+        "stress expectations failed: {}",
+        serde_json::to_string(&results)?
+    );
+    output.emit(
+        "stress run",
+        &results,
+        &format!(
+            "Stress suite {} passed {} candidate(s)",
+            suite.name,
+            results.len()
+        ),
+    )
+}
+
+async fn run_solution(
+    root: &Path,
+    solution: &SolutionSpecV2,
+    input_path: &str,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<reporch_cli::local_sandbox::LocalSandboxResult> {
+    reporch_cli::authoring_runtime::run_program(&reporch_cli::authoring_runtime::ProgramRequest {
+        project_directory: root,
+        source_path: &solution.program.source_path,
+        language: &solution.program.language,
+        arguments: &solution.program.arguments,
+        stdin_path: Some(input_path),
+        options,
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stress_outputs_match(
+    root: &Path,
+    scratch: &Path,
+    input_path: &str,
+    seed: u64,
+    candidate: &SolutionSpecV2,
+    checker: &CheckerSpec,
+    oracle_output: &[u8],
+    candidate_output: &[u8],
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<bool> {
+    let CheckerSpec::Custom {
+        source_path,
+        language,
+    } = checker
+    else {
+        return reporch_cli::authoring_runtime::standard_checker_matches(
+            checker,
+            oracle_output,
+            candidate_output,
+        );
+    };
+    let oracle_path = scratch.join(format!("{seed}.oracle"));
+    let candidate_path = scratch.join(format!("{seed}.{}.out", candidate.program.id));
+    fs::write(&oracle_path, oracle_output)?;
+    fs::write(&candidate_path, candidate_output)?;
+    let relative = |path: &Path| -> Result<String> {
+        Ok(path
+            .strip_prefix(root)?
+            .to_str()
+            .context("stress checker scratch path is not valid Unicode")?
+            .to_owned())
+    };
+    let arguments = vec![
+        input_path.to_owned(),
+        relative(&candidate_path)?,
+        relative(&oracle_path)?,
+    ];
+    let result = reporch_cli::authoring_runtime::run_program(
+        &reporch_cli::authoring_runtime::ProgramRequest {
+            project_directory: root,
+            source_path,
+            language,
+            arguments: &arguments,
+            stdin_path: None,
+            options,
+        },
+    )
+    .await?;
+    Ok(result.exit_code == 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn minimize_counterexample(
+    root: &Path,
+    scratch: &Path,
+    seed: u64,
+    candidate: &SolutionSpecV2,
+    oracle: &SolutionSpecV2,
+    checker: &CheckerSpec,
+    input: Vec<u8>,
+    oracle_output: Vec<u8>,
+    candidate_output: Vec<u8>,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let mut lines = input
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if lines.len() <= 1 {
+        return Ok((input, oracle_output, candidate_output));
+    }
+    let mut best_outputs = (oracle_output, candidate_output);
+    let mut attempts = 0_u32;
+    let mut index = lines.len();
+    while index > 0 && attempts < 64 && lines.len() > 1 {
+        index -= 1;
+        let candidate_input = lines
+            .iter()
+            .enumerate()
+            .filter(|(line_index, _)| *line_index != index)
+            .flat_map(|(_, line)| line.iter().copied())
+            .collect::<Vec<_>>();
+        attempts += 1;
+        if let Some(outputs) = evaluate_counterexample(
+            root,
+            scratch,
+            seed,
+            candidate,
+            oracle,
+            checker,
+            &candidate_input,
+            options,
+        )
+        .await?
+        {
+            lines.remove(index);
+            best_outputs = outputs;
+            index = lines.len();
+        }
+    }
+    Ok((
+        lines.into_iter().flatten().collect(),
+        best_outputs.0,
+        best_outputs.1,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_counterexample(
+    root: &Path,
+    scratch: &Path,
+    seed: u64,
+    candidate: &SolutionSpecV2,
+    oracle: &SolutionSpecV2,
+    checker: &CheckerSpec,
+    input: &[u8],
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let input_path = scratch.join(format!("{seed}.min.in"));
+    fs::write(&input_path, input)?;
+    let input_relative = input_path
+        .strip_prefix(root)?
+        .to_str()
+        .context("minimized stress path is not valid Unicode")?
+        .to_owned();
+    let oracle_result = run_solution(root, oracle, &input_relative, options).await?;
+    if oracle_result.exit_code != 0 {
+        return Ok(None);
+    }
+    let candidate_result = run_solution(root, candidate, &input_relative, options).await?;
+    let matches = candidate_result.exit_code == 0
+        && stress_outputs_match(
+            root,
+            scratch,
+            &input_relative,
+            seed,
+            candidate,
+            checker,
+            &oracle_result.stdout_bytes,
+            &candidate_result.stdout_bytes,
+            options,
+        )
+        .await?;
+    Ok((!matches).then_some((oracle_result.stdout_bytes, candidate_result.stdout_bytes)))
+}
+
+fn answer_path_for(input: &str) -> Result<String> {
+    let path = Path::new(input);
+    let answer = if path.extension().is_some_and(|extension| extension == "in") {
+        path.with_extension("ans")
+    } else {
+        PathBuf::from(format!("{input}.ans"))
+    };
+    relative_string(&answer)
+}
+
+fn write_project_bytes_once_or_same(root: &Path, path: &str, bytes: &[u8]) -> Result<()> {
+    match read_project_bytes(root, path) {
+        Ok(existing) => ensure!(
+            existing == bytes,
+            "existing stress artifact differs: {path}"
+        ),
+        Err(_) => write_project_bytes_atomic(root, path, bytes)?,
+    }
+    Ok(())
+}
+
+pub(super) async fn interactor(options: InteractorOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        InteractorCommand::Set { source, language } => {
+            let source = relative_string(&source)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        spec.problem_type == ProblemType::Interactive,
+                        "interactor can only be configured for an interactive problem"
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&language),
+                        false,
+                    )?;
+                    spec.execution.interactive = Some(InteractiveSpecV2 {
+                        interactor: ProgramSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: "interactor".into(),
+                            source_path: source.clone(),
+                            language: language.clone(),
+                            arguments: Vec::new(),
+                        },
+                        idle_timeout_ms: 2_000,
+                        transcript_limit_kib: 1_024,
+                        unit_tests: Vec::new(),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "interactor set",
+                &spec.execution.interactive,
+                "Configured interactor",
+            )
+        }
+        InteractorCommand::Run(options) => run_interactor(options, false, output).await,
+        InteractorCommand::Transcript(options) => run_interactor(options, true, output).await,
+    }
+}
+
+async fn run_interactor(
+    options: RuntimeProgramRunOptions,
+    transcript: bool,
+    output: &CliOutput,
+) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let interactive = spec
+        .execution
+        .interactive
+        .as_ref()
+        .context("no interactor is configured")?;
+    let solution = find_solution(&spec, &options.solution)?;
+    let test = spec
+        .testing
+        .tests
+        .iter()
+        .find(|test| test.id == options.test)
+        .with_context(|| format!("test case was not found: {}", options.test))?;
+    let run_options = options.runtime.into_run_options();
+    let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
+        run_options.toolchain_id.as_deref(),
+        &interactive.interactor.language,
+    )?;
+    let solution_toolchain = reporch_cli::toolchain::resolve_for_language(
+        run_options.toolchain_id.as_deref(),
+        &solution.program.language,
+    )?;
+    ensure!(
+        interactor_toolchain.language == solution_toolchain.language,
+        "local interactive pairing requires matching toolchain languages; use Studio verification for cross-language pairing"
+    );
+    let result = reporch_cli::authoring_runtime::run_interactive_pair(
+        &reporch_cli::authoring_runtime::InteractivePairRequest {
+            project_directory: &root,
+            solver_source_path: &solution.program.source_path,
+            interactor_source_path: &interactive.interactor.source_path,
+            language: &interactive.interactor.language,
+            input_path: &test.input_file,
+            options: &run_options,
+        },
+    )
+    .await?;
+    if let Some(path) = options.output.as_deref() {
+        let path = relative_string(path)?;
+        write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
+    }
+    let expected_accepted = solution.expected_verdict == studio_core::ExpectedVerdict::Accepted;
+    let report = RuntimeProgramReport {
+        solution: solution.program.name.clone(),
+        test_id: test.id,
+        expected: if expected_accepted {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        actual: if result.exit_code == 0 {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        passed: (result.exit_code == 0) == expected_accepted,
+        exit_code: result.exit_code,
+        duration_ms: result.duration_ms,
+        transcript: transcript.then_some(result.stdout),
+        stderr: result.stderr,
+    };
+    ensure!(
+        report.passed,
+        "interactive validation did not pass: expected {}, got {}",
+        report.expected,
+        report.actual
+    );
+    output.emit(
+        if transcript {
+            "interactor transcript"
+        } else {
+            "interactor run"
+        },
+        &report,
+        if transcript {
+            report.transcript.as_deref().unwrap_or("")
+        } else {
+            "Interactive run matched the expected verdict"
+        },
+    )
+}
+
+pub(super) async fn grader(options: GraderOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        GraderCommand::Set { source, language } => {
+            let source = relative_string(&source)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        matches!(
+                            spec.problem_type,
+                            ProblemType::Library | ProblemType::Grader
+                        ),
+                        "grader can only be configured for a library or grader problem"
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&language),
+                        false,
+                    )?;
+                    let kind = if spec.problem_type == ProblemType::Library {
+                        HarnessKindV2::Library
+                    } else {
+                        HarnessKindV2::Grader
+                    };
+                    let harness = spec.execution.harness.get_or_insert_with(|| HarnessSpecV2 {
+                        kind,
+                        interface_files: Vec::new(),
+                        public_files: Vec::new(),
+                        private_files: Vec::new(),
+                        stub_templates: Default::default(),
+                        profiles: Default::default(),
+                    });
+                    harness.kind = kind;
+                    if !harness.private_files.contains(&source) {
+                        harness.private_files.push(source.clone());
+                    }
+                    harness.profiles.insert(
+                        language.clone(),
+                        HarnessProfileSpecV2 {
+                            language: language.clone(),
+                            source_path: source.clone(),
+                            asset_paths: vec![source.clone()],
+                            include_dirs: Vec::new(),
+                            compile_script: None,
+                            run_script: None,
+                            compile_command: None,
+                            run_command: None,
+                        },
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit("grader set", &spec.execution.harness, "Configured grader")
+        }
+        GraderCommand::Run(options) => run_grader(options, output).await,
+    }
+}
+
+async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let harness = spec
+        .execution
+        .harness
+        .as_ref()
+        .context("no grader is configured")?;
+    let solution = find_solution(&spec, &options.solution)?;
+    let profile = harness
+        .profiles
+        .get(&solution.program.language)
+        .or_else(|| harness.profiles.values().next())
+        .context("configured grader has no language profile")?;
+    ensure!(
+        reporch_cli::toolchain::resolve_for_language(None, &profile.language)?.language
+            == reporch_cli::toolchain::resolve_for_language(None, &solution.program.language)?
+                .language,
+        "local grader linking requires the solution and grader to use the same C or C++ toolchain"
+    );
+    let test = spec
+        .testing
+        .tests
+        .iter()
+        .find(|test| test.id == options.test)
+        .with_context(|| format!("test case was not found: {}", options.test))?;
+    let answer_path = test
+        .answer_file
+        .as_deref()
+        .context("grader test has no answer file")?;
+    let run_options = options.runtime.into_run_options();
+    let result = reporch_cli::authoring_runtime::run_linked_pair(
+        &reporch_cli::authoring_runtime::LinkedPairRequest {
+            project_directory: &root,
+            first_source_path: &solution.program.source_path,
+            second_source_path: &profile.source_path,
+            language: &profile.language,
+            stdin_path: &test.input_file,
+            options: &run_options,
+        },
+    )
+    .await?;
+    let actual_accepted = if result.exit_code == 0 {
+        checker_accepts_bytes(
+            &root,
+            &spec.testing.checker.checker,
+            &test.input_file,
+            answer_path,
+            &result.stdout_bytes,
+            &run_options,
+        )
+        .await?
+    } else {
+        false
+    };
+    if let Some(path) = options.output.as_deref() {
+        let path = relative_string(path)?;
+        write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
+    }
+    let expected_accepted = solution.expected_verdict == studio_core::ExpectedVerdict::Accepted;
+    let report = RuntimeProgramReport {
+        solution: solution.program.name.clone(),
+        test_id: test.id,
+        expected: if expected_accepted {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        actual: if actual_accepted {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        passed: actual_accepted == expected_accepted,
+        exit_code: result.exit_code,
+        duration_ms: result.duration_ms,
+        transcript: None,
+        stderr: result.stderr,
+    };
+    ensure!(
+        report.passed,
+        "grader validation did not pass: expected {}, got {}",
+        report.expected,
+        report.actual
+    );
+    output.emit(
+        "grader run",
+        &report,
+        "Grader run matched the expected verdict",
+    )
+}
+
+pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        OutputCommand::List => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            output.emit(
+                "output list",
+                &spec.output_submissions,
+                &format!("{} output submission(s)", spec.output_submissions.len()),
+            )
+        }
+        OutputCommand::Add {
+            name,
+            expected,
+            mappings,
+            minimum_score,
+            maximum_score,
+        } => {
+            ensure!(!mappings.is_empty(), "at least one --map is required");
+            let expected_score = score_range(minimum_score, maximum_score, expected)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .output_submissions
+                            .iter()
+                            .any(|submission| submission.name == name),
+                        "output submission already exists: {name}"
+                    );
+                    let mut outputs = std::collections::BTreeMap::new();
+                    for (test_id, path) in &mappings {
+                        ensure!(
+                            spec.testing.tests.iter().any(|test| test.id == *test_id),
+                            "unknown test case: {test_id}"
+                        );
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            path,
+                            "text/plain",
+                            false,
+                        )?;
+                        ensure!(
+                            outputs.insert(*test_id, path.clone()).is_none(),
+                            "duplicate test mapping: {test_id}"
+                        );
+                    }
+                    spec.output_submissions.push(OutputSubmissionSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: normalize_name(&name)?,
+                        outputs,
+                        expected_verdict: expected.into(),
+                        expected_score: expected_score.clone(),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "output add",
+                &spec.output_submissions,
+                &format!("Added output submission {name}"),
+            )
+        }
+        OutputCommand::Remove { name } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let before = spec.output_submissions.len();
+                    spec.output_submissions
+                        .retain(|submission| submission.name != name);
+                    ensure!(
+                        before != spec.output_submissions.len(),
+                        "output submission was not found"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "output remove",
+                &spec.output_submissions,
+                &format!("Removed output submission {name}"),
+            )
+        }
+        OutputCommand::Test { name, runtime } => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let submissions =
+                selected_by_name(&spec.output_submissions, name.as_deref(), |submission| {
+                    submission.name.as_str()
+                })?;
+            ensure!(
+                !submissions.is_empty(),
+                "no output submissions are configured"
+            );
+            let run_options = runtime.into_run_options();
+            let mut reports = Vec::new();
+            for submission in submissions {
+                let mut cases = Vec::new();
+                for test in &spec.testing.tests {
+                    let actual_path = submission.outputs.get(&test.id).with_context(|| {
+                        format!(
+                            "output submission {} has no mapping for test {}",
+                            submission.name, test.id
+                        )
+                    })?;
+                    let answer_path = test
+                        .answer_file
+                        .as_deref()
+                        .context("output-only test has no answer file")?;
+                    let accepted = checker_accepts_path(
+                        &root,
+                        &spec.testing.checker.checker,
+                        &test.input_file,
+                        answer_path,
+                        actual_path,
+                        &run_options,
+                    )
+                    .await?;
+                    cases.push(OutputCaseResult {
+                        test_id: test.id,
+                        name: test.name.clone(),
+                        accepted,
+                    });
+                }
+                let score = output_score(&spec.testing.groups, &spec.testing.tests, &cases)?;
+                let actual_verdict = if cases.iter().all(|case| case.accepted) {
+                    studio_core::ExpectedVerdict::Accepted
+                } else if score > 0.0 {
+                    studio_core::ExpectedVerdict::Partial
+                } else {
+                    studio_core::ExpectedVerdict::WrongAnswer
+                };
+                let score_matches = submission
+                    .expected_score
+                    .as_ref()
+                    .is_none_or(|range| score >= range.minimum && score <= range.maximum);
+                reports.push(OutputSubmissionResult {
+                    name: submission.name.clone(),
+                    expected: verdict_name(submission.expected_verdict),
+                    actual: verdict_name(actual_verdict),
+                    score,
+                    passed: actual_verdict == submission.expected_verdict && score_matches,
+                    cases,
+                });
+            }
+            let report = OutputTestReport {
+                passed: reports.iter().all(|report| report.passed),
+                submissions: reports,
+            };
+            ensure!(
+                report.passed,
+                "output validation did not pass: one or more submissions disagreed with the expected verdict"
+            );
+            output.emit(
+                "output test",
+                &report,
+                "All output submissions matched their expected verdicts",
+            )
+        }
+    }
+}
+
+fn output_score(
+    groups: &[TestGroupSpecV2],
+    tests: &[TestCaseSpecV2],
+    cases: &[OutputCaseResult],
+) -> Result<f64> {
+    if groups.is_empty() {
+        return Ok(if cases.iter().all(|case| case.accepted) {
+            100.0
+        } else {
+            0.0
+        });
+    }
+    let accepted = cases
+        .iter()
+        .map(|case| (case.test_id, case.accepted))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut resolved = std::collections::BTreeMap::<Uuid, bool>::new();
+    while resolved.len() < groups.len() {
+        let before = resolved.len();
+        for group in groups {
+            if resolved.contains_key(&group.id)
+                || group
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !resolved.contains_key(dependency))
+            {
+                continue;
+            }
+            let dependencies_passed = group
+                .depends_on
+                .iter()
+                .all(|dependency| resolved.get(dependency) == Some(&true));
+            let group_tests = tests
+                .iter()
+                .filter(|test| test.group_ids.contains(&group.id))
+                .collect::<Vec<_>>();
+            ensure!(
+                !group_tests.is_empty(),
+                "score group has no test cases: {}",
+                group.name
+            );
+            let tests_passed = group_tests
+                .iter()
+                .all(|test| accepted.get(&test.id) == Some(&true));
+            resolved.insert(group.id, dependencies_passed && tests_passed);
+        }
+        ensure!(
+            resolved.len() > before,
+            "score group dependencies contain a cycle or unknown group"
+        );
+    }
+    Ok(groups
+        .iter()
+        .filter(|group| resolved.get(&group.id) == Some(&true))
+        .map(|group| group.points)
+        .sum())
+}
+
+fn inferred_role(name: &str) -> TestCaseRoleV2 {
+    if name.to_ascii_lowercase().starts_with("sample") {
+        TestCaseRoleV2::Sample
+    } else {
+        TestCaseRoleV2::Secret
+    }
+}
+
+fn ensure_unique_test_name(
+    spec: &reporch_format::AuthoringSpecV2,
+    name: &str,
+    except: Option<Uuid>,
+) -> Result<()> {
+    let normalized = normalize_name(name)?;
+    ensure!(
+        !spec
+            .testing
+            .tests
+            .iter()
+            .any(|test| test.id != except.unwrap_or_else(Uuid::nil) && test.name == normalized),
+        "test case name already exists: {normalized}"
+    );
+    Ok(())
+}
+
+fn resolve_group_ids(
+    spec: &reporch_format::AuthoringSpecV2,
+    names: &[String],
+) -> Result<Vec<Uuid>> {
+    names
+        .iter()
+        .map(|name| Ok(find_group(spec, name)?.id))
+        .collect()
+}
+
+fn find_group<'a>(
+    spec: &'a reporch_format::AuthoringSpecV2,
+    value: &str,
+) -> Result<&'a TestGroupSpecV2> {
+    let parsed = Uuid::parse_str(value).ok();
+    spec.testing
+        .groups
+        .iter()
+        .find(|group| group.name == value || parsed == Some(group.id))
+        .with_context(|| format!("unknown group: {value}"))
+}
+
+fn find_generator<'a>(
+    spec: &'a reporch_format::AuthoringSpecV2,
+    value: &str,
+) -> Result<&'a GeneratorSpecV2> {
+    let parsed = Uuid::parse_str(value).ok();
+    spec.testing
+        .generators
+        .iter()
+        .find(|generator| generator.program.name == value || parsed == Some(generator.program.id))
+        .with_context(|| format!("generator was not found: {value}"))
+}
+
+fn legacy_program(program: &ProgramSpecV2) -> ProgramSpec {
+    ProgramSpec {
+        id: program.name.clone(),
+        source_path: program.source_path.clone(),
+        language: program.language.clone(),
+        arguments: program.arguments.clone(),
+    }
+}
+
+fn find_solution<'a>(
+    spec: &'a reporch_format::AuthoringSpecV2,
+    value: &str,
+) -> Result<&'a SolutionSpecV2> {
+    let parsed = Uuid::parse_str(value).ok();
+    spec.testing
+        .solutions
+        .iter()
+        .find(|solution| solution.program.name == value || parsed == Some(solution.program.id))
+        .with_context(|| format!("solution was not found: {value}"))
+}

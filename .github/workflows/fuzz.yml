@@ -1,6 +1,14 @@
 name: Fuzz
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/fuzz.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/reporch-format/**"
+      - "crates/studio-core/**"
+      - "fuzz/**"
   schedule:
     - cron: "31 17 * * *"
   workflow_dispatch:
@@ -16,21 +24,28 @@ jobs:
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-11
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
         with:
           toolchain: nightly-2026-08-11
           components: clippy, rustfmt
-      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
-        with:
-          tool: cargo-fuzz@0.13.2
-          fallback: none
+      - name: Install pinned cargo-fuzz
+        run: |
+          rustup show active-toolchain | grep -F 'nightly-2026-08-11'
+          rustc --version
+          cargo install --locked cargo-fuzz --version 0.13.2
       - name: Check fuzz harnesses
         run: |
           cargo fmt --manifest-path fuzz/Cargo.toml -- --check
           cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       - name: Fuzz bounded authoring YAML
-        run: cargo fuzz run authoring_yaml -- -max_total_time=240 -rss_limit_mb=4096
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '30' || '240' }}
+        run: cargo fuzz run authoring_yaml -- -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=4096
       - name: Fuzz normalized project paths
-        run: cargo fuzz run relative_path -- -max_total_time=240 -rss_limit_mb=4096
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '30' || '240' }}
+        run: cargo fuzz run relative_path -- -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=4096

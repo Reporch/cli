@@ -4,7 +4,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use reporch_format::{AuthoringSpecV1, parse_authoring_spec, to_authoring_yaml};
+use reporch_format::{
+    AuthoringSpecV1, MAX_AUTHORING_SPEC_BYTES, parse_authoring_spec, to_authoring_yaml,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use studio_core::{ManifestFile, ReleaseManifestV1, validate_manifest};
@@ -98,7 +100,7 @@ pub struct MigrationOutcome {
 
 pub fn read_authoring_spec(directory: &Path) -> Result<AuthoringSpecV1> {
     let path = directory.join(AUTHORING_FILE_NAME);
-    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = read_bounded_regular_file(&path, MAX_AUTHORING_SPEC_BYTES as u64)?;
     parse_authoring_spec(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
@@ -502,7 +504,7 @@ fn verify_manifest_files(directory: &Path, manifest: &ReleaseManifestV1) -> Resu
     Ok(())
 }
 
-fn hash_regular_project_file(root: &Path, relative_path: &str) -> Result<(String, u64)> {
+pub(crate) fn hash_regular_project_file(root: &Path, relative_path: &str) -> Result<(String, u64)> {
     studio_core::validate_relative_path(relative_path)?;
     let source = root.join(relative_path);
     let metadata = fs::symlink_metadata(&source)
@@ -568,7 +570,7 @@ fn create_or_verify_backup(path: &Path, expected: &[u8]) -> Result<()> {
     }
 }
 
-fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .context("destination has no parent directory")?;
@@ -591,7 +593,7 @@ fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8], unix_mode: u32) -> Result<()> {
+pub(crate) fn atomic_replace(path: &Path, bytes: &[u8], unix_mode: u32) -> Result<()> {
     reject_non_regular_destination(path)?;
     let parent = path
         .parent()
@@ -617,7 +619,7 @@ fn atomic_replace(path: &Path, bytes: &[u8], unix_mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn reject_non_regular_destination(path: &Path) -> Result<()> {
+pub(crate) fn reject_non_regular_destination(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => ensure!(
             metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
@@ -656,7 +658,7 @@ fn local_state_path(directory: &Path) -> PathBuf {
         .join(LOCAL_STATE_FILE_NAME)
 }
 
-fn read_bounded_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>> {
+pub fn read_bounded_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
     ensure!(
@@ -670,10 +672,16 @@ fn read_bounded_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>> {
         path.display(),
         maximum
     );
-    fs::read(path).with_context(|| format!("read {}", path.display()))
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    ensure!(
+        bytes.len() as u64 <= maximum && bytes.len() as u64 == metadata.len(),
+        "file changed or exceeded its bound while being read: {}",
+        path.display()
+    );
+    Ok(bytes)
 }
 
-fn ensure_real_directory(directory: &Path) -> Result<PathBuf> {
+pub(crate) fn ensure_real_directory(directory: &Path) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(directory)
         .with_context(|| format!("inspect project directory {}", directory.display()))?;
     ensure!(
@@ -696,7 +704,16 @@ fn sync_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::init_project_with_id;
+    use crate::project_template::init_legacy_v1_project_template;
+
+    fn init_project_with_id(directory: &Path, title: &str, project_id: Uuid) -> Result<()> {
+        init_legacy_v1_project_template(
+            directory,
+            title,
+            project_id,
+            studio_core::ProblemType::Standard,
+        )
+    }
 
     fn legacy_project() -> tempfile::TempDir {
         let temporary = tempfile::tempdir().unwrap();

@@ -10,13 +10,14 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 pub const RELEASE_MANIFEST_SCHEMA_V1: &str = "reporch.release-manifest.v1";
-pub const NATIVE_PACKAGE_RESERVED_PATHS: [&str; 6] = [
+pub const NATIVE_PACKAGE_RESERVED_PATHS: [&str; 7] = [
     "META-INF/reporch-release.json",
     "META-INF/reporch-source.json",
     "manifest.json",
     "reporch.problem.json",
     "validation-report.json",
     "reporch.import-report.json",
+    "reporch.yaml",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
@@ -558,6 +559,9 @@ pub fn validate_relative_path(path: &str) -> Result<(), ManifestError> {
             value if value.chars().any(char::is_control) => {
                 return Err(ManifestError::UnsafePath(path.to_owned()));
             }
+            value if !is_portable_path_component(value) => {
+                return Err(ManifestError::UnsafePath(path.to_owned()));
+            }
             _ => depth += 1,
         }
     }
@@ -565,6 +569,29 @@ pub fn validate_relative_path(path: &str) -> Result<(), ManifestError> {
         return Err(ManifestError::UnsafePath(path.to_owned()));
     }
     Ok(())
+}
+
+fn is_portable_path_component(component: &str) -> bool {
+    // These names have special meaning on Windows even when an extension is
+    // present. Colons also cover drive-qualified paths and NTFS alternate data
+    // streams. Enforcing this policy on every OS keeps a package digest bound
+    // to one filesystem interpretation.
+    if component.contains(':') || component.ends_with(['.', ' ']) {
+        return false;
+    }
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !is_numbered_windows_device(&stem, "COM")
+        && !is_numbered_windows_device(&stem, "LPT")
+}
+
+fn is_numbered_windows_device(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| matches!(suffix.as_bytes(), [b'1'..=b'9']))
 }
 
 pub fn normalize_relative_path(path: &str) -> Result<String, ManifestError> {
@@ -584,6 +611,12 @@ pub enum ManifestError {
     DuplicatePath(String),
     #[error("manifest references a missing file: {0}")]
     MissingFileReference(String),
+    #[error("duplicate manifest identity: {0}")]
+    DuplicateIdentity(String),
+    #[error("manifest references a missing identity: {0}")]
+    MissingIdentityReference(String),
+    #[error("invalid manifest configuration: {0}")]
+    InvalidConfiguration(String),
     #[error("manifest serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -602,6 +635,15 @@ mod tests {
             "a/../secret",
             "a\\b",
             "a//b",
+            "C:/Windows/System32",
+            "C:relative.txt",
+            "statement.md:payload",
+            "CON",
+            "nul.txt",
+            "tools/COM1.exe",
+            "tools/LPT9",
+            "statement.md.",
+            "statement.md ",
         ] {
             assert!(validate_relative_path(path).is_err(), "{path}");
         }
@@ -630,7 +672,9 @@ mod tests {
         fn normalization_is_idempotent_for_safe_ascii_paths(
             components in prop::collection::vec("[a-zA-Z0-9._-]{1,24}", 1..=12)
         ) {
-            prop_assume!(components.iter().all(|component| component != "." && component != ".."));
+            prop_assume!(components.iter().all(|component| {
+                component != "." && component != ".." && is_portable_path_component(component)
+            }));
             let path = components.join("/");
             let normalized = normalize_relative_path(&path).unwrap();
             prop_assert_eq!(normalize_relative_path(&normalized).unwrap(), normalized);

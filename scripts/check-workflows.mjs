@@ -16,6 +16,14 @@ for (const name of workflows) {
   }
 }
 const release = readFileSync(".github/workflows/release.yml", "utf8");
+assert.doesNotMatch(
+  release,
+  /^\s*-\s+run:\s+npm install --global/m,
+  "the privileged release job must not execute an unverified registry bootstrap"
+);
+assert.match(release, /npm-11\.18\.0\.tgz/);
+assert.match(release, /NPM_TARBALL_SHA256:\s*[a-f0-9]{64}/);
+assert.match(release, /sha256sum --check --strict/);
 assert.match(release, /id-token:\s*write/, "release must mint OIDC tokens");
 assert.match(release, /attestations:\s*write/, "release must create attestations");
 assert.match(release, /environment:\s*npm-release/, "release must use a protected environment");
@@ -42,6 +50,11 @@ assert.match(
 assert.match(release, /sha256sum --check --strict/, "release checksum verification must be strict");
 assert.match(
   release,
+  /cmp "\$native" "\$npm_native"/,
+  "published npm binaries must match the independently attested GitHub release bytes"
+);
+assert.match(
+  release,
   /subject-path: dist\/release-assets\/\*/,
   "every immutable release asset must receive provenance"
 );
@@ -50,5 +63,10 @@ assert.match(ci, /actionlint_1\.7\.12_linux_amd64\.tar\.gz/);
 assert.match(ci, /ACTIONLINT_SHA256:\s*[a-f0-9]{64}/);
 assert.match(ci, /sha256sum --check --strict/);
 const publisher = readFileSync("scripts/publish-npm-release.mjs", "utf8");
-assert.match(publisher, /\["publish", tarball, "--access", "public"\]/);
+assert.match(publisher, /"--tag",\s*npmTag/);
+assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prerelease/);
+assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --latest/);
+assert.match(release, /qualify-published-artifacts:/);
+assert.match(release, /start-beta-window:/);
+assert.match(release, /30 \* 24 \* 60 \* 60 \* 1000/);
 console.log(`workflow contract passed for ${workflows.length} workflows`);

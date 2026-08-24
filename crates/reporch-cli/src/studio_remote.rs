@@ -31,8 +31,8 @@ use studio_contracts::{
     WorkingCopyReadinessV1, WorkingCopyV1,
 };
 use studio_core::{
-    ManifestFile, ProblemType, ProjectRole, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
-    SubjectRef, validate_manifest,
+    ManifestFile, ProblemType, ProjectRole, ReviewDecisionKindV1, Sha256Digest, SubjectRef,
+    VersionedReleaseManifest, validate_manifest,
 };
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use tempfile::NamedTempFile;
@@ -46,9 +46,13 @@ use zeroize::Zeroizing;
 use crate::{NativeAuthOptions, device_auth_config};
 
 const DEFAULT_API_URL: &str = "https://studio.reporch.com";
+const DEFAULT_OIDC_ISSUER: &str = "https://reporch.com/oauth";
 const MAX_JSON_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MULTIPART_BLOCKS: u32 = 50_000;
+const MAX_FILE_TRANSFER_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_PACKAGE_TRANSFER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WAIT_SECONDS: u64 = 30 * 60;
 const MAX_TRANSIENT_POLL_RETRIES: u32 = 8;
 const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
@@ -139,6 +143,9 @@ pub struct RemoteConnectionOptions {
     pub api_url: String,
     #[command(flatten)]
     pub auth: NativeAuthOptions,
+    /// Development-only identity header for a loopback Studio API.
+    #[arg(long, env = "REPORCH_STUDIO_DEV_SUBJECT", hide = true)]
+    pub dev_subject: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -583,19 +590,30 @@ struct StudioApiClient {
     http: reqwest::Client,
     api_base: Url,
     access_token: Zeroizing<String>,
+    dev_subject: Option<String>,
     allow_insecure_loopback: bool,
 }
 
 impl StudioApiClient {
     async fn connect(options: &RemoteConnectionOptions) -> Result<Self> {
         let api_base = validate_api_url(&options.api_url, options.auth.allow_insecure_http)?;
-        let auth = NativeAuthClient::discover(device_auth_config(&options.auth)?)
-            .await
-            .context("discover Reporch native OAuth endpoints")?;
-        let access_token = auth
-            .access_token(&KeyringTokenStore)
-            .await
-            .context("load or refresh the CLI credential; run `reporch auth login` first")?;
+        let dev_subject = validate_dev_subject(
+            &api_base,
+            options.auth.allow_insecure_http,
+            options.dev_subject.as_deref(),
+        )?;
+        validate_connection_binding(&api_base, &options.auth, dev_subject.as_deref())?;
+        let access_token =
+            if dev_subject.is_some() {
+                Zeroizing::new(String::new())
+            } else {
+                let auth = NativeAuthClient::discover(device_auth_config(&options.auth)?)
+                    .await
+                    .context("discover Reporch native OAuth endpoints")?;
+                Zeroizing::new(auth.access_token(&KeyringTokenStore).await.context(
+                    "load or refresh the CLI credential; run `reporch auth login` first",
+                )?)
+            };
         let http = reqwest::ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -605,7 +623,8 @@ impl StudioApiClient {
         Ok(Self {
             http,
             api_base,
-            access_token: Zeroizing::new(access_token),
+            access_token,
+            dev_subject,
             allow_insecure_loopback: options.auth.allow_insecure_http,
         })
     }
@@ -617,8 +636,12 @@ impl StudioApiClient {
     }
 
     fn authenticated(&self, request: RequestBuilder) -> RequestBuilder {
+        let request = if let Some(subject) = &self.dev_subject {
+            request.header("x-studio-dev-subject", subject)
+        } else {
+            request.bearer_auth(self.access_token.as_str())
+        };
         request
-            .bearer_auth(self.access_token.as_str())
             .header("x-request-id", Uuid::now_v7().to_string())
             .timeout(Duration::from_secs(30))
     }
@@ -1215,11 +1238,23 @@ impl StudioApiClient {
             part_size > 0 && part_size <= MAX_BLOCK_BYTES,
             "invalid block part size"
         );
-        ensure!(part_count > 0, "invalid block part count");
+        let metadata = tokio::fs::symlink_metadata(source)
+            .await
+            .with_context(|| format!("inspect {}", source.display()))?;
+        ensure!(
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() == upload.upload.size_bytes,
+            "upload source changed or is not a regular file"
+        );
+        validate_multipart_contract(metadata.len(), part_size, part_count)?;
         let mut file = tokio::fs::File::open(source)
             .await
             .with_context(|| format!("open {}", source.display()))?;
-        let mut block_ids = Vec::with_capacity(part_count as usize);
+        let mut block_ids = Vec::new();
+        block_ids
+            .try_reserve_exact(part_count as usize)
+            .context("reserve multipart block identifiers")?;
         for index in 0..part_count {
             let mut block = vec![0_u8; part_size as usize];
             let mut used = 0_usize;
@@ -1279,7 +1314,12 @@ impl StudioApiClient {
         expected_size: u64,
         expected_digest: &Sha256Digest,
         output: &Path,
+        maximum_size: u64,
     ) -> Result<()> {
+        ensure!(
+            expected_size <= maximum_size,
+            "object exceeds the permitted download size"
+        );
         ensure!(
             !output.exists(),
             "refusing to overwrite {}",
@@ -1700,8 +1740,8 @@ pub async fn restore_revision_operation(
 }
 
 fn diff_revisions(from: &CommitDetailResponse, to: &CommitDetailResponse) -> RevisionDiffV1 {
-    let from_spec = reporch_format::AuthoringSpecV1::from_manifest(&from.manifest);
-    let to_spec = reporch_format::AuthoringSpecV1::from_manifest(&to.manifest);
+    let from_spec = reporch_format::VersionedAuthoringSpec::from_manifest(&from.manifest);
+    let to_spec = reporch_format::VersionedAuthoringSpec::from_manifest(&to.manifest);
     let from_json = serde_json::to_value(&from_spec).expect("AuthoringSpec serializes");
     let to_json = serde_json::to_value(&to_spec).expect("AuthoringSpec serializes");
     let mut metadata_changed = Vec::new();
@@ -1720,13 +1760,13 @@ fn diff_revisions(from: &CommitDetailResponse, to: &CommitDetailResponse) -> Rev
 
     let from_files = from
         .manifest
-        .files
+        .files()
         .iter()
         .map(|file| (file.path.as_str(), file))
         .collect::<std::collections::BTreeMap<_, _>>();
     let to_files = to
         .manifest
-        .files
+        .files()
         .iter()
         .map(|file| (file.path.as_str(), file))
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -1901,7 +1941,7 @@ pub async fn create_operation(options: &CreateOptions) -> Result<ProjectResponse
         .await?;
     if let Some(directory) = &options.directory {
         crate::init_project_template(directory, title, project.id, options.problem_type.into())?;
-        crate::local_project::link_project(directory, &options.connection.api_url, project.id)?;
+        crate::local_project_v2::link_project(directory, &options.connection.api_url, project.id)?;
     }
     Ok(project)
 }
@@ -1958,7 +1998,8 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         "Studio returned a mismatched commit"
     );
     ensure!(
-        commit.manifest.project_id == options.project_id && commit.manifest.commit_id == commit_id,
+        commit.manifest.project_id() == options.project_id
+            && commit.manifest.commit_id() == commit_id,
         "commit manifest identity mismatch"
     );
     ensure!(
@@ -1966,11 +2007,25 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         "commit manifest digest mismatch"
     );
     commit.manifest.validate_references()?;
+    let mut project_bytes = 0_u64;
+    for file in commit.manifest.files() {
+        ensure!(
+            file.size_bytes <= MAX_FILE_TRANSFER_BYTES,
+            "commit file exceeds the 1 GiB transfer limit"
+        );
+        project_bytes = project_bytes
+            .checked_add(file.size_bytes)
+            .context("commit transfer size overflow")?;
+        ensure!(
+            project_bytes <= MAX_PACKAGE_TRANSFER_BYTES,
+            "commit files exceed the 5 GiB transfer limit"
+        );
+    }
 
     let staging = tempfile::Builder::new()
         .prefix(".reporch-pull-")
         .tempdir_in(parent)?;
-    for file in &commit.manifest.files {
+    for file in commit.manifest.files() {
         let descriptor = client
             .commit_file_download(options.project_id, commit_id, &file.path)
             .await?;
@@ -1985,6 +2040,7 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
                 file.size_bytes,
                 &file.sha256,
                 &output,
+                MAX_FILE_TRANSFER_BYTES,
             )
             .await?;
     }
@@ -1992,8 +2048,15 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         &staging.path().join("reporch.problem.json"),
         &commit.manifest,
     )?;
-    let authoring_spec = reporch_format::AuthoringSpecV1::from_manifest(&commit.manifest);
-    crate::local_project::write_authoring_spec_create_new(staging.path(), &authoring_spec)?;
+    let authoring_spec = reporch_format::VersionedAuthoringSpec::from_manifest(&commit.manifest);
+    match &authoring_spec {
+        reporch_format::VersionedAuthoringSpec::V1(spec) => {
+            crate::local_project::write_authoring_spec_create_new(staging.path(), spec)?;
+        }
+        reporch_format::VersionedAuthoringSpec::V2(spec) => {
+            crate::local_project_v2::write_authoring_spec_create_new(staging.path(), spec)?;
+        }
+    }
     let working_copy_revision = match client.get_working_copy(options.project_id).await {
         Ok(working_copy) if working_copy.spec == authoring_spec => {
             Some(working_copy.revision.to_string())
@@ -2035,7 +2098,7 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         project_id: options.project_id,
         commit_id,
         directory: options.directory.clone(),
-        file_count: commit.manifest.files.len(),
+        file_count: commit.manifest.files().len(),
     })
 }
 
@@ -2056,7 +2119,11 @@ pub async fn push_operation(options: &PushOptions) -> Result<PushOperationResult
         return push_authoring_operation(options).await;
     };
     let manifest = read_manifest(manifest_path)?;
-    let issues = validate_manifest(&manifest);
+    manifest.validate_references()?;
+    let issues = match &manifest {
+        VersionedReleaseManifest::V1(manifest) => validate_manifest(manifest),
+        VersionedReleaseManifest::V2(_) => Vec::new(),
+    };
     if !issues.is_empty() {
         bail!(
             "manifest validation failed with {} issue(s): {}",
@@ -2080,14 +2147,15 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
             "--source-root must match the discovered reporch.yaml project root"
         );
     }
-    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let spec = read_versioned_authoring_spec(&root)?;
+    let project_id = spec.project_id();
     let mut state = crate::local_project::read_local_state(&root)?;
     let remote = state
         .remote
         .as_ref()
         .context("project is not linked; run reporch project link")?;
     ensure!(
-        remote.project_id == spec.project_id,
+        remote.project_id == project_id,
         "local link and reporch.yaml project IDs differ"
     );
     ensure!(
@@ -2102,20 +2170,28 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         capabilities
             .authoring_spec_versions
             .iter()
-            .any(|schema| schema == reporch_format::AUTHORING_SPEC_SCHEMA_V1),
+            .any(|schema| schema == spec.schema()),
         "Studio does not support {}",
-        reporch_format::AUTHORING_SPEC_SCHEMA_V1
+        spec.schema()
     );
 
-    let upload_manifest = crate::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let upload_manifest = compile_versioned_authoring_spec(&root, &spec, Uuid::nil())?;
+    ensure!(
+        capabilities
+            .release_manifest_versions
+            .iter()
+            .any(|schema| schema == upload_manifest.schema()),
+        "Studio does not support {}",
+        upload_manifest.schema()
+    );
     let uploaded = upload_manifest_files(&client, options, &upload_manifest, &root).await?;
 
     if uploaded == 0
         && let Some(last_commit_id) = state.last_commit_id
     {
-        let candidate = crate::local_project::compile_authoring_spec(&root, &spec, last_commit_id)?;
+        let candidate = compile_versioned_authoring_spec(&root, &spec, last_commit_id)?;
         if state.baseline_working_digest.as_deref() == Some(candidate.digest()?.as_str()) {
-            let commits = client.list_commits(spec.project_id).await?;
+            let commits = client.list_commits(project_id).await?;
             if let Some(head) = commits.items.first()
                 && head.id == last_commit_id
                 && head.manifest_digest == candidate.digest()?
@@ -2134,7 +2210,7 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         }
     }
 
-    let remote_copy = client.get_working_copy(spec.project_id).await?;
+    let remote_copy = client.get_working_copy(project_id).await?;
     if let Some(base_revision) = state.base_revision.as_deref() {
         let base_revision: i64 = base_revision
             .parse()
@@ -2154,7 +2230,7 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
     } else {
         client
             .update_working_copy(
-                spec.project_id,
+                project_id,
                 remote_copy.revision,
                 &UpdateWorkingCopyRequestV1 { spec: spec.clone() },
             )
@@ -2173,7 +2249,7 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         .or_insert(operation_key("cli-push", None)?)
         .clone();
     crate::local_project::write_local_state(&root, &state)?;
-    let readiness = client.working_copy_readiness(spec.project_id).await?;
+    let readiness = client.working_copy_readiness(project_id).await?;
     ensure!(
         readiness.can_commit,
         "working copy is not ready: {}",
@@ -2181,14 +2257,14 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
     );
     let commit = client
         .commit_working_copy(
-            spec.project_id,
+            project_id,
             &CommitWorkingCopyRequestV1 {
                 message: options.message.clone(),
             },
             &commit_key,
         )
         .await?;
-    let manifest = crate::local_project::compile_authoring_spec(&root, &spec, commit.id)?;
+    let manifest = compile_versioned_authoring_spec(&root, &spec, commit.id)?;
     let manifest_digest = manifest.digest()?;
     ensure!(
         commit.manifest_digest == manifest_digest,
@@ -2199,7 +2275,7 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         commit,
     };
 
-    crate::local_project::write_generated_manifest_atomic(&root, &manifest)?;
+    write_versioned_generated_manifest_atomic(&root, &manifest)?;
     state.baseline_working_digest = Some(manifest_digest.to_string());
     state.last_commit_id = Some(result.commit.id);
     state.last_validation_run_id = None;
@@ -2213,18 +2289,18 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
 
 async fn push_manifest(
     options: &PushOptions,
-    manifest: ReleaseManifestV1,
+    manifest: VersionedReleaseManifest,
     source_root: PathBuf,
 ) -> Result<PushOperationResult> {
     let client = StudioApiClient::connect(&options.connection).await?;
     let uploaded = upload_manifest_files(&client, options, &manifest, &source_root).await?;
     let manifest_digest = manifest.digest()?;
     if uploaded == 0 {
-        let commits = client.list_commits(manifest.project_id).await?;
+        let commits = client.list_commits(manifest.project_id()).await?;
         if let Some(head) = commits.items.first()
             && is_unchanged_remote_head(
                 uploaded,
-                manifest.commit_id,
+                manifest.commit_id(),
                 &manifest_digest,
                 head.id,
                 &head.manifest_digest,
@@ -2244,7 +2320,7 @@ async fn push_manifest(
     }
     let commit = client
         .create_commit(
-            manifest.project_id,
+            manifest.project_id(),
             &CreateCommitRequest {
                 message: options.message.clone(),
                 manifest: manifest.clone(),
@@ -2252,7 +2328,7 @@ async fn push_manifest(
         )
         .await?;
     ensure!(
-        commit.id == manifest.commit_id,
+        commit.id == manifest.commit_id(),
         "Studio returned a mismatched commit ID"
     );
     ensure!(
@@ -2268,18 +2344,18 @@ async fn push_manifest(
 async fn upload_manifest_files(
     client: &StudioApiClient,
     options: &PushOptions,
-    manifest: &ReleaseManifestV1,
+    manifest: &VersionedReleaseManifest,
     source_root: &Path,
 ) -> Result<usize> {
     let remote = client
-        .list_files(manifest.project_id)
+        .list_files(manifest.project_id())
         .await?
         .items
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect::<HashMap<_, _>>();
     let mut uploaded = 0_usize;
-    for file in &manifest.files {
+    for file in manifest.files() {
         let source = source_root.join(&file.path);
         verify_local_file(&source, file).await?;
         if remote.get(&file.path).is_some_and(|remote| {
@@ -2292,7 +2368,7 @@ async fn upload_manifest_files(
         }
         let upload = client
             .begin_upload(
-                manifest.project_id,
+                manifest.project_id(),
                 &BeginFileUploadRequest {
                     path: file.path.clone(),
                     sha256: file.sha256.clone(),
@@ -2304,9 +2380,15 @@ async fn upload_manifest_files(
             .await?;
         client.upload_file(&source, &upload).await?;
         let status = client
-            .complete_upload(manifest.project_id, upload.upload.id)
+            .complete_upload(manifest.project_id(), upload.upload.id)
             .await?;
-        wait_for_upload(client, manifest.project_id, status, options.timeout_seconds).await?;
+        wait_for_upload(
+            client,
+            manifest.project_id(),
+            status,
+            options.timeout_seconds,
+        )
+        .await?;
         uploaded += 1;
     }
     Ok(uploaded)
@@ -2620,6 +2702,7 @@ async fn download_release_to(
             download.package_size_bytes,
             &download.package_digest,
             output,
+            MAX_PACKAGE_TRANSFER_BYTES,
         )
         .await?;
     Ok(PackageOperationResult {
@@ -3231,11 +3314,11 @@ fn resolve_local_candidate(
     }
     let root = crate::local_project::discover_project(Path::new("."))
         .context("project and commit IDs were omitted and no local project was found")?;
-    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let spec = read_versioned_authoring_spec(&root)?;
     let state = crate::local_project::read_local_state(&root)?;
-    let resolved_project_id = project_id.unwrap_or(spec.project_id);
+    let resolved_project_id = project_id.unwrap_or(spec.project_id());
     ensure!(
-        resolved_project_id == spec.project_id,
+        resolved_project_id == spec.project_id(),
         "explicit project ID does not match reporch.yaml"
     );
     if let Some(remote) = &state.remote {
@@ -3256,16 +3339,16 @@ fn resolve_local_project_id(project_id: Option<Uuid>) -> Result<Uuid> {
     }
     let root = crate::local_project::discover_project(Path::new("."))
         .context("project ID was omitted and no local project was found")?;
-    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let spec = read_versioned_authoring_spec(&root)?;
     let state = crate::local_project::read_local_state(&root)?;
     let remote = state
         .remote
         .context("project is not linked; run reporch project link")?;
     ensure!(
-        remote.project_id == spec.project_id,
+        remote.project_id == spec.project_id(),
         "local link and reporch.yaml project IDs differ"
     );
-    Ok(spec.project_id)
+    Ok(spec.project_id())
 }
 
 pub fn current_project_id(project_id: Option<Uuid>) -> Result<Uuid> {
@@ -3319,7 +3402,43 @@ fn validate_wait_timeout(value: u64) -> Result<()> {
     Ok(())
 }
 
-fn read_manifest(path: &Path) -> Result<ReleaseManifestV1> {
+fn read_versioned_authoring_spec(root: &Path) -> Result<reporch_format::VersionedAuthoringSpec> {
+    let path = root.join(crate::local_project::AUTHORING_FILE_NAME);
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    reporch_format::parse_versioned_authoring_spec(&bytes)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
+fn compile_versioned_authoring_spec(
+    root: &Path,
+    spec: &reporch_format::VersionedAuthoringSpec,
+    commit_id: Uuid,
+) -> Result<VersionedReleaseManifest> {
+    match spec {
+        reporch_format::VersionedAuthoringSpec::V1(spec) => {
+            crate::local_project::compile_authoring_spec(root, spec, commit_id).map(Into::into)
+        }
+        reporch_format::VersionedAuthoringSpec::V2(spec) => {
+            crate::local_project_v2::compile_authoring_spec(root, spec, commit_id).map(Into::into)
+        }
+    }
+}
+
+fn write_versioned_generated_manifest_atomic(
+    root: &Path,
+    manifest: &VersionedReleaseManifest,
+) -> Result<PathBuf> {
+    match manifest {
+        VersionedReleaseManifest::V1(manifest) => {
+            crate::local_project::write_generated_manifest_atomic(root, manifest)
+        }
+        VersionedReleaseManifest::V2(manifest) => {
+            crate::local_project_v2::write_generated_manifest_atomic(root, manifest)
+        }
+    }
+}
+
+fn read_manifest(path: &Path) -> Result<VersionedReleaseManifest> {
     let metadata = fs::metadata(path).with_context(|| format!("inspect {}", path.display()))?;
     ensure!(
         metadata.is_file() && metadata.len() <= 32 * 1024 * 1024,
@@ -3433,6 +3552,86 @@ fn validate_api_url(value: &str, allow_insecure_loopback: bool) -> Result<Url> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
+}
+
+fn validate_dev_subject(
+    api_base: &Url,
+    allow_insecure_http: bool,
+    subject: Option<&str>,
+) -> Result<Option<String>> {
+    let subject = subject
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+        .map(str::to_owned);
+    if let Some(subject) = &subject {
+        ensure!(
+            allow_insecure_http
+                && api_base.scheme() == "http"
+                && api_base.host().is_some_and(is_loopback_host)
+                && subject.len() <= 255
+                && !subject.chars().any(char::is_control),
+            "development identity is permitted only for an explicitly insecure loopback API"
+        );
+    }
+    Ok(subject)
+}
+
+fn validate_connection_binding(
+    api_base: &Url,
+    auth: &NativeAuthOptions,
+    dev_subject: Option<&str>,
+) -> Result<()> {
+    if dev_subject.is_some() {
+        return Ok(());
+    }
+    let issuer = Url::parse(auth.issuer.trim()).context("invalid native OAuth issuer URL")?;
+    ensure!(
+        issuer.username().is_empty()
+            && issuer.password().is_none()
+            && issuer.query().is_none()
+            && issuer.fragment().is_none(),
+        "native OAuth issuer contains forbidden URL components"
+    );
+    let official_issuer = issuer.as_str().trim_end_matches('/') == DEFAULT_OIDC_ISSUER;
+    if official_issuer {
+        let official_api = Url::parse(DEFAULT_API_URL).expect("valid official Studio API URL");
+        ensure!(
+            same_origin(api_base, &official_api),
+            "the official Reporch OAuth credential can only be sent to {DEFAULT_API_URL}"
+        );
+    } else {
+        ensure!(
+            same_origin(api_base, &issuer),
+            "a custom OAuth issuer and Studio API must use the same origin"
+        );
+    }
+    Ok(())
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn validate_multipart_contract(size: u64, part_size: u64, part_count: u32) -> Result<()> {
+    ensure!(
+        part_size > 0
+            && part_size <= MAX_BLOCK_BYTES
+            && part_count > 0
+            && part_count <= MAX_MULTIPART_BLOCKS,
+        "invalid multipart upload shape"
+    );
+    let expected_count = size
+        .checked_add(part_size - 1)
+        .context("block count calculation overflow")?
+        / part_size;
+    ensure!(
+        expected_count == u64::from(part_count),
+        "block part count does not match the source size"
+    );
+    Ok(())
 }
 
 fn validate_signed_object_url(value: &str, allow_insecure_loopback: bool) -> Result<Url> {
@@ -3551,6 +3750,52 @@ mod tests {
         assert!(validate_api_url("http://127.0.0.1:8080", false).is_err());
         assert!(validate_api_url("http://127.0.0.1:8080", true).is_ok());
         assert!(validate_api_url("https://user:secret@studio.reporch.com", false).is_err());
+    }
+
+    #[test]
+    fn development_identity_is_strictly_loopback_only() {
+        let loopback = validate_api_url("http://127.0.0.1:8080", true).unwrap();
+        assert_eq!(
+            validate_dev_subject(&loopback, true, Some("  e2e-author  ")).unwrap(),
+            Some("e2e-author".into())
+        );
+        assert!(validate_dev_subject(&loopback, false, Some("author")).is_err());
+        let production = validate_api_url("https://studio.reporch.com", false).unwrap();
+        assert!(validate_dev_subject(&production, true, Some("author")).is_err());
+        assert!(validate_dev_subject(&loopback, true, Some("bad\nsubject")).is_err());
+    }
+
+    #[test]
+    fn oauth_credentials_are_bound_to_the_studio_api_origin() {
+        let production = validate_api_url(DEFAULT_API_URL, false).unwrap();
+        let official_auth = NativeAuthOptions {
+            issuer: DEFAULT_OIDC_ISSUER.into(),
+            client_id: "reporch-studio-cli".into(),
+            allow_insecure_http: false,
+        };
+        validate_connection_binding(&production, &official_auth, None).unwrap();
+        let attacker = validate_api_url("https://attacker.example", false).unwrap();
+        assert!(validate_connection_binding(&attacker, &official_auth, None).is_err());
+
+        let custom_api = validate_api_url("https://self-hosted.example", false).unwrap();
+        let custom_auth = NativeAuthOptions {
+            issuer: "https://self-hosted.example/oauth".into(),
+            client_id: "self-hosted-cli".into(),
+            allow_insecure_http: false,
+        };
+        validate_connection_binding(&custom_api, &custom_auth, None).unwrap();
+        assert!(validate_connection_binding(&production, &custom_auth, None).is_err());
+
+        let loopback = validate_api_url("http://127.0.0.1:8080", true).unwrap();
+        validate_connection_binding(&loopback, &official_auth, Some("e2e-author")).unwrap();
+    }
+
+    #[test]
+    fn multipart_contract_rejects_remote_allocation_control() {
+        validate_multipart_contract(65, 64, 2).unwrap();
+        assert!(validate_multipart_contract(65, 64, 50_000).is_err());
+        assert!(validate_multipart_contract(1, 1, MAX_MULTIPART_BLOCKS + 1).is_err());
+        assert!(validate_multipart_contract(u64::MAX, 64, 1).is_err());
     }
 
     #[test]

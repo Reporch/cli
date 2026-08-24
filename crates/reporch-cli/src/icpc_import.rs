@@ -229,6 +229,11 @@ fn import_icpc_based(
 }
 
 pub(crate) fn scan_archive(archive: &mut ZipArchive<File>) -> Result<(String, Vec<ScannedEntry>)> {
+    crate::archive_safety::validate_zip_resource_budget(
+        archive,
+        MAX_ARCHIVE_FILES,
+        MAX_ARCHIVE_BYTES,
+    )?;
     ensure!(
         archive.len() <= MAX_ARCHIVE_FILES,
         "archive exceeds the {MAX_ARCHIVE_FILES} entry limit"

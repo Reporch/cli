@@ -24,7 +24,7 @@ pub struct VerifyDesktopArtifactOptions {
 }
 
 pub fn verify(options: &VerifyDesktopArtifactOptions) -> Result<()> {
-    verify_with_schema(options, "reporch.desktop-artifact-verification.v1")
+    verify_with_schema(options, "reporch.caller-key-minisign-verification.v1")
 }
 
 pub fn verify_signed_artifact(options: &VerifyDesktopArtifactOptions) -> Result<()> {
@@ -99,6 +99,8 @@ fn verify_with_schema(options: &VerifyDesktopArtifactOptions, schema: &str) -> R
             "size_bytes": bytes,
             "sha256": hex::encode(digest),
             "minisign_verified": true,
+            "trust_scope": "caller_selected_public_key",
+            "official_reporch_artifact": false,
             "passed": true,
         }))?
     );

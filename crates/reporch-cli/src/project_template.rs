@@ -61,6 +61,26 @@ pub fn init_project_template(
     project_id: Uuid,
     problem_type: ProblemType,
 ) -> Result<()> {
+    init_project_template_versioned(directory, title, project_id, problem_type, true)
+}
+
+#[doc(hidden)]
+pub fn init_legacy_v1_project_template(
+    directory: &Path,
+    title: &str,
+    project_id: Uuid,
+    problem_type: ProblemType,
+) -> Result<()> {
+    init_project_template_versioned(directory, title, project_id, problem_type, false)
+}
+
+fn init_project_template_versioned(
+    directory: &Path,
+    title: &str,
+    project_id: Uuid,
+    problem_type: ProblemType,
+    emit_v2: bool,
+) -> Result<()> {
     let title = title.trim();
     if title.is_empty() {
         bail!("title is required");
@@ -219,15 +239,24 @@ pub fn init_project_template(
             serde_json::to_string(&issues)?
         );
     }
-    write_new_file(
-        &directory.join("reporch.problem.json"),
-        &serde_json::to_vec_pretty(&manifest)?,
-        false,
-    )?;
-    crate::local_project::write_authoring_spec_create_new(
-        directory,
-        &reporch_format::AuthoringSpecV1::from_manifest(&manifest),
-    )?;
+    let authoring_v1 = reporch_format::AuthoringSpecV1::from_manifest(&manifest);
+    if emit_v2 {
+        let authoring_v2 = reporch_format::AuthoringSpecV2::migrate_v1(&authoring_v1)?;
+        let manifest_v2 = authoring_v2.materialize(manifest.commit_id, manifest.files.clone())?;
+        write_new_file(
+            &directory.join("reporch.problem.json"),
+            &serde_json::to_vec_pretty(&manifest_v2)?,
+            false,
+        )?;
+        crate::local_project_v2::write_authoring_spec_create_new(directory, &authoring_v2)?;
+    } else {
+        write_new_file(
+            &directory.join("reporch.problem.json"),
+            &serde_json::to_vec_pretty(&manifest)?,
+            false,
+        )?;
+        crate::local_project::write_authoring_spec_create_new(directory, &authoring_v1)?;
+    }
     Ok(())
 }
 
@@ -530,13 +559,13 @@ mod tests {
             let temporary = tempfile::tempdir().unwrap();
             init_project_template(temporary.path(), "Example", Uuid::now_v7(), problem_type)
                 .unwrap();
-            let manifest: ReleaseManifestV1 = serde_json::from_slice(
+            let manifest: studio_core::ReleaseManifestV2 = serde_json::from_slice(
                 &fs::read(temporary.path().join("reporch.problem.json")).unwrap(),
             )
             .unwrap();
             assert_eq!(manifest.problem_type, problem_type);
-            assert!(studio_core::validate_manifest(&manifest).is_empty());
-            let authoring = crate::local_project::read_authoring_spec(temporary.path()).unwrap();
+            manifest.validate_references().unwrap();
+            let authoring = crate::local_project_v2::read_authoring_spec(temporary.path()).unwrap();
             assert_eq!(authoring.problem_type, problem_type);
             assert_eq!(authoring.project_id, manifest.project_id);
             assert!(

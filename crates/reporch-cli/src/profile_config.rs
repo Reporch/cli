@@ -34,7 +34,10 @@ pub fn bootstrap() -> Result<Option<i32>> {
         return Ok(None);
     }
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let profile_name = selected_profile(&arguments)
+    let explicit_profile = (!is_package_profile_command(&arguments))
+        .then(|| selected_profile(&arguments))
+        .flatten();
+    let profile_name = explicit_profile
         .or_else(|| std::env::var("REPORCH_PROFILE").ok())
         .map(|profile| profile.trim().to_owned());
     let Some(profile_name) = profile_name else {
@@ -66,6 +69,13 @@ pub fn bootstrap() -> Result<Option<i32>> {
     }
     let status = child.status().context("run CLI with selected profile")?;
     Ok(Some(exit_code(status)))
+}
+
+pub fn package_profile_argument() -> Option<String> {
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    is_package_profile_command(&arguments)
+        .then(|| selected_profile(&arguments))
+        .flatten()
 }
 
 impl ConnectionProfileV1 {
@@ -106,6 +116,35 @@ fn selected_profile(arguments: &[OsString]) -> Option<String> {
         }
     }
     selected
+}
+
+fn is_package_profile_command(arguments: &[OsString]) -> bool {
+    let mut path = Vec::with_capacity(2);
+    let mut skip_value = false;
+    for argument in arguments {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        let Some(argument) = argument.to_str() else {
+            continue;
+        };
+        if matches!(argument, "--cwd" | "--profile" | "--format" | "--color") {
+            skip_value = true;
+            continue;
+        }
+        if argument.starts_with('-') {
+            continue;
+        }
+        path.push(argument);
+        if path.len() == 2 {
+            break;
+        }
+    }
+    matches!(
+        path.as_slice(),
+        ["package", "export" | "import"] | ["manifest", "compatibility"]
+    )
 }
 
 fn validate_profile_name(profile: &str) -> Result<()> {

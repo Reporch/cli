@@ -1,6 +1,6 @@
 {
   "name": "@reporch/cli-darwin-x64",
-  "version": "0.9.0",
+  "version": "1.0.0-rc.1",
   "description": "Reporch CLI native binary for macOS x64",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/Reporch/cli.git" },

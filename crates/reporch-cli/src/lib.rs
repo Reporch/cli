@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+pub mod authoring_runtime;
 pub mod local_project;
+pub mod local_project_v2;
 pub mod local_sandbox;
 mod project_template;
 pub mod studio_remote;
@@ -10,7 +12,10 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use studio_native_auth::NativeAuthConfig;
 
-pub use project_template::{init_project_template, init_project_with_id, preflight_init_directory};
+pub use project_template::{
+    init_legacy_v1_project_template, init_project_template, init_project_with_id,
+    preflight_init_directory,
+};
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct NativeAuthOptions {

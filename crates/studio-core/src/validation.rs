@@ -15,6 +15,8 @@ const MIN_MEMORY_LIMIT_MIB: u64 = 16;
 const MAX_MEMORY_LIMIT_MIB: u64 = 8 * 1_024;
 const MIN_OUTPUT_LIMIT_KIB: u64 = 1;
 const MAX_OUTPUT_LIMIT_KIB: u64 = 1_024 * 1_024;
+const MAX_TEST_GROUPS: usize = 10_000;
+const MAX_TEST_GROUP_EDGES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -626,6 +628,23 @@ fn validate_groups(manifest: &ReleaseManifestV1, issues: &mut Vec<ValidationIssu
             "test group identifiers must be unique".into(),
         ));
     }
+    let edge_count = manifest
+        .judging
+        .groups
+        .iter()
+        .try_fold(0_usize, |total, group| {
+            total.checked_add(group.depends_on.len())
+        });
+    let graph_within_limits = groups.len() <= MAX_TEST_GROUPS
+        && edge_count.is_some_and(|count| count <= MAX_TEST_GROUP_EDGES);
+    if !graph_within_limits {
+        issues.push(error_issue(
+            "groups.resource_limit",
+            format!(
+                "test groups are limited to {MAX_TEST_GROUPS} nodes and {MAX_TEST_GROUP_EDGES} dependency edges"
+            ),
+        ));
+    }
     for test in &manifest.judging.tests {
         for group in &test.groups {
             if !groups.contains_key(group.as_str()) {
@@ -651,11 +670,12 @@ fn validate_groups(manifest: &ReleaseManifestV1, issues: &mut Vec<ValidationIssu
                 ));
             }
         }
-        let mut visiting = BTreeSet::new();
-        if has_cycle(group.id.as_str(), &groups, &mut visiting) {
+    }
+    if graph_within_limits {
+        for group in cyclic_or_blocked_groups(&groups) {
             issues.push(error_issue(
                 "groups.dependency_cycle",
-                format!("group {} participates in a dependency cycle", group.id),
+                format!("group {group} participates in or depends on a dependency cycle"),
             ));
         }
     }
@@ -685,22 +705,46 @@ fn validate_groups(manifest: &ReleaseManifestV1, issues: &mut Vec<ValidationIssu
     }
 }
 
-fn has_cycle<'a>(
-    id: &'a str,
+fn cyclic_or_blocked_groups<'a>(
     groups: &BTreeMap<&'a str, &'a crate::TestGroupSpec>,
-    visiting: &mut BTreeSet<&'a str>,
-) -> bool {
-    if !visiting.insert(id) {
-        return true;
+) -> BTreeSet<&'a str> {
+    let mut pending_dependencies = groups
+        .iter()
+        .map(|(id, group)| {
+            (
+                *id,
+                group
+                    .depends_on
+                    .iter()
+                    .filter(|dependency| groups.contains_key(dependency.as_str()))
+                    .count(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut dependents = BTreeMap::<&str, Vec<&str>>::new();
+    for (id, group) in groups {
+        for dependency in &group.depends_on {
+            if let Some((dependency_id, _)) = groups.get_key_value(dependency.as_str()) {
+                dependents.entry(*dependency_id).or_default().push(*id);
+            }
+        }
     }
-    let cyclic = groups.get(id).is_some_and(|group| {
-        group
-            .depends_on
-            .iter()
-            .any(|dependency| has_cycle(dependency, groups, visiting))
-    });
-    visiting.remove(id);
-    cyclic
+    let mut ready = pending_dependencies
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(*id))
+        .collect::<Vec<_>>();
+    while let Some(id) = ready.pop() {
+        pending_dependencies.remove(id);
+        for dependent in dependents.get(id).into_iter().flatten() {
+            if let Some(count) = pending_dependencies.get_mut(dependent) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.push(*dependent);
+                }
+            }
+        }
+    }
+    pending_dependencies.into_keys().collect()
 }
 
 fn validate_problem_type(manifest: &ReleaseManifestV1, issues: &mut Vec<ValidationIssue>) {
