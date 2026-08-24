@@ -50,17 +50,19 @@ jobs:
             test "$GITHUB_REF" = refs/heads/main
           fi
           if [ "$version" = 1.0.0 ]; then
-            gh issue list --state all --limit 100 --json title,createdAt,closedAt \
+            gh issue list --state all --limit 100 --json number,title,createdAt,closedAt \
               > "$RUNNER_TEMP/beta-issues.json"
-            BETA_ISSUES="$RUNNER_TEMP/beta-issues.json" node -e '
-              const fs = require("node:fs");
-              const candidates = JSON.parse(fs.readFileSync(process.env.BETA_ISSUES, "utf8"))
-                .filter((issue) => /^Reporch CLI 1\.0\.0-rc\.[0-9A-Za-z.-]+ — 30-day stability window$/.test(issue.title))
-                .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
-              const latest = candidates[0];
-              const elapsed = latest && Date.parse(latest.closedAt) - Date.parse(latest.createdAt);
-              if (!latest || !latest.closedAt || !Number.isFinite(elapsed) || elapsed < 30 * 24 * 60 * 60 * 1000) process.exit(1);
-            '
+            latest_number=$(jq -er '
+              [ .[]
+                | select(.title | test("^Reporch CLI 1\\.0\\.0-rc\\.[0-9A-Za-z.-]+ — 30-day stability window$"))
+              ]
+              | sort_by(.createdAt)
+              | last
+              | .number
+            ' "$RUNNER_TEMP/beta-issues.json")
+            gh issue view "$latest_number" --json comments > "$RUNNER_TEMP/beta-comments.json"
+            node scripts/verify-stability-window.mjs \
+              "$RUNNER_TEMP/beta-issues.json" "$RUNNER_TEMP/beta-comments.json"
           fi
           {
             echo "version=$version"
@@ -440,7 +442,7 @@ jobs:
           if [ "$count" = 0 ]; then
             started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
             earliest=$(date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)
-            gh issue create --title "$title" --body "RC qualification completed in workflow run $GITHUB_RUN_ID.\n\nStart: $started\nEarliest eligible completion: $earliest\n\nDo not close this issue before 30 full days have elapsed. Close it only after confirming zero critical security, data-loss, or duplicate-publication incidents and attaching the daily/incident evidence. The stable 1.0.0 release workflow verifies both the elapsed time and this issue's closed state."
+            gh issue create --title "$title" --body "RC qualification completed in workflow run $GITHUB_RUN_ID.\n\nStart: $started\nEarliest eligible completion: $earliest\n\nDo not close this issue before 30 full days have elapsed. Close it only after confirming zero critical security, data-loss, or duplicate-publication incidents and attaching the daily/incident evidence. The stable 1.0.0 release workflow verifies the elapsed time, closed state, and at least 30 distinct passing daily monitor records."
           else
             number=$(jq -er --arg title "$title" '.[] | select(.title == $title) | .number' "$RUNNER_TEMP/issues.json")
             state=$(jq -er --arg title "$title" '.[] | select(.title == $title) | .state' "$RUNNER_TEMP/issues.json")

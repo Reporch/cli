@@ -83,5 +83,18 @@ assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prereleas
 assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --latest/);
 assert.match(release, /qualify-published-artifacts:/);
 assert.match(release, /start-beta-window:/);
-assert.match(release, /30 \* 24 \* 60 \* 60 \* 1000/);
+assert.match(release, /node scripts\/verify-stability-window\.mjs/);
+const stability = readFileSync(".github/workflows/rc-stability.yml", "utf8");
+assert.match(stability, /schedule:/);
+assert.match(stability, /@reporch\/cli@\$VERSION/);
+assert.match(stability, /reporch\.studio-capabilities\.v1/);
+assert.match(stability, /reporch\.authoring-spec\.v2/);
+assert.match(stability, /reporch-cli-stability:/);
+assert.match(stability, /retention-days: 90/);
+assert.match(stability, /persist-credentials: false/);
+assert.doesNotMatch(
+  stability,
+  /jobs:\n\s+monitor:\n(?:.|\n)*?timeout-minutes: 20\n\s+env:\n\s+GH_TOKEN:/,
+  "the npm dogfood process must not inherit an issue-write token"
+);
 console.log(`workflow contract passed for ${workflows.length} workflows`);
