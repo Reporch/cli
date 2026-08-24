@@ -24,6 +24,21 @@ assert.doesNotMatch(
 assert.match(release, /npm-11\.18\.0\.tgz/);
 assert.match(release, /NPM_TARBALL_SHA256:\s*[a-f0-9]{64}/);
 assert.match(release, /sha256sum --check --strict/);
+assert.doesNotMatch(
+  release,
+  /echo "\$install_dir\/package\/bin" >> "\$GITHUB_PATH"/,
+  "the npm tarball wrapper must not be used outside a Node installation prefix"
+);
+assert.match(
+  release,
+  /ln -s "\$install_dir\/package\/bin\/npm-cli\.js" "\$shim_dir\/npm"/,
+  "the pinned npm client must invoke npm-cli.js through a dedicated shim"
+);
+assert.match(
+  release,
+  /test "\$\("\$shim_dir\/npm" --version\)" = "11\.18\.0"/,
+  "the release must exercise the exact pinned npm shim before publishing"
+);
 assert.match(release, /id-token:\s*write/, "release must mint OIDC tokens");
 assert.match(release, /attestations:\s*write/, "release must create attestations");
 assert.match(release, /environment:\s*npm-release/, "release must use a protected environment");
