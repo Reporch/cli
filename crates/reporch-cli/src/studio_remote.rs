@@ -139,6 +139,9 @@ pub struct RemoteConnectionOptions {
     pub api_url: String,
     #[command(flatten)]
     pub auth: NativeAuthOptions,
+    /// Development-only identity header for a loopback Studio API.
+    #[arg(long, env = "REPORCH_STUDIO_DEV_SUBJECT", hide = true)]
+    pub dev_subject: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -583,19 +586,29 @@ struct StudioApiClient {
     http: reqwest::Client,
     api_base: Url,
     access_token: Zeroizing<String>,
+    dev_subject: Option<String>,
     allow_insecure_loopback: bool,
 }
 
 impl StudioApiClient {
     async fn connect(options: &RemoteConnectionOptions) -> Result<Self> {
         let api_base = validate_api_url(&options.api_url, options.auth.allow_insecure_http)?;
-        let auth = NativeAuthClient::discover(device_auth_config(&options.auth)?)
-            .await
-            .context("discover Reporch native OAuth endpoints")?;
-        let access_token = auth
-            .access_token(&KeyringTokenStore)
-            .await
-            .context("load or refresh the CLI credential; run `reporch auth login` first")?;
+        let dev_subject = validate_dev_subject(
+            &api_base,
+            options.auth.allow_insecure_http,
+            options.dev_subject.as_deref(),
+        )?;
+        let access_token =
+            if dev_subject.is_some() {
+                Zeroizing::new(String::new())
+            } else {
+                let auth = NativeAuthClient::discover(device_auth_config(&options.auth)?)
+                    .await
+                    .context("discover Reporch native OAuth endpoints")?;
+                Zeroizing::new(auth.access_token(&KeyringTokenStore).await.context(
+                    "load or refresh the CLI credential; run `reporch auth login` first",
+                )?)
+            };
         let http = reqwest::ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -605,7 +618,8 @@ impl StudioApiClient {
         Ok(Self {
             http,
             api_base,
-            access_token: Zeroizing::new(access_token),
+            access_token,
+            dev_subject,
             allow_insecure_loopback: options.auth.allow_insecure_http,
         })
     }
@@ -617,8 +631,12 @@ impl StudioApiClient {
     }
 
     fn authenticated(&self, request: RequestBuilder) -> RequestBuilder {
+        let request = if let Some(subject) = &self.dev_subject {
+            request.header("x-studio-dev-subject", subject)
+        } else {
+            request.bearer_auth(self.access_token.as_str())
+        };
         request
-            .bearer_auth(self.access_token.as_str())
             .header("x-request-id", Uuid::now_v7().to_string())
             .timeout(Duration::from_secs(30))
     }
@@ -3498,6 +3516,28 @@ fn validate_api_url(value: &str, allow_insecure_loopback: bool) -> Result<Url> {
     Ok(url)
 }
 
+fn validate_dev_subject(
+    api_base: &Url,
+    allow_insecure_http: bool,
+    subject: Option<&str>,
+) -> Result<Option<String>> {
+    let subject = subject
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+        .map(str::to_owned);
+    if let Some(subject) = &subject {
+        ensure!(
+            allow_insecure_http
+                && api_base.scheme() == "http"
+                && api_base.host().is_some_and(is_loopback_host)
+                && subject.len() <= 255
+                && !subject.chars().any(char::is_control),
+            "development identity is permitted only for an explicitly insecure loopback API"
+        );
+    }
+    Ok(subject)
+}
+
 fn validate_signed_object_url(value: &str, allow_insecure_loopback: bool) -> Result<Url> {
     let url = Url::parse(value).context("Studio returned an invalid signed object URL")?;
     ensure!(
@@ -3614,6 +3654,19 @@ mod tests {
         assert!(validate_api_url("http://127.0.0.1:8080", false).is_err());
         assert!(validate_api_url("http://127.0.0.1:8080", true).is_ok());
         assert!(validate_api_url("https://user:secret@studio.reporch.com", false).is_err());
+    }
+
+    #[test]
+    fn development_identity_is_strictly_loopback_only() {
+        let loopback = validate_api_url("http://127.0.0.1:8080", true).unwrap();
+        assert_eq!(
+            validate_dev_subject(&loopback, true, Some("  e2e-author  ")).unwrap(),
+            Some("e2e-author".into())
+        );
+        assert!(validate_dev_subject(&loopback, false, Some("author")).is_err());
+        let production = validate_api_url("https://studio.reporch.com", false).unwrap();
+        assert!(validate_dev_subject(&production, true, Some("author")).is_err());
+        assert!(validate_dev_subject(&loopback, true, Some("bad\nsubject")).is_err());
     }
 
     #[test]
