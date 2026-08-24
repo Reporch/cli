@@ -1203,6 +1203,9 @@ async fn materialize_generator(
 }
 
 pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::validator(options, output).await;
+    }
     match options.command {
         ValidatorCommand::Set {
             source,
@@ -1326,6 +1329,9 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
 }
 
 pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::checker(options, output).await;
+    }
     match options.command {
         CheckerCommand::ListStandard => output.emit(
             "checker list-standard",
@@ -1482,6 +1488,9 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
 }
 
 pub fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::solution(options, output);
+    }
     match options.command {
         SolutionCommand::List => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;

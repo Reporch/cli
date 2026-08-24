@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use reporch_format::{VersionedAuthoringSpec, parse_versioned_authoring_spec};
 use studio_core::{
-    GeneratedCaseRefV2, GeneratorMatrixStrategyV2, GeneratorRecipeSpecV2, GeneratorSpecV2,
-    ProgramSpec, ProgramSpecV2, ScoreAggregationV2, TestCaseOriginV2, TestCaseRoleV2,
-    TestCaseSpecV2, TestGroupSpecV2,
+    CheckerSpec, CheckerUnitSpecV2, GeneratedCaseRefV2, GeneratorMatrixStrategyV2,
+    GeneratorRecipeSpecV2, GeneratorSpecV2, ProgramSpec, ProgramSpecV2, ScoreAggregationV2,
+    SolutionRoleV2, SolutionSpecV2, TestCaseOriginV2, TestCaseRoleV2, TestCaseSpecV2,
+    TestGroupSpecV2, ValidatorUnitSpecV2,
 };
 use uuid::Uuid;
 
@@ -765,6 +766,465 @@ pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> 
     }
 }
 
+pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        ValidatorCommand::Set {
+            source,
+            language,
+            extra,
+        } => {
+            let source = relative_string(&source)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&language),
+                        false,
+                    )?;
+                    let program = ProgramSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: if extra {
+                            format!("extra-{}", spec.testing.validators.extra.len() + 1)
+                        } else {
+                            "primary".into()
+                        },
+                        source_path: source.clone(),
+                        language: language.clone(),
+                        arguments: Vec::new(),
+                    };
+                    if extra {
+                        spec.testing.validators.extra.push(program);
+                    } else {
+                        spec.testing.validators.primary = Some(program);
+                    }
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "validator set",
+                &spec.testing.validators,
+                &format!("Configured validator {source}"),
+            )
+        }
+        ValidatorCommand::UnitAdd {
+            name,
+            input,
+            expected,
+        } => {
+            let input = relative_string(&input)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .validators
+                            .unit_tests
+                            .iter()
+                            .any(|unit| unit.name == name),
+                        "validator unit already exists: {name}"
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &input,
+                        "text/plain",
+                        false,
+                    )?;
+                    spec.testing
+                        .validators
+                        .unit_tests
+                        .push(ValidatorUnitSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: normalize_name(&name)?,
+                            input_file: input.clone(),
+                            expected_valid: matches!(expected, ValidityExpectation::Valid),
+                        });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "validator unit-add",
+                &spec.testing.validators.unit_tests,
+                &format!("Added validator unit {name}"),
+            )
+        }
+        ValidatorCommand::Run { name, runtime } => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let validators = spec
+                .testing
+                .validators
+                .primary
+                .iter()
+                .chain(spec.testing.validators.extra.iter())
+                .collect::<Vec<_>>();
+            ensure!(!validators.is_empty(), "no validator is configured");
+            let units = selected_by_name(
+                &spec.testing.validators.unit_tests,
+                name.as_deref(),
+                |unit| unit.name.as_str(),
+            )?;
+            ensure!(!units.is_empty(), "no validator unit tests are configured");
+            let run_options = runtime.into_run_options();
+            let mut cases = Vec::new();
+            for validator in validators {
+                for unit in &units {
+                    let result = reporch_cli::authoring_runtime::run_program(
+                        &reporch_cli::authoring_runtime::ProgramRequest {
+                            project_directory: &root,
+                            source_path: &validator.source_path,
+                            language: &validator.language,
+                            arguments: &validator.arguments,
+                            stdin_path: Some(&unit.input_file),
+                            options: &run_options,
+                        },
+                    )
+                    .await?;
+                    let actual_valid = result.exit_code == 0;
+                    cases.push(ProgramUnitResult {
+                        program: validator.name.clone(),
+                        name: unit.name.clone(),
+                        expected: if unit.expected_valid {
+                            "valid"
+                        } else {
+                            "invalid"
+                        },
+                        actual: if actual_valid { "valid" } else { "invalid" },
+                        passed: actual_valid == unit.expected_valid,
+                        exit_code: result.exit_code,
+                        duration_ms: result.duration_ms,
+                        stderr: result.stderr,
+                    });
+                }
+            }
+            emit_unit_report("validator run", cases, output)
+        }
+    }
+}
+
+pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        CheckerCommand::ListStandard => output.emit(
+            "checker list-standard",
+            &["exact", "token", "case-insensitive", "floating", "custom"],
+            "exact, token, case-insensitive, floating, custom",
+        ),
+        CheckerCommand::Set {
+            kind,
+            source,
+            language,
+            absolute_error,
+            relative_error,
+        } => {
+            let source = source.as_deref().map(relative_string).transpose()?;
+            let checker = match kind {
+                CheckerKind::Exact => CheckerSpec::Exact,
+                CheckerKind::Token => CheckerSpec::Token,
+                CheckerKind::CaseInsensitive => CheckerSpec::CaseInsensitive,
+                CheckerKind::Floating => CheckerSpec::Floating {
+                    absolute_error: absolute_error.context("--absolute-error is required")?,
+                    relative_error: relative_error.context("--relative-error is required")?,
+                },
+                CheckerKind::Custom => CheckerSpec::Custom {
+                    source_path: source.clone().context("--source is required")?,
+                    language: language.clone().context("--language is required")?,
+                },
+            };
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    if let (Some(source), Some(language)) = (&source, &language) {
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            source,
+                            source_media_type(language),
+                            false,
+                        )?;
+                    }
+                    spec.testing.checker.checker = checker.clone();
+                    Ok(())
+                },
+            )?;
+            output.emit("checker set", &spec.testing.checker, "Configured checker")
+        }
+        CheckerCommand::UnitAdd {
+            name,
+            input,
+            answer,
+            output: actual_output,
+            expected,
+        } => {
+            let input = relative_string(&input)?;
+            let answer = relative_string(&answer)?;
+            let actual_output = relative_string(&actual_output)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .checker
+                            .unit_tests
+                            .iter()
+                            .any(|unit| unit.name == name),
+                        "checker unit already exists: {name}"
+                    );
+                    for path in [&input, &answer, &actual_output] {
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            path,
+                            "text/plain",
+                            false,
+                        )?;
+                    }
+                    spec.testing.checker.unit_tests.push(CheckerUnitSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: normalize_name(&name)?,
+                        input_file: input.clone(),
+                        answer_file: answer.clone(),
+                        output_file: actual_output.clone(),
+                        expected_accepted: matches!(expected, CheckerExpectation::Accept),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "checker unit-add",
+                &spec.testing.checker.unit_tests,
+                &format!("Added checker unit {name}"),
+            )
+        }
+        CheckerCommand::Run { name, runtime } => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            let units =
+                selected_by_name(&spec.testing.checker.unit_tests, name.as_deref(), |unit| {
+                    unit.name.as_str()
+                })?;
+            ensure!(!units.is_empty(), "no checker unit tests are configured");
+            let run_options = runtime.into_run_options();
+            let mut cases = Vec::new();
+            for unit in units {
+                let (actual_accepted, exit_code, duration_ms, stderr) =
+                    if let CheckerSpec::Custom {
+                        source_path,
+                        language,
+                    } = &spec.testing.checker.checker
+                    {
+                        let arguments = vec![
+                            unit.input_file.clone(),
+                            unit.output_file.clone(),
+                            unit.answer_file.clone(),
+                        ];
+                        let result = reporch_cli::authoring_runtime::run_program(
+                            &reporch_cli::authoring_runtime::ProgramRequest {
+                                project_directory: &root,
+                                source_path,
+                                language,
+                                arguments: &arguments,
+                                stdin_path: None,
+                                options: &run_options,
+                            },
+                        )
+                        .await?;
+                        (
+                            result.exit_code == 0,
+                            result.exit_code,
+                            result.duration_ms,
+                            result.stderr,
+                        )
+                    } else {
+                        let answer = read_project_bytes(&root, &unit.answer_file)?;
+                        let actual = read_project_bytes(&root, &unit.output_file)?;
+                        (
+                            reporch_cli::authoring_runtime::standard_checker_matches(
+                                &spec.testing.checker.checker,
+                                &answer,
+                                &actual,
+                            )?,
+                            0,
+                            0,
+                            String::new(),
+                        )
+                    };
+                cases.push(ProgramUnitResult {
+                    program: "checker".into(),
+                    name: unit.name.clone(),
+                    expected: if unit.expected_accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    actual: if actual_accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    passed: actual_accepted == unit.expected_accepted,
+                    exit_code,
+                    duration_ms,
+                    stderr,
+                });
+            }
+            emit_unit_report("checker run", cases, output)
+        }
+    }
+}
+
+pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        SolutionCommand::List => emit_solutions("solution list", output),
+        SolutionCommand::Matrix => emit_solutions("solution matrix", output),
+        SolutionCommand::Add(options) => {
+            let source = relative_string(&options.source)?;
+            let expected_score = score_range(
+                options.minimum_score,
+                options.maximum_score,
+                options.expected,
+            )?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .solutions
+                            .iter()
+                            .any(|solution| solution.program.name == options.name),
+                        "solution already exists: {}",
+                        options.name
+                    );
+                    reporch_cli::local_project_v2::declare_project_file(
+                        root,
+                        spec,
+                        &source,
+                        source_media_type(&options.language),
+                        false,
+                    )?;
+                    let expected_verdict = options.expected.into();
+                    let role = match expected_verdict {
+                        studio_core::ExpectedVerdict::Accepted
+                            if !spec
+                                .testing
+                                .solutions
+                                .iter()
+                                .any(|solution| solution.role == SolutionRoleV2::Reference) =>
+                        {
+                            SolutionRoleV2::Reference
+                        }
+                        studio_core::ExpectedVerdict::WrongAnswer => SolutionRoleV2::KnownWrong,
+                        _ => SolutionRoleV2::Alternative,
+                    };
+                    spec.testing.solutions.push(SolutionSpecV2 {
+                        program: ProgramSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: normalize_name(&options.name)?,
+                            source_path: source.clone(),
+                            language: options.language.clone(),
+                            arguments: Vec::new(),
+                        },
+                        role,
+                        expected_verdict,
+                        expected_score: expected_score.clone(),
+                        group_expectations: Vec::new(),
+                        tags: Vec::new(),
+                        notes: String::new(),
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "solution add",
+                &spec.testing.solutions,
+                &format!("Added solution {}", options.name),
+            )
+        }
+        SolutionCommand::Update(options) => {
+            let expected_score = match options.expected {
+                Some(expected) => {
+                    score_range(options.minimum_score, options.maximum_score, expected)?
+                }
+                None => None,
+            };
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let solution = spec
+                        .testing
+                        .solutions
+                        .iter_mut()
+                        .find(|solution| solution.program.name == options.name)
+                        .context("solution was not found")?;
+                    if let Some(expected) = options.expected {
+                        solution.expected_verdict = expected.into();
+                        solution.expected_score = expected_score.clone();
+                    }
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "solution update",
+                &spec.testing.solutions,
+                &format!("Updated solution {}", options.name),
+            )
+        }
+        SolutionCommand::Remove { name } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let solution_id = find_solution(spec, &name)?.program.id;
+                    ensure!(
+                        !spec.testing.stress_suites.iter().any(|suite| {
+                            suite.oracle_solution_id == solution_id
+                                || suite.candidate_solution_ids.contains(&solution_id)
+                        }),
+                        "solution is still used by a stress suite"
+                    );
+                    ensure!(
+                        !spec
+                            .execution
+                            .interactive
+                            .iter()
+                            .flat_map(|interactive| interactive.unit_tests.iter())
+                            .any(|unit| unit.solution_id == solution_id),
+                        "solution is still used by an interactive unit"
+                    );
+                    let before = spec.testing.solutions.len();
+                    spec.testing
+                        .solutions
+                        .retain(|solution| solution.program.id != solution_id);
+                    ensure!(
+                        before != spec.testing.solutions.len(),
+                        "solution was not found"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "solution remove",
+                &spec.testing.solutions,
+                &format!("Removed solution {name}"),
+            )
+        }
+    }
+}
+
+fn emit_solutions(command: &'static str, output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    output.emit(
+        command,
+        &spec.testing.solutions,
+        &format!("{} solution expectation(s)", spec.testing.solutions.len()),
+    )
+}
+
 fn inferred_role(name: &str) -> TestCaseRoleV2 {
     if name.to_ascii_lowercase().starts_with("sample") {
         TestCaseRoleV2::Sample
@@ -831,4 +1291,16 @@ fn legacy_program(program: &ProgramSpecV2) -> ProgramSpec {
         language: program.language.clone(),
         arguments: program.arguments.clone(),
     }
+}
+
+fn find_solution<'a>(
+    spec: &'a reporch_format::AuthoringSpecV2,
+    value: &str,
+) -> Result<&'a SolutionSpecV2> {
+    let parsed = Uuid::parse_str(value).ok();
+    spec.testing
+        .solutions
+        .iter()
+        .find(|solution| solution.program.name == value || parsed == Some(solution.program.id))
+        .with_context(|| format!("solution was not found: {value}"))
 }

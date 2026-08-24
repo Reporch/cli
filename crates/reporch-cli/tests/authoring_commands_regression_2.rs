@@ -491,3 +491,108 @@ fn v2_generator_materialization_persists_a_replayable_recipe_and_seed() {
         b"17\n"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn v2_validator_checker_and_solution_flows_execute_and_persist() {
+    let runtime = tempfile::tempdir().unwrap();
+    fake_rootless_runtime(runtime.path());
+    let log = runtime.path().join("v2-programs.log");
+    let project = tempfile::tempdir().unwrap();
+    init(project.path(), None);
+    reporch_cli::local_project_v2::migrate_v1_authoring_file(project.path()).unwrap();
+
+    assert!(
+        run_json(
+            project.path(),
+            &[
+                "validator",
+                "set",
+                "--source",
+                "solutions/accepted.py",
+                "--language",
+                "python3",
+            ],
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_json(
+            project.path(),
+            &[
+                "validator",
+                "unit-add",
+                "--name",
+                "valid-v2",
+                "--input",
+                "tests/1.in",
+                "--expected",
+                "valid",
+            ],
+        )
+        .status
+        .success()
+    );
+    let validated = fake_runtime_command(
+        runtime.path(),
+        project.path(),
+        &["validator", "run", "--runtime", "podman"],
+        "",
+        &log,
+    );
+    assert!(validated.status.success(), "{validated:?}");
+
+    assert!(
+        run_json(
+            project.path(),
+            &[
+                "checker",
+                "unit-add",
+                "--name",
+                "accept-v2",
+                "--input",
+                "tests/1.in",
+                "--answer",
+                "tests/1.ans",
+                "--output",
+                "tests/1.ans",
+                "--expected",
+                "accept",
+            ],
+        )
+        .status
+        .success()
+    );
+    let checked = run_json(project.path(), &["checker", "run"]);
+    assert!(checked.status.success(), "{checked:?}");
+
+    let added = run_json(
+        project.path(),
+        &[
+            "solution",
+            "add",
+            "--name",
+            "third-accepted",
+            "--source",
+            "solutions/accepted.py",
+            "--language",
+            "python3",
+            "--expected",
+            "accepted",
+        ],
+    );
+    assert!(added.status.success(), "{added:?}");
+    let matrix = run_json(project.path(), &["solution", "matrix"]);
+    assert!(matrix.status.success(), "{matrix:?}");
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(project.path()).unwrap();
+    assert!(spec.testing.validators.primary.is_some());
+    assert_eq!(spec.testing.validators.unit_tests.len(), 1);
+    assert_eq!(spec.testing.checker.unit_tests.len(), 1);
+    assert!(
+        spec.testing
+            .solutions
+            .iter()
+            .any(|solution| solution.program.name == "third-accepted")
+    );
+}
