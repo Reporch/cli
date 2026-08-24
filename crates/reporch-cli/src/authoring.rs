@@ -13,6 +13,8 @@ use studio_core::{
 };
 use uuid::Uuid;
 
+mod v2;
+
 use crate::cli_output::CliOutput;
 
 #[derive(Debug, ClapArgs)]
@@ -484,6 +486,9 @@ impl From<Verdict> for ExpectedVerdict {
 }
 
 pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::statement(options, output);
+    }
     match options.command {
         StatementCommand::Add {
             locale,
@@ -604,6 +609,9 @@ fn safe_statement_html(markdown: &str) -> String {
 }
 
 pub fn tests(options: TestOptions, output: &CliOutput, no_input: bool) -> Result<()> {
+    if v2::is_active_project()? {
+        return v2::tests(options, output, no_input);
+    }
     match options.command {
         None => guided_test_case(output, no_input),
         Some(TestCommand::Case { command }) => test_case(command, output),

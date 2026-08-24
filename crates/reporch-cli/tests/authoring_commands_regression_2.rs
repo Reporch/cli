@@ -167,6 +167,53 @@ fn renderer_and_standard_checker_flows_are_deterministic_safe_and_non_overwritin
     assert_eq!(envelope["data"]["submissions"][1]["score"], 0.0);
 }
 
+#[test]
+fn v2_projects_can_edit_statements_tests_and_named_groups_without_internal_ids() {
+    let project = tempfile::tempdir().unwrap();
+    init(project.path(), None);
+    reporch_cli::local_project_v2::migrate_v1_authoring_file(project.path()).unwrap();
+
+    let checked = run_json(project.path(), &["statement", "check"]);
+    assert!(checked.status.success(), "{checked:?}");
+    let group = run_json(
+        project.path(),
+        &["test", "group", "add", "easy", "--points", "100"],
+    );
+    assert!(group.status.success(), "{group:?}");
+    let added = run_json(
+        project.path(),
+        &[
+            "test",
+            "case",
+            "add",
+            "--name",
+            "second",
+            "--input",
+            "tests/1.in",
+            "--answer",
+            "tests/1.ans",
+            "--group",
+            "easy",
+        ],
+    );
+    assert!(added.status.success(), "{added:?}");
+
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(project.path()).unwrap();
+    let easy = spec
+        .testing
+        .groups
+        .iter()
+        .find(|group| group.name == "easy")
+        .unwrap();
+    let second = spec
+        .testing
+        .tests
+        .iter()
+        .find(|test| test.name == "second")
+        .unwrap();
+    assert_eq!(second.group_ids, vec![easy.id]);
+}
+
 #[cfg(unix)]
 fn fake_rootless_runtime(directory: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
