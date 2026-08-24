@@ -61,22 +61,8 @@ jobs:
               | .number
             ' "$RUNNER_TEMP/beta-issues.json")
             gh issue view "$latest_number" --json comments > "$RUNNER_TEMP/beta-comments.json"
-            BETA_ISSUES="$RUNNER_TEMP/beta-issues.json" BETA_COMMENTS="$RUNNER_TEMP/beta-comments.json" node -e '
-              const fs = require("node:fs");
-              const candidates = JSON.parse(fs.readFileSync(process.env.BETA_ISSUES, "utf8"))
-                .filter((issue) => /^Reporch CLI 1\.0\.0-rc\.[0-9A-Za-z.-]+ — 30-day stability window$/.test(issue.title))
-                .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
-              const latest = candidates[0];
-              const elapsed = latest && Date.parse(latest.closedAt) - Date.parse(latest.createdAt);
-              if (!latest || !latest.closedAt || !Number.isFinite(elapsed) || elapsed < 30 * 24 * 60 * 60 * 1000) process.exit(1);
-              const comments = JSON.parse(fs.readFileSync(process.env.BETA_COMMENTS, "utf8")).comments ?? [];
-              const passedDates = new Set(comments.flatMap(({author, body}) => {
-                if (!["github-actions", "github-actions[bot]"].includes(author?.login)) return [];
-                const match = String(body).match(/<!-- reporch-cli-stability:(\d{4}-\d{2}-\d{2}):passed:\d+:\d+ -->/);
-                return match ? [match[1]] : [];
-              }));
-              if (passedDates.size < 30) process.exit(1);
-            '
+            node scripts/verify-stability-window.mjs \
+              "$RUNNER_TEMP/beta-issues.json" "$RUNNER_TEMP/beta-comments.json"
           fi
           {
             echo "version=$version"

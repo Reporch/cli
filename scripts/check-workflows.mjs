@@ -83,9 +83,7 @@ assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prereleas
 assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --latest/);
 assert.match(release, /qualify-published-artifacts:/);
 assert.match(release, /start-beta-window:/);
-assert.match(release, /30 \* 24 \* 60 \* 60 \* 1000/);
-assert.match(release, /passedDates\.size < 30/);
-assert.match(release, /github-actions\[bot\]/);
+assert.match(release, /node scripts\/verify-stability-window\.mjs/);
 const stability = readFileSync(".github/workflows/rc-stability.yml", "utf8");
 assert.match(stability, /schedule:/);
 assert.match(stability, /@reporch\/cli@\$VERSION/);
