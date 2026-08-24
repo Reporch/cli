@@ -1,0 +1,236 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, ensure};
+use reporch_format::{
+    AuthoringFileV2, AuthoringSpecV2, parse_authoring_spec_v2, to_authoring_yaml_v2,
+};
+use studio_core::{ManifestFile, ReleaseManifestV2};
+use uuid::Uuid;
+
+use crate::local_project::{
+    AUTHORING_FILE_NAME, LEGACY_MANIFEST_FILE_NAME, atomic_create_new, atomic_replace,
+    ensure_real_directory, hash_regular_project_file, reject_non_regular_destination,
+};
+
+pub const AUTHORING_V1_BACKUP_FILE_NAME: &str = "reporch.pre-v2.yaml";
+
+pub fn read_authoring_spec(directory: &Path) -> Result<AuthoringSpecV2> {
+    let path = directory.join(AUTHORING_FILE_NAME);
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    parse_authoring_spec_v2(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+pub fn write_authoring_spec_atomic(directory: &Path, spec: &AuthoringSpecV2) -> Result<PathBuf> {
+    let root = ensure_real_directory(directory)?;
+    let path = root.join(AUTHORING_FILE_NAME);
+    reject_non_regular_destination(&path)?;
+    let bytes = to_authoring_yaml_v2(spec).context("serialize v2 authoring spec")?;
+    atomic_replace(&path, &bytes, 0o644)?;
+    Ok(path)
+}
+
+pub fn write_authoring_spec_create_new(
+    directory: &Path,
+    spec: &AuthoringSpecV2,
+) -> Result<PathBuf> {
+    let root = ensure_real_directory(directory)?;
+    let bytes = to_authoring_yaml_v2(spec).context("serialize v2 authoring spec")?;
+    let path = root.join(AUTHORING_FILE_NAME);
+    atomic_create_new(&path, &bytes)?;
+    Ok(path)
+}
+
+pub fn update_authoring_spec<F>(directory: &Path, update: F) -> Result<AuthoringSpecV2>
+where
+    F: FnOnce(&Path, &mut AuthoringSpecV2) -> Result<()>,
+{
+    let root = crate::local_project::discover_project(directory)?;
+    let mut spec = read_authoring_spec(&root)?;
+    update(&root, &mut spec)?;
+    spec.validate_references()
+        .context("updated v2 authoring spec contains invalid references")?;
+    write_authoring_spec_atomic(&root, &spec)?;
+    Ok(spec)
+}
+
+pub fn declare_project_file(
+    root: &Path,
+    spec: &mut AuthoringSpecV2,
+    path: &str,
+    media_type: &str,
+    executable: bool,
+) -> Result<()> {
+    let normalized = studio_core::normalize_relative_path(path)?;
+    let _ = hash_regular_project_file(root, &normalized)?;
+    if let Some(existing) = spec.files.iter_mut().find(|file| file.path == normalized) {
+        existing.media_type = media_type.to_owned();
+        existing.executable = executable;
+    } else {
+        spec.files.push(AuthoringFileV2 {
+            path: normalized,
+            media_type: media_type.to_owned(),
+            executable,
+        });
+        spec.files.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    Ok(())
+}
+
+pub fn compile_authoring_spec(
+    directory: &Path,
+    spec: &AuthoringSpecV2,
+    commit_id: Uuid,
+) -> Result<ReleaseManifestV2> {
+    let root = ensure_real_directory(directory)?;
+    let files = spec
+        .files
+        .iter()
+        .map(|declared| {
+            let (sha256, size_bytes) = hash_regular_project_file(&root, &declared.path)?;
+            Ok(ManifestFile {
+                path: declared.path.clone(),
+                sha256: sha256
+                    .parse()
+                    .context("parse locally generated SHA-256 digest")?,
+                size_bytes,
+                media_type: declared.media_type.clone(),
+                executable: declared.executable,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    spec.materialize(commit_id, files)
+        .context("materialize immutable v2 release manifest")
+}
+
+pub fn write_generated_manifest_atomic(
+    directory: &Path,
+    manifest: &ReleaseManifestV2,
+) -> Result<PathBuf> {
+    manifest.validate_references()?;
+    let root = ensure_real_directory(directory)?;
+    let path = root.join(LEGACY_MANIFEST_FILE_NAME);
+    let mut bytes = serde_json::to_vec_pretty(manifest)?;
+    bytes.push(b'\n');
+    atomic_replace(&path, &bytes, 0o644)?;
+    Ok(path)
+}
+
+pub fn migrate_v1_authoring_file(directory: &Path) -> Result<AuthoringSpecV2> {
+    let root = ensure_real_directory(directory)?;
+    let path = root.join(AUTHORING_FILE_NAME);
+    let original = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    if let Ok(v2) = parse_authoring_spec_v2(&original) {
+        return Ok(v2);
+    }
+    let v1 = reporch_format::parse_authoring_spec(&original)
+        .with_context(|| format!("parse legacy authoring file {}", path.display()))?;
+    let v2 = AuthoringSpecV2::migrate_v1(&v1)?;
+    let bytes = to_authoring_yaml_v2(&v2)?;
+    let reparsed = parse_authoring_spec_v2(&bytes)?;
+    ensure!(reparsed == v2, "v2 migration round-trip changed meaning");
+
+    let backup = root.join(AUTHORING_V1_BACKUP_FILE_NAME);
+    match atomic_create_new(&backup, &original) {
+        Ok(()) => {}
+        Err(error) if backup.exists() => {
+            let existing = fs::read(&backup)?;
+            ensure!(
+                existing == original,
+                "refusing to overwrite a different v1 authoring backup: {}",
+                backup.display()
+            );
+            let _ = error;
+        }
+        Err(error) => return Err(error),
+    }
+    atomic_replace(&path, &bytes, 0o644)?;
+    Ok(v2)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use reporch_format::{AUTHORING_SPEC_SCHEMA_V1, AuthoringFileV1, AuthoringSpecV1};
+    use studio_core::{CheckerSpec, JudgingSpec, PackageProfile, ProblemType, ResourceLimits};
+
+    use super::*;
+
+    fn write_minimal_v1(directory: &Path) -> AuthoringSpecV1 {
+        fs::create_dir_all(directory.join("statements")).unwrap();
+        fs::write(directory.join("statements/ko.md"), "# 합\n").unwrap();
+        let spec = AuthoringSpecV1 {
+            schema: AUTHORING_SPEC_SCHEMA_V1.into(),
+            project_id: Uuid::now_v7(),
+            problem_type: ProblemType::Standard,
+            package_profile: PackageProfile::ReporchNative,
+            default_locale: "ko".into(),
+            title: BTreeMap::from([("ko".into(), "합".into())]),
+            statements: BTreeMap::from([("ko".into(), "statements/ko.md".into())]),
+            files: vec![AuthoringFileV1 {
+                path: "statements/ko.md".into(),
+                media_type: "text/markdown".into(),
+                executable: false,
+            }],
+            toolchains: BTreeMap::new(),
+            judging: JudgingSpec {
+                limits: ResourceLimits {
+                    time_ms: 1_000,
+                    memory_mib: 256,
+                    output_kib: 65_536,
+                },
+                checker: CheckerSpec::Token,
+                tests: vec![],
+                groups: vec![],
+                generators: vec![],
+                validator_path: None,
+                validator_language: None,
+                extra_validator_paths: vec![],
+                extra_validators: vec![],
+                validator_tests: vec![],
+                checker_tests: vec![],
+                interactor_path: None,
+                interactor_language: None,
+                grader_path: None,
+                grader_language: None,
+                harness: None,
+            },
+            sources: vec![],
+            solutions: vec![],
+            output_submissions: vec![],
+            publication: None,
+            policy_version: "studio-policy-v1".into(),
+        };
+        crate::local_project::write_authoring_spec_create_new(directory, &spec).unwrap();
+        spec
+    }
+
+    #[test]
+    fn v1_file_migrates_once_and_preserves_a_create_only_backup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = write_minimal_v1(temporary.path());
+        let migrated = migrate_v1_authoring_file(temporary.path()).unwrap();
+        assert_eq!(migrated.project_id, original.project_id);
+        assert_eq!(read_authoring_spec(temporary.path()).unwrap(), migrated);
+        let backup = fs::read(temporary.path().join(AUTHORING_V1_BACKUP_FILE_NAME)).unwrap();
+        assert!(matches!(
+            reporch_format::parse_versioned_authoring_spec(&backup).unwrap(),
+            reporch_format::VersionedAuthoringSpec::V1(_)
+        ));
+        assert_eq!(
+            migrate_v1_authoring_file(temporary.path()).unwrap(),
+            migrated
+        );
+    }
+
+    #[test]
+    fn v2_compiler_hashes_declared_files_and_rejects_inventory_drift() {
+        let temporary = tempfile::tempdir().unwrap();
+        write_minimal_v1(temporary.path());
+        let v2 = migrate_v1_authoring_file(temporary.path()).unwrap();
+        let manifest = compile_authoring_spec(temporary.path(), &v2, Uuid::now_v7()).unwrap();
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].path, "statements/ko.md");
+    }
+}

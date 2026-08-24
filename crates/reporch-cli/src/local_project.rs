@@ -502,7 +502,7 @@ fn verify_manifest_files(directory: &Path, manifest: &ReleaseManifestV1) -> Resu
     Ok(())
 }
 
-fn hash_regular_project_file(root: &Path, relative_path: &str) -> Result<(String, u64)> {
+pub(crate) fn hash_regular_project_file(root: &Path, relative_path: &str) -> Result<(String, u64)> {
     studio_core::validate_relative_path(relative_path)?;
     let source = root.join(relative_path);
     let metadata = fs::symlink_metadata(&source)
@@ -568,7 +568,7 @@ fn create_or_verify_backup(path: &Path, expected: &[u8]) -> Result<()> {
     }
 }
 
-fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .context("destination has no parent directory")?;
@@ -591,7 +591,7 @@ fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8], unix_mode: u32) -> Result<()> {
+pub(crate) fn atomic_replace(path: &Path, bytes: &[u8], unix_mode: u32) -> Result<()> {
     reject_non_regular_destination(path)?;
     let parent = path
         .parent()
@@ -617,7 +617,7 @@ fn atomic_replace(path: &Path, bytes: &[u8], unix_mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn reject_non_regular_destination(path: &Path) -> Result<()> {
+pub(crate) fn reject_non_regular_destination(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => ensure!(
             metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
@@ -673,7 +673,7 @@ fn read_bounded_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("read {}", path.display()))
 }
 
-fn ensure_real_directory(directory: &Path) -> Result<PathBuf> {
+pub(crate) fn ensure_real_directory(directory: &Path) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(directory)
         .with_context(|| format!("inspect project directory {}", directory.display()))?;
     ensure!(
