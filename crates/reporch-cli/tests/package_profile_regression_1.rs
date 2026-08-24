@@ -93,3 +93,119 @@ fn package_profile_commands_complete_without_panicking_and_round_trip() {
         fs::read(manifest).unwrap()
     );
 }
+
+#[test]
+fn every_external_v2_sidecar_restores_the_exact_manifest_and_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = temporary.path().join("project");
+    let init = reporch()
+        .args([
+            "--quiet",
+            "project",
+            "init",
+            "--title",
+            "Polygon V2 round trip",
+            "--directory",
+            project.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    for arguments in [
+        vec![
+            "validator",
+            "set",
+            "--source",
+            "solutions/accepted.py",
+            "--language",
+            "python3",
+        ],
+        vec![
+            "validator",
+            "unit-add",
+            "--name",
+            "valid",
+            "--input",
+            "tests/1.in",
+            "--expected",
+            "valid",
+        ],
+        vec![
+            "validator",
+            "unit-add",
+            "--name",
+            "invalid",
+            "--input",
+            "tests/1.in",
+            "--expected",
+            "invalid",
+        ],
+    ] {
+        let output = reporch()
+            .args(["--cwd", project.to_str().unwrap(), "--quiet"])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let manifest = project.join("reporch.problem.json");
+    let previous: studio_core::ReleaseManifestV2 =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&project).unwrap();
+    let current =
+        reporch_cli::local_project_v2::compile_authoring_spec(&project, &spec, previous.commit_id)
+            .unwrap();
+    fs::write(&manifest, serde_json::to_vec_pretty(&current).unwrap()).unwrap();
+    for (name, profile) in [
+        ("polygon", "polygon-compatible"),
+        ("icpc", "icpc202509"),
+        ("legacy", "icpc-legacy"),
+        ("domjudge", "domjudge-zip"),
+    ] {
+        let archive = temporary.path().join(format!("{name}.zip"));
+        let imported = temporary.path().join(format!("imported-{name}"));
+        let export = reporch()
+            .args([
+                "--format",
+                "json",
+                "package",
+                "export",
+                manifest.to_str().unwrap(),
+                archive.to_str().unwrap(),
+                "--profile",
+                profile,
+                "--source-root",
+                project.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(export.status.success(), "{profile}: {export:?}");
+        let import = reporch()
+            .args([
+                "--format",
+                "json",
+                "package",
+                "import",
+                archive.to_str().unwrap(),
+                imported.to_str().unwrap(),
+                "--profile",
+                profile,
+            ])
+            .output()
+            .unwrap();
+        assert!(import.status.success(), "{profile}: {import:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(imported.join("reporch.problem.json")).unwrap()
+            )
+            .unwrap(),
+            serde_json::from_slice::<Value>(&fs::read(&manifest).unwrap()).unwrap(),
+            "{profile}"
+        );
+        assert_eq!(
+            fs::read(imported.join("solutions/accepted.py")).unwrap(),
+            fs::read(project.join("solutions/accepted.py")).unwrap(),
+            "{profile}"
+        );
+    }
+}

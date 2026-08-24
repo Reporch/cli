@@ -13,6 +13,7 @@ mod polygon_export;
 mod polygon_import;
 mod profile_config;
 mod statement_tex;
+mod versioned_package;
 
 use std::fs;
 use std::io::{IsTerminal as _, Write as _};
@@ -25,9 +26,10 @@ use cli_output::{CliOutput, ColorMode, OutputFormat};
 use reporch_cli::local_sandbox::{LocalSandboxOptions, OciRuntime};
 use reporch_cli::studio_remote;
 use reporch_cli::{NativeAuthOptions, device_auth_config};
+#[cfg(test)]
+use studio_core::ReleaseManifestV1;
 use studio_core::{
-    CompatibilityIssueV1, CompatibilityReportV1, CompatibilitySeverity, PackageProfile,
-    ReleaseManifestV1, VersionedReleaseManifest, compatibility_report, validate_manifest,
+    PackageProfile, VersionedReleaseManifest, compatibility_report, validate_manifest,
 };
 use studio_native_auth::qualification_keyring_canary;
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
@@ -1652,14 +1654,26 @@ fn import_package(
     profile: PackageProfile,
     output: &CliOutput,
 ) -> Result<()> {
-    let manifest: VersionedReleaseManifest = match profile {
-        PackageProfile::Icpc202509 => icpc_import::import_icpc_2025_09(input, directory)?.into(),
-        PackageProfile::IcpcLegacy => icpc_legacy::import_icpc_legacy(input, directory)?.into(),
-        PackageProfile::DomjudgeZip => icpc_import::import_domjudge_zip(input, directory)?.into(),
-        PackageProfile::PolygonCompatible => {
-            polygon_import::import_polygon_package(input, directory)?.into()
+    let manifest: VersionedReleaseManifest = if profile != PackageProfile::ReporchNative
+        && versioned_package::contains_v2_sidecar(input)?
+    {
+        versioned_package::import_v2_sidecar(input, directory, profile)?
+    } else {
+        match profile {
+            PackageProfile::Icpc202509 => {
+                icpc_import::import_icpc_2025_09(input, directory)?.into()
+            }
+            PackageProfile::IcpcLegacy => icpc_legacy::import_icpc_legacy(input, directory)?.into(),
+            PackageProfile::DomjudgeZip => {
+                icpc_import::import_domjudge_zip(input, directory)?.into()
+            }
+            PackageProfile::PolygonCompatible => {
+                polygon_import::import_polygon_package(input, directory)?.into()
+            }
+            PackageProfile::ReporchNative => {
+                native_package::import_native_versioned(input, directory)?
+            }
         }
-        PackageProfile::ReporchNative => native_package::import_native_versioned(input, directory)?,
     };
     match &manifest {
         VersionedReleaseManifest::V1(manifest) => {
@@ -1702,61 +1716,63 @@ fn export_package(
         .map(Path::to_path_buf)
         .or_else(|| manifest_path.parent().map(Path::to_path_buf))
         .context("manifest path has no parent directory")?;
-    match profile {
-        PackageProfile::Icpc202509 => icpc_export::export_icpc_2025_09(
-            require_v1_external_manifest(&manifest, profile)?,
-            &source_root,
-            output,
-        )?,
-        PackageProfile::IcpcLegacy => icpc_legacy::export_icpc_legacy(
-            require_v1_external_manifest(&manifest, profile)?,
-            &source_root,
-            output,
-        )?,
-        PackageProfile::DomjudgeZip => icpc_export::export_domjudge_zip(
-            require_v1_external_manifest(&manifest, profile)?,
-            &source_root,
-            output,
-        )?,
-        PackageProfile::PolygonCompatible => polygon_export::export_polygon_package(
-            require_v1_external_manifest(&manifest, profile)?,
-            &source_root,
-            output,
-        )?,
-        PackageProfile::ReporchNative => {
-            native_package::export_native_versioned(&manifest, &source_root, output)?
+    let report = match (&manifest, profile) {
+        (_, PackageProfile::ReporchNative) => {
+            native_package::export_native_versioned(&manifest, &source_root, output)?;
+            None
         }
-    }
+        (VersionedReleaseManifest::V1(manifest), PackageProfile::Icpc202509) => {
+            icpc_export::export_icpc_2025_09(manifest, &source_root, output)?;
+            Some(compatibility_report(manifest, profile))
+        }
+        (VersionedReleaseManifest::V1(manifest), PackageProfile::IcpcLegacy) => {
+            icpc_legacy::export_icpc_legacy(manifest, &source_root, output)?;
+            Some(compatibility_report(manifest, profile))
+        }
+        (VersionedReleaseManifest::V1(manifest), PackageProfile::DomjudgeZip) => {
+            icpc_export::export_domjudge_zip(manifest, &source_root, output)?;
+            Some(compatibility_report(manifest, profile))
+        }
+        (VersionedReleaseManifest::V1(manifest), PackageProfile::PolygonCompatible) => {
+            polygon_export::export_polygon_package(manifest, &source_root, output)?;
+            Some(compatibility_report(manifest, profile))
+        }
+        (VersionedReleaseManifest::V2(manifest), target) => {
+            Some(versioned_package::export_v2_with_sidecar(
+                manifest,
+                &source_root,
+                output,
+                target,
+                |projection, root, destination| match target {
+                    PackageProfile::Icpc202509 => {
+                        icpc_export::export_icpc_2025_09(projection, root, destination)
+                    }
+                    PackageProfile::IcpcLegacy => {
+                        icpc_legacy::export_icpc_legacy(projection, root, destination)
+                    }
+                    PackageProfile::DomjudgeZip => {
+                        icpc_export::export_domjudge_zip(projection, root, destination)
+                    }
+                    PackageProfile::PolygonCompatible => {
+                        polygon_export::export_polygon_package(projection, root, destination)
+                    }
+                    PackageProfile::ReporchNative => unreachable!(),
+                },
+            )?)
+        }
+    };
     let data = serde_json::json!({
         "schema": "reporch.package-export-result.v1",
         "profile": profile,
         "output": output,
         "manifest_digest": manifest.digest()?,
+        "compatibility": report,
     });
     cli_output.emit(
         "package export",
         &data,
         &format!("Exported package to {}", output.display()),
     )
-}
-
-fn require_v1_external_manifest(
-    manifest: &VersionedReleaseManifest,
-    profile: PackageProfile,
-) -> Result<&ReleaseManifestV1> {
-    match manifest {
-        VersionedReleaseManifest::V1(manifest) => Ok(manifest),
-        VersionedReleaseManifest::V2(_) => bail!(
-            "V2 export to {profile:?} is not lossless yet; use reporch-native or inspect `reporch manifest compatibility --profile {}`",
-            match profile {
-                PackageProfile::Icpc202509 => "icpc202509",
-                PackageProfile::IcpcLegacy => "icpc-legacy",
-                PackageProfile::PolygonCompatible => "polygon-compatible",
-                PackageProfile::DomjudgeZip => "domjudge-zip",
-                PackageProfile::ReporchNative => "reporch-native",
-            }
-        ),
-    }
 }
 
 fn compatibility(
@@ -1768,29 +1784,9 @@ fn compatibility(
     let manifest = read_versioned_manifest(path)?;
     let report = match &manifest {
         VersionedReleaseManifest::V1(manifest) => compatibility_report(manifest, profile),
-        VersionedReleaseManifest::V2(manifest) if profile == PackageProfile::ReporchNative => {
-            CompatibilityReportV1 {
-                schema: studio_core::COMPATIBILITY_REPORT_SCHEMA_V1.into(),
-                source_profile: manifest.package_profile,
-                target_profile: profile,
-                exportable: true,
-                lossless: true,
-                issues: vec![],
-            }
+        VersionedReleaseManifest::V2(manifest) => {
+            versioned_package::compatibility_v2(manifest, profile)?
         }
-        VersionedReleaseManifest::V2(manifest) => CompatibilityReportV1 {
-            schema: studio_core::COMPATIBILITY_REPORT_SCHEMA_V1.into(),
-            source_profile: manifest.package_profile,
-            target_profile: profile,
-            exportable: false,
-            lossless: false,
-            issues: vec![CompatibilityIssueV1 {
-                code: "compatibility.v2_external_export_pending".into(),
-                severity: CompatibilitySeverity::Error,
-                message: "this V2 project uses semantics that require the versioned external-profile exporter".into(),
-                path: None,
-            }],
-        },
     };
     if strict && !report.exportable {
         bail!("manifest cannot be exported to the requested profile");
