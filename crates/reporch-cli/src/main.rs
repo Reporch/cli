@@ -89,6 +89,10 @@ enum Command {
     Checker(authoring::CheckerOptions),
     /// Manage expected solution verdicts and score ranges.
     Solution(authoring::SolutionOptions),
+    /// Generate deterministic answer files with a reference solution.
+    Answer(authoring::AnswerOptions),
+    /// Define and run generator/oracle/candidate stress suites.
+    Stress(authoring::StressOptions),
     /// Configure an interactive problem's interactor.
     Interactor(authoring::InteractorOptions),
     /// Configure a library or grader problem's grader.
@@ -620,6 +624,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Validator(options) => authoring::validator(options, output).await,
         Command::Checker(options) => authoring::checker(options, output).await,
         Command::Solution(options) => authoring::solution(options, output),
+        Command::Answer(options) => authoring::answer(options, output).await,
+        Command::Stress(options) => authoring::stress(options, output).await,
         Command::Interactor(options) => authoring::interactor(options, output).await,
         Command::Grader(options) => authoring::grader(options, output).await,
         Command::Output(options) => authoring::output_submission(options, output).await,
@@ -1456,6 +1462,8 @@ fn command_name(command: &Command) -> &'static str {
             ReviewCommand::RequestChanges(_) => "review request-changes",
         },
         Command::Manifest { .. } => "manifest",
+        Command::Answer(_) => "answer",
+        Command::Stress(_) => "stress",
         Command::Package { .. } => "package",
         Command::Sandbox { .. } => "sandbox",
         Command::Toolchain { command } => match command {

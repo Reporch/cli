@@ -8,8 +8,8 @@ use studio_core::{
     CheckerSpec, CheckerUnitSpecV2, GeneratedCaseRefV2, GeneratorMatrixStrategyV2,
     GeneratorRecipeSpecV2, GeneratorSpecV2, HarnessKindV2, HarnessProfileSpecV2, HarnessSpecV2,
     InteractiveSpecV2, OutputSubmissionSpecV2, ProblemType, ProgramSpec, ProgramSpecV2,
-    ScoreAggregationV2, SolutionRoleV2, SolutionSpecV2, TestCaseOriginV2, TestCaseRoleV2,
-    TestCaseSpecV2, TestGroupSpecV2, ValidatorUnitSpecV2,
+    ScoreAggregationV2, SolutionRoleV2, SolutionSpecV2, StressSuiteSpecV2, TestCaseOriginV2,
+    TestCaseRoleV2, TestCaseSpecV2, TestGroupSpecV2, ValidatorUnitSpecV2,
 };
 use uuid::Uuid;
 
@@ -1224,6 +1224,587 @@ fn emit_solutions(command: &'static str, output: &CliOutput) -> Result<()> {
         &spec.testing.solutions,
         &format!("{} solution expectation(s)", spec.testing.solutions.len()),
     )
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedAnswerResult {
+    test_id: Uuid,
+    test_name: String,
+    path: String,
+    sha256: String,
+}
+
+pub(super) async fn answer(options: AnswerOptions, output: &CliOutput) -> Result<()> {
+    let AnswerCommand::Generate {
+        solution,
+        test,
+        missing_only,
+        runtime,
+    } = options.command;
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let solution = find_solution(&spec, &solution)?.clone();
+    ensure!(
+        solution.expected_verdict == studio_core::ExpectedVerdict::Accepted
+            && matches!(
+                solution.role,
+                SolutionRoleV2::Reference | SolutionRoleV2::Oracle
+            ),
+        "answer generation requires an accepted reference or oracle solution"
+    );
+    let selected = spec
+        .testing
+        .tests
+        .iter()
+        .filter(|candidate| test.is_none_or(|test| candidate.id == test))
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(!selected.is_empty(), "no matching test case was found");
+    let run_options = runtime.into_run_options();
+    let mut generated = Vec::new();
+    for test in selected {
+        if test.answer_file.is_some() {
+            ensure!(
+                missing_only,
+                "test {} already has an answer file; use --missing-only to skip it",
+                test.name
+            );
+            continue;
+        }
+        let answer_path = answer_path_for(&test.input_file)?;
+        let result = reporch_cli::authoring_runtime::run_program(
+            &reporch_cli::authoring_runtime::ProgramRequest {
+                project_directory: &root,
+                source_path: &solution.program.source_path,
+                language: &solution.program.language,
+                arguments: &solution.program.arguments,
+                stdin_path: Some(&test.input_file),
+                options: &run_options,
+            },
+        )
+        .await?;
+        ensure!(
+            result.exit_code == 0,
+            "reference solution failed on {} with exit {}: {}",
+            test.name,
+            result.exit_code,
+            result.stderr.trim()
+        );
+        generated.push((test, answer_path, result.stdout_bytes));
+    }
+    for (_, path, bytes) in &generated {
+        write_project_bytes_atomic(&root, path, bytes)?;
+    }
+    reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
+        for (test, path, _) in &generated {
+            reporch_cli::local_project_v2::declare_project_file(
+                root,
+                spec,
+                path,
+                "text/plain",
+                false,
+            )?;
+            let target = spec
+                .testing
+                .tests
+                .iter_mut()
+                .find(|candidate| candidate.id == test.id)
+                .context("test disappeared while saving generated answers")?;
+            target.answer_file = Some(path.clone());
+        }
+        Ok(())
+    })?;
+    let results = generated
+        .into_iter()
+        .map(|(test, path, bytes)| GeneratedAnswerResult {
+            test_id: test.id,
+            test_name: test.name,
+            path,
+            sha256: hex::encode(Sha256::digest(bytes)),
+        })
+        .collect::<Vec<_>>();
+    output.emit(
+        "answer generate",
+        &results,
+        &format!("Generated {} answer file(s)", results.len()),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct StressCandidateResult {
+    candidate: String,
+    expected_counterexample: bool,
+    counterexample_seed: Option<u64>,
+    input_path: Option<String>,
+    passed: bool,
+}
+
+pub(super) async fn stress(options: StressOptions, output: &CliOutput) -> Result<()> {
+    match options.command {
+        StressCommand::List => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            output.emit(
+                "stress list",
+                &spec.testing.stress_suites,
+                &format!("{} stress suite(s)", spec.testing.stress_suites.len()),
+            )
+        }
+        StressCommand::Add {
+            name,
+            generator,
+            recipe,
+            oracle,
+            candidates,
+            seed_start,
+            cases,
+            timeout_ms,
+            minimize_failure,
+        } => {
+            ensure!(
+                (1..=100_000).contains(&cases),
+                "cases must be between 1 and 100000"
+            );
+            ensure!(
+                (10..=600_000).contains(&timeout_ms),
+                "timeout must be between 10 and 600000 ms"
+            );
+            let normalized_name = normalize_name(&name)?;
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    ensure!(
+                        !spec
+                            .testing
+                            .stress_suites
+                            .iter()
+                            .any(|suite| suite.name == normalized_name),
+                        "stress suite already exists: {normalized_name}"
+                    );
+                    let generator = find_generator(spec, &generator)?;
+                    let recipe_id = Uuid::parse_str(&recipe).ok();
+                    let recipe = generator
+                        .recipes
+                        .iter()
+                        .find(|candidate| {
+                            candidate.name == recipe || recipe_id == Some(candidate.id)
+                        })
+                        .with_context(|| format!("generator recipe was not found: {recipe}"))?;
+                    let oracle = find_solution(spec, &oracle)?;
+                    ensure!(
+                        oracle.expected_verdict == studio_core::ExpectedVerdict::Accepted,
+                        "stress oracle must be expected accepted"
+                    );
+                    let candidate_ids = candidates
+                        .iter()
+                        .map(|candidate| Ok(find_solution(spec, candidate)?.program.id))
+                        .collect::<Result<Vec<_>>>()?;
+                    ensure!(
+                        !candidate_ids.contains(&oracle.program.id),
+                        "the oracle cannot also be a stress candidate"
+                    );
+                    let mut unique = std::collections::BTreeSet::new();
+                    ensure!(
+                        candidate_ids.iter().all(|id| unique.insert(*id)),
+                        "stress candidates must be unique"
+                    );
+                    spec.testing.stress_suites.push(StressSuiteSpecV2 {
+                        id: Uuid::now_v7(),
+                        name: normalized_name.clone(),
+                        generator_id: generator.program.id,
+                        recipe_id: recipe.id,
+                        oracle_solution_id: oracle.program.id,
+                        candidate_solution_ids: candidate_ids,
+                        seed_start,
+                        cases,
+                        timeout_ms,
+                        minimize_failure,
+                    });
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "stress add",
+                &spec.testing.stress_suites,
+                &format!("Added stress suite {normalized_name}"),
+            )
+        }
+        StressCommand::Remove { name } => {
+            let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                Path::new("."),
+                |_root, spec| {
+                    let parsed = Uuid::parse_str(&name).ok();
+                    let before = spec.testing.stress_suites.len();
+                    spec.testing
+                        .stress_suites
+                        .retain(|suite| suite.name != name && parsed != Some(suite.id));
+                    ensure!(
+                        before != spec.testing.stress_suites.len(),
+                        "stress suite was not found"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.emit(
+                "stress remove",
+                &spec.testing.stress_suites,
+                &format!("Removed stress suite {name}"),
+            )
+        }
+        StressCommand::Run { name, runtime } => run_stress_suite(&name, runtime, output).await,
+    }
+}
+
+async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutput) -> Result<()> {
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let parsed = Uuid::parse_str(name).ok();
+    let suite = spec
+        .testing
+        .stress_suites
+        .iter()
+        .find(|suite| suite.name == name || parsed == Some(suite.id))
+        .with_context(|| format!("stress suite was not found: {name}"))?
+        .clone();
+    let generator = spec
+        .testing
+        .generators
+        .iter()
+        .find(|generator| generator.program.id == suite.generator_id)
+        .context("stress generator is missing")?;
+    let recipe = generator
+        .recipes
+        .iter()
+        .find(|recipe| recipe.id == suite.recipe_id)
+        .context("stress generator recipe is missing")?;
+    let oracle = spec
+        .testing
+        .solutions
+        .iter()
+        .find(|solution| solution.program.id == suite.oracle_solution_id)
+        .context("stress oracle is missing")?;
+    let candidates = suite
+        .candidate_solution_ids
+        .iter()
+        .map(|id| {
+            spec.testing
+                .solutions
+                .iter()
+                .find(|solution| solution.program.id == *id)
+                .context("stress candidate is missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut run_options = runtime.into_run_options();
+    run_options.timeout = std::time::Duration::from_millis(suite.timeout_ms);
+    let scratch_parent = root.join(".reporch").join("stress-tmp");
+    fs::create_dir_all(&scratch_parent)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(&scratch_parent)?;
+    let mut first_mismatch =
+        std::collections::BTreeMap::<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>::new();
+    for ordinal in 0..suite.cases {
+        let seed = suite
+            .seed_start
+            .checked_add(u64::from(ordinal))
+            .context("stress seed range overflows u64")?;
+        let input = materialize_generator(
+            &root,
+            &legacy_program(&generator.program),
+            &recipe.argument_template,
+            Some(seed),
+            &run_options,
+        )
+        .await?;
+        let input_path = scratch.path().join(format!("{seed}.in"));
+        fs::write(&input_path, &input)?;
+        let input_relative = input_path
+            .strip_prefix(&root)?
+            .to_str()
+            .context("stress scratch path is not valid Unicode")?
+            .to_owned();
+        let oracle_result = run_solution(&root, oracle, &input_relative, &run_options).await?;
+        ensure!(
+            oracle_result.exit_code == 0,
+            "stress oracle failed for seed {seed}: {}",
+            oracle_result.stderr.trim()
+        );
+        for candidate in &candidates {
+            if first_mismatch.contains_key(&candidate.program.id) {
+                continue;
+            }
+            let candidate_result =
+                run_solution(&root, candidate, &input_relative, &run_options).await?;
+            let matches = candidate_result.exit_code == 0
+                && stress_outputs_match(
+                    &root,
+                    scratch.path(),
+                    &input_relative,
+                    seed,
+                    candidate,
+                    &spec.testing.checker.checker,
+                    &oracle_result.stdout_bytes,
+                    &candidate_result.stdout_bytes,
+                    &run_options,
+                )
+                .await?;
+            if !matches {
+                let (input, oracle_output, candidate_output) = if suite.minimize_failure {
+                    minimize_counterexample(
+                        &root,
+                        scratch.path(),
+                        seed,
+                        candidate,
+                        oracle,
+                        &spec.testing.checker.checker,
+                        input.clone(),
+                        oracle_result.stdout_bytes.clone(),
+                        candidate_result.stdout_bytes,
+                        &run_options,
+                    )
+                    .await?
+                } else {
+                    (
+                        input.clone(),
+                        oracle_result.stdout_bytes.clone(),
+                        candidate_result.stdout_bytes,
+                    )
+                };
+                first_mismatch.insert(
+                    candidate.program.id,
+                    (seed, input, oracle_output, candidate_output),
+                );
+            }
+        }
+    }
+    let mut results = Vec::new();
+    for candidate in candidates {
+        let mismatch = first_mismatch.remove(&candidate.program.id);
+        let expected_counterexample =
+            candidate.expected_verdict != studio_core::ExpectedVerdict::Accepted;
+        let passed = mismatch.is_some() == expected_counterexample;
+        let (counterexample_seed, input_path) =
+            if let Some((seed, input, oracle, actual)) = mismatch {
+                let base = format!("stress-failures/{}-{seed}", suite.name);
+                write_project_bytes_once_or_same(&root, &format!("{base}.in"), &input)?;
+                write_project_bytes_once_or_same(&root, &format!("{base}.oracle"), &oracle)?;
+                write_project_bytes_once_or_same(
+                    &root,
+                    &format!("{base}.{}.out", candidate.program.name),
+                    &actual,
+                )?;
+                (Some(seed), Some(format!("{base}.in")))
+            } else {
+                (None, None)
+            };
+        results.push(StressCandidateResult {
+            candidate: candidate.program.name.clone(),
+            expected_counterexample,
+            counterexample_seed,
+            input_path,
+            passed,
+        });
+    }
+    ensure!(
+        results.iter().all(|result| result.passed),
+        "stress expectations failed: {}",
+        serde_json::to_string(&results)?
+    );
+    output.emit(
+        "stress run",
+        &results,
+        &format!(
+            "Stress suite {} passed {} candidate(s)",
+            suite.name,
+            results.len()
+        ),
+    )
+}
+
+async fn run_solution(
+    root: &Path,
+    solution: &SolutionSpecV2,
+    input_path: &str,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<reporch_cli::local_sandbox::LocalSandboxResult> {
+    reporch_cli::authoring_runtime::run_program(&reporch_cli::authoring_runtime::ProgramRequest {
+        project_directory: root,
+        source_path: &solution.program.source_path,
+        language: &solution.program.language,
+        arguments: &solution.program.arguments,
+        stdin_path: Some(input_path),
+        options,
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stress_outputs_match(
+    root: &Path,
+    scratch: &Path,
+    input_path: &str,
+    seed: u64,
+    candidate: &SolutionSpecV2,
+    checker: &CheckerSpec,
+    oracle_output: &[u8],
+    candidate_output: &[u8],
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<bool> {
+    let CheckerSpec::Custom {
+        source_path,
+        language,
+    } = checker
+    else {
+        return reporch_cli::authoring_runtime::standard_checker_matches(
+            checker,
+            oracle_output,
+            candidate_output,
+        );
+    };
+    let oracle_path = scratch.join(format!("{seed}.oracle"));
+    let candidate_path = scratch.join(format!("{seed}.{}.out", candidate.program.id));
+    fs::write(&oracle_path, oracle_output)?;
+    fs::write(&candidate_path, candidate_output)?;
+    let relative = |path: &Path| -> Result<String> {
+        Ok(path
+            .strip_prefix(root)?
+            .to_str()
+            .context("stress checker scratch path is not valid Unicode")?
+            .to_owned())
+    };
+    let arguments = vec![
+        input_path.to_owned(),
+        relative(&candidate_path)?,
+        relative(&oracle_path)?,
+    ];
+    let result = reporch_cli::authoring_runtime::run_program(
+        &reporch_cli::authoring_runtime::ProgramRequest {
+            project_directory: root,
+            source_path,
+            language,
+            arguments: &arguments,
+            stdin_path: None,
+            options,
+        },
+    )
+    .await?;
+    Ok(result.exit_code == 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn minimize_counterexample(
+    root: &Path,
+    scratch: &Path,
+    seed: u64,
+    candidate: &SolutionSpecV2,
+    oracle: &SolutionSpecV2,
+    checker: &CheckerSpec,
+    input: Vec<u8>,
+    oracle_output: Vec<u8>,
+    candidate_output: Vec<u8>,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let mut lines = input
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if lines.len() <= 1 {
+        return Ok((input, oracle_output, candidate_output));
+    }
+    let mut best_outputs = (oracle_output, candidate_output);
+    let mut attempts = 0_u32;
+    let mut index = lines.len();
+    while index > 0 && attempts < 64 && lines.len() > 1 {
+        index -= 1;
+        let candidate_input = lines
+            .iter()
+            .enumerate()
+            .filter(|(line_index, _)| *line_index != index)
+            .flat_map(|(_, line)| line.iter().copied())
+            .collect::<Vec<_>>();
+        attempts += 1;
+        if let Some(outputs) = evaluate_counterexample(
+            root,
+            scratch,
+            seed,
+            candidate,
+            oracle,
+            checker,
+            &candidate_input,
+            options,
+        )
+        .await?
+        {
+            lines.remove(index);
+            best_outputs = outputs;
+            index = lines.len();
+        }
+    }
+    Ok((
+        lines.into_iter().flatten().collect(),
+        best_outputs.0,
+        best_outputs.1,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_counterexample(
+    root: &Path,
+    scratch: &Path,
+    seed: u64,
+    candidate: &SolutionSpecV2,
+    oracle: &SolutionSpecV2,
+    checker: &CheckerSpec,
+    input: &[u8],
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let input_path = scratch.join(format!("{seed}.min.in"));
+    fs::write(&input_path, input)?;
+    let input_relative = input_path
+        .strip_prefix(root)?
+        .to_str()
+        .context("minimized stress path is not valid Unicode")?
+        .to_owned();
+    let oracle_result = run_solution(root, oracle, &input_relative, options).await?;
+    if oracle_result.exit_code != 0 {
+        return Ok(None);
+    }
+    let candidate_result = run_solution(root, candidate, &input_relative, options).await?;
+    let matches = candidate_result.exit_code == 0
+        && stress_outputs_match(
+            root,
+            scratch,
+            &input_relative,
+            seed,
+            candidate,
+            checker,
+            &oracle_result.stdout_bytes,
+            &candidate_result.stdout_bytes,
+            options,
+        )
+        .await?;
+    Ok((!matches).then_some((oracle_result.stdout_bytes, candidate_result.stdout_bytes)))
+}
+
+fn answer_path_for(input: &str) -> Result<String> {
+    let path = Path::new(input);
+    let answer = if path.extension().is_some_and(|extension| extension == "in") {
+        path.with_extension("ans")
+    } else {
+        PathBuf::from(format!("{input}.ans"))
+    };
+    relative_string(&answer)
+}
+
+fn write_project_bytes_once_or_same(root: &Path, path: &str, bytes: &[u8]) -> Result<()> {
+    match read_project_bytes(root, path) {
+        Ok(existing) => ensure!(
+            existing == bytes,
+            "existing stress artifact differs: {path}"
+        ),
+        Err(_) => write_project_bytes_atomic(root, path, bytes)?,
+    }
+    Ok(())
 }
 
 pub(super) async fn interactor(options: InteractorOptions, output: &CliOutput) -> Result<()> {

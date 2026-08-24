@@ -356,6 +356,68 @@ pub struct OutputOptions {
     command: OutputCommand,
 }
 
+#[derive(Debug, ClapArgs)]
+pub struct AnswerOptions {
+    #[command(subcommand)]
+    command: AnswerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AnswerCommand {
+    /// Generate expected output files with an accepted reference solution.
+    Generate {
+        #[arg(long)]
+        solution: String,
+        /// Generate only one test; omitted means every selected test.
+        #[arg(long)]
+        test: Option<Uuid>,
+        /// Skip tests that already have an answer file instead of failing.
+        #[arg(long)]
+        missing_only: bool,
+        #[command(flatten)]
+        runtime: RuntimeOptions,
+    },
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct StressOptions {
+    #[command(subcommand)]
+    command: StressCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum StressCommand {
+    List,
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        generator: String,
+        #[arg(long)]
+        recipe: String,
+        #[arg(long)]
+        oracle: String,
+        #[arg(long = "candidate", required = true)]
+        candidates: Vec<String>,
+        #[arg(long, default_value_t = 1)]
+        seed_start: u64,
+        #[arg(long, default_value_t = 100)]
+        cases: u32,
+        #[arg(long, default_value_t = 2_000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        minimize_failure: bool,
+    },
+    Run {
+        name: String,
+        #[command(flatten)]
+        runtime: RuntimeOptions,
+    },
+    Remove {
+        name: String,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum OutputCommand {
     List,
@@ -1594,6 +1656,22 @@ pub fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
             )
         }
     }
+}
+
+pub async fn answer(options: AnswerOptions, output: &CliOutput) -> Result<()> {
+    ensure!(
+        v2::is_active_project()?,
+        "answer generation requires AuthoringSpecV2; run `reporch migrate --yes`"
+    );
+    v2::answer(options, output).await
+}
+
+pub async fn stress(options: StressOptions, output: &CliOutput) -> Result<()> {
+    ensure!(
+        v2::is_active_project()?,
+        "stress testing requires AuthoringSpecV2; run `reporch migrate --yes`"
+    );
+    v2::stress(options, output).await
 }
 
 pub async fn interactor(options: InteractorOptions, output: &CliOutput) -> Result<()> {

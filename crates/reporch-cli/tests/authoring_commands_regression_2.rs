@@ -69,6 +69,8 @@ fn every_promised_expert_authoring_command_is_reachable_without_a_clap_panic() {
             "solution",
             &["list", "add", "update", "remove", "matrix"][..],
         ),
+        ("answer", &["generate"][..]),
+        ("stress", &["list", "add", "run", "remove"][..]),
         ("interactor", &["set", "run", "transcript"][..]),
         ("grader", &["set", "run"][..]),
         ("output", &["list", "add", "remove", "test"][..]),
@@ -250,7 +252,16 @@ case "$1" in
     if [ -n "${REPORCH_FAKE_LOG:-}" ]; then
       for argument in "$@"; do printf 'ARG=%s\n' "$argument" >> "$REPORCH_FAKE_LOG"; done
     fi
-    printf '%s' "${REPORCH_FAKE_STDOUT:-}"
+    output="${REPORCH_FAKE_STDOUT:-}"
+    if [ "${REPORCH_FAKE_SCENARIO:-}" = stress ]; then
+      joined=" $* "
+      case "$joined" in
+        *'/workspace/generators/stress.py'*) output='1 2\n' ;;
+        *'/workspace/solutions/wrong.py'*) output='0\n' ;;
+        *'/workspace/solutions/accepted.py'*) output='3\n' ;;
+      esac
+    fi
+    printf '%b' "$output"
     exit "${REPORCH_FAKE_EXIT:-0}"
     ;;
   rm)
@@ -283,6 +294,27 @@ fn fake_runtime_command(
         .args(arguments)
         .env("PATH", path)
         .env("REPORCH_FAKE_STDOUT", stdout)
+        .env("REPORCH_FAKE_LOG", log)
+        .output()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn fake_stress_command(
+    runtime_directory: &std::path::Path,
+    project: &std::path::Path,
+    arguments: &[&str],
+    log: &std::path::Path,
+) -> Output {
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![runtime_directory.to_owned()];
+    paths.extend(std::env::split_paths(&inherited_path));
+    let path = std::env::join_paths(paths).unwrap();
+    reporch()
+        .args(["--cwd", project.to_str().unwrap(), "--format", "json"])
+        .args(arguments)
+        .env("PATH", path)
+        .env("REPORCH_FAKE_SCENARIO", "stress")
         .env("REPORCH_FAKE_LOG", log)
         .output()
         .unwrap()
@@ -434,6 +466,131 @@ fn signed_rootless_execution_wires_generators_validators_checkers_interactors_an
         &log,
     );
     assert!(graded.status.success(), "{graded:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn v2_answer_generation_and_stress_suite_configuration_are_persisted() {
+    let runtime = tempfile::tempdir().unwrap();
+    fake_rootless_runtime(runtime.path());
+    let log = runtime.path().join("answer-stress.log");
+    let project = tempfile::tempdir().unwrap();
+    init(project.path(), None);
+
+    fs::write(project.path().join("tests/answerless.in"), b"1 2\n").unwrap();
+    let added = run_json(
+        project.path(),
+        &[
+            "test",
+            "case",
+            "add",
+            "--name",
+            "answerless",
+            "--input",
+            "tests/answerless.in",
+        ],
+    );
+    assert!(added.status.success(), "{added:?}");
+    let answer = fake_runtime_command(
+        runtime.path(),
+        project.path(),
+        &[
+            "answer",
+            "generate",
+            "--solution",
+            "accepted",
+            "--runtime",
+            "podman",
+            "--missing-only",
+        ],
+        "3\n",
+        &log,
+    );
+    assert!(answer.status.success(), "{answer:?}");
+    assert_eq!(
+        fs::read(project.path().join("tests/answerless.ans")).unwrap(),
+        b"3\n"
+    );
+
+    fs::create_dir_all(project.path().join("generators")).unwrap();
+    fs::write(
+        project.path().join("generators/stress.py"),
+        b"# generator\n",
+    )
+    .unwrap();
+    let generator = run_json(
+        project.path(),
+        &[
+            "generator",
+            "add",
+            "--id",
+            "stress-gen",
+            "--source",
+            "generators/stress.py",
+            "--language",
+            "python3",
+        ],
+    );
+    assert!(generator.status.success(), "{generator:?}");
+    let generated = fake_runtime_command(
+        runtime.path(),
+        project.path(),
+        &[
+            "generator",
+            "run",
+            "stress-gen",
+            "--output",
+            "tests/stress-seed.in",
+            "--name",
+            "stress-seed",
+            "--seed",
+            "11",
+            "--runtime",
+            "podman",
+        ],
+        "7 8\n",
+        &log,
+    );
+    assert!(generated.status.success(), "{generated:?}");
+    let stress = run_json(
+        project.path(),
+        &[
+            "stress",
+            "add",
+            "--name",
+            "known-wrong-check",
+            "--generator",
+            "stress-gen",
+            "--recipe",
+            "case-stress-seed",
+            "--oracle",
+            "accepted",
+            "--candidate",
+            "known-wrong",
+            "--cases",
+            "5",
+        ],
+    );
+    assert!(stress.status.success(), "{stress:?}");
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(project.path()).unwrap();
+    assert_eq!(spec.testing.stress_suites.len(), 1);
+    assert_eq!(spec.testing.stress_suites[0].cases, 5);
+    let stressed = fake_stress_command(
+        runtime.path(),
+        project.path(),
+        &["stress", "run", "known-wrong-check", "--runtime", "podman"],
+        &log,
+    );
+    assert!(stressed.status.success(), "{stressed:?}");
+    let report: Value = serde_json::from_slice(&stressed.stdout).unwrap();
+    assert_eq!(report["data"][0]["passed"], true);
+    assert_eq!(report["data"][0]["counterexample_seed"], 1);
+    assert!(
+        project
+            .path()
+            .join("stress-failures/known-wrong-check-1.in")
+            .is_file()
+    );
 }
 
 #[cfg(unix)]
