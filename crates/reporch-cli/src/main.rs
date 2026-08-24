@@ -1253,7 +1253,11 @@ fn migrate(options: &MigrateOptions, yes: bool, output: &CliOutput) -> Result<()
         }
     }
 
-    let outcome = reporch_cli::local_project_v2::migrate_project(&options.directory)?;
+    // Keep the public migrate command on the V1 compatibility path until every
+    // authoring command consumes AuthoringSpecV2. The V2 migration is already
+    // implemented and tested, but exposing it early would strand a project in
+    // a format the remaining 0.x command handlers cannot edit yet.
+    let outcome = reporch_cli::local_project::migrate_legacy_project(&options.directory)?;
     let human = if outcome.migrated {
         format!("Migrated {}", outcome.directory.display())
     } else {
