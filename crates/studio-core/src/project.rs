@@ -4,7 +4,7 @@ use thiserror::Error;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{ProblemType, ReleaseManifestV1, Sha256Digest};
+use crate::{ProblemType, Sha256Digest, VersionedReleaseManifest};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub struct SubjectRef {
@@ -265,7 +265,7 @@ pub struct ImmutableCommit {
     pub id: Uuid,
     pub project_id: Uuid,
     pub sequence: i64,
-    pub manifest: ReleaseManifestV1,
+    pub manifest: VersionedReleaseManifest,
     pub manifest_digest: Sha256Digest,
     pub authored_by: SubjectRef,
     pub message: String,
@@ -276,18 +276,18 @@ impl ImmutableCommit {
     pub fn create(
         project_id: Uuid,
         sequence: i64,
-        manifest: ReleaseManifestV1,
+        manifest: VersionedReleaseManifest,
         authored_by: SubjectRef,
         message: String,
         now: DateTime<Utc>,
     ) -> Result<Self, ProjectError> {
-        if manifest.project_id != project_id {
+        if manifest.project_id() != project_id {
             return Err(ProjectError::ManifestProjectMismatch);
         }
         manifest.validate_references()?;
         let manifest_digest = manifest.digest()?;
         Ok(Self {
-            id: manifest.commit_id,
+            id: manifest.commit_id(),
             project_id,
             sequence,
             manifest,

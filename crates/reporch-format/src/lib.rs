@@ -103,6 +103,17 @@ pub enum VersionedAuthoringSpec {
 }
 
 impl VersionedAuthoringSpec {
+    pub fn from_manifest(manifest: &VersionedReleaseManifest) -> Self {
+        match manifest {
+            VersionedReleaseManifest::V1(manifest) => {
+                Self::V1(AuthoringSpecV1::from_manifest(manifest))
+            }
+            VersionedReleaseManifest::V2(manifest) => {
+                Self::V2(AuthoringSpecV2::from_manifest(manifest))
+            }
+        }
+    }
+
     pub fn schema(&self) -> &str {
         match self {
             Self::V1(spec) => &spec.schema,

@@ -696,7 +696,16 @@ fn sync_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::init_project_with_id;
+    use crate::project_template::init_legacy_v1_project_template;
+
+    fn init_project_with_id(directory: &Path, title: &str, project_id: Uuid) -> Result<()> {
+        init_legacy_v1_project_template(
+            directory,
+            title,
+            project_id,
+            studio_core::ProblemType::Standard,
+        )
+    }
 
     fn legacy_project() -> tempfile::TempDir {
         let temporary = tempfile::tempdir().unwrap();

@@ -11,8 +11,11 @@ use studio_contracts::{
     NativeReleasePackageMetadataV1, NativeSourcePackageMetadataV1, ValidationReportV1,
     ValidationRunStatus,
 };
+#[cfg(test)]
+use studio_core::ReleaseManifestV1;
 use studio_core::{
-    IssueSeverity, ReleaseManifestV1, Sha256Digest, normalize_relative_path, validate_manifest,
+    IssueSeverity, Sha256Digest, VersionedReleaseManifest, normalize_relative_path,
+    validate_manifest,
 };
 use tempfile::Builder;
 use zip::write::SimpleFileOptions;
@@ -100,8 +103,17 @@ impl Drop for CreatedDirectory {
     }
 }
 
+#[cfg(test)]
 pub fn export_native(
     manifest: &ReleaseManifestV1,
+    source_root: &Path,
+    output: &Path,
+) -> Result<()> {
+    export_native_versioned(&manifest.clone().into(), source_root, output)
+}
+
+pub fn export_native_versioned(
+    manifest: &VersionedReleaseManifest,
     source_root: &Path,
     output: &Path,
 ) -> Result<()> {
@@ -116,7 +128,7 @@ pub fn export_native(
         manifest_json.len() as u64 <= MAX_MANIFEST_BYTES,
         "manifest exceeds the 16 MiB native package limit"
     );
-    let file_bytes = manifest.files.iter().try_fold(0_u64, |total, file| {
+    let file_bytes = manifest.files().iter().try_fold(0_u64, |total, file| {
         total
             .checked_add(file.size_bytes)
             .context("manifest file size overflow")
@@ -128,8 +140,8 @@ pub fn export_native(
     let metadata = NativeSourcePackageMetadataV1 {
         schema: NATIVE_SOURCE_PACKAGE_SCHEMA_V1.into(),
         manifest_digest: manifest.digest()?,
-        source_profile: manifest.package_profile,
-        file_count: manifest.files.len() as u64,
+        source_profile: manifest.package_profile(),
+        file_count: manifest.files().len() as u64,
         file_bytes,
     };
     let mut entries = vec![
@@ -144,7 +156,7 @@ pub fn export_native(
             source: WriteSource::Bytes(manifest_json),
         },
     ];
-    for manifest_file in &manifest.files {
+    for manifest_file in manifest.files() {
         ensure!(
             manifest_file.size_bytes <= MAX_ENTRY_BYTES,
             "manifest file exceeds the 1 GiB native package limit: {}",
@@ -212,7 +224,15 @@ pub fn export_native(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1> {
+    match import_native_versioned(input, directory)? {
+        VersionedReleaseManifest::V1(manifest) => Ok(manifest),
+        VersionedReleaseManifest::V2(_) => bail!("native package contains a V2 manifest"),
+    }
+}
+
+pub fn import_native_versioned(input: &Path, directory: &Path) -> Result<VersionedReleaseManifest> {
     let input_file = File::open(input).with_context(|| format!("open {}", input.display()))?;
     let mut archive = ZipArchive::new(input_file).context("read Reporch Native ZIP")?;
     let entries = scan_archive(&mut archive)?;
@@ -240,7 +260,7 @@ pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1
             .copied()
             .context("native source package is missing reporch.problem.json")?;
         let manifest_bytes = read_entry(&mut archive, manifest_entry, MAX_MANIFEST_BYTES)?;
-        let manifest: ReleaseManifestV1 =
+        let manifest: VersionedReleaseManifest =
             serde_json::from_slice(&manifest_bytes).context("parse native source manifest")?;
         (manifest, NativePackageKind::Source { metadata })
     } else {
@@ -257,7 +277,7 @@ pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1
             .copied()
             .context("native release package is missing manifest.json")?;
         let manifest_bytes = read_entry(&mut archive, manifest_entry, MAX_MANIFEST_BYTES)?;
-        let manifest: ReleaseManifestV1 =
+        let manifest: VersionedReleaseManifest =
             serde_json::from_slice(&manifest_bytes).context("parse native release manifest")?;
         let report_entry = by_path
             .get(VALIDATION_REPORT_PATH)
@@ -292,14 +312,14 @@ pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1
                 "native source manifest digest mismatch"
             );
             ensure!(
-                metadata.source_profile == manifest.package_profile,
+                metadata.source_profile == manifest.package_profile(),
                 "native source profile does not match its manifest"
             );
             ensure!(
-                metadata.file_count == manifest.files.len() as u64,
+                metadata.file_count == manifest.files().len() as u64,
                 "native source file count mismatch"
             );
-            let file_bytes = manifest.files.iter().try_fold(0_u64, |total, file| {
+            let file_bytes = manifest.files().iter().try_fold(0_u64, |total, file| {
                 total
                     .checked_add(file.size_bytes)
                     .context("manifest file size overflow")
@@ -319,8 +339,8 @@ pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1
                 "native release manifest digest mismatch"
             );
             ensure!(
-                metadata.project_id == manifest.project_id
-                    && metadata.commit_id == manifest.commit_id,
+                metadata.project_id == manifest.project_id()
+                    && metadata.commit_id == manifest.commit_id(),
                 "native release identity does not match its manifest"
             );
             ensure!(
@@ -334,7 +354,7 @@ pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1
     }
 
     let mut expected_paths = manifest
-        .files
+        .files()
         .iter()
         .map(|file| file.path.clone())
         .collect::<BTreeSet<_>>();
@@ -357,7 +377,7 @@ pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1
         actual_paths == expected_paths,
         "native package archive inventory does not exactly match its manifest"
     );
-    for file in &manifest.files {
+    for file in manifest.files() {
         let entry = by_path
             .get(file.path.as_str())
             .copied()
@@ -370,7 +390,7 @@ pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1
     }
 
     let destination = CreatedDirectory::create(directory)?;
-    let mut files = manifest.files.iter().collect::<Vec<_>>();
+    let mut files = manifest.files().iter().collect::<Vec<_>>();
     files.sort_by(|left, right| left.path.cmp(&right.path));
     for manifest_file in files {
         let entry = by_path
@@ -437,11 +457,15 @@ pub fn import_native(input: &Path, directory: &Path) -> Result<ReleaseManifestV1
     Ok(manifest)
 }
 
-fn ensure_valid_manifest(manifest: &ReleaseManifestV1) -> Result<()> {
-    let blocking = validate_manifest(manifest)
-        .into_iter()
-        .filter(|issue| issue.severity == IssueSeverity::Error)
-        .collect::<Vec<_>>();
+fn ensure_valid_manifest(manifest: &VersionedReleaseManifest) -> Result<()> {
+    manifest.validate_references()?;
+    let blocking = match manifest {
+        VersionedReleaseManifest::V1(manifest) => validate_manifest(manifest)
+            .into_iter()
+            .filter(|issue| issue.severity == IssueSeverity::Error)
+            .collect::<Vec<_>>(),
+        VersionedReleaseManifest::V2(_) => Vec::new(),
+    };
     if !blocking.is_empty() {
         bail!(
             "native manifest validation failed: {}",
@@ -658,7 +682,7 @@ fn set_executable(_path: &Path, _executable: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reporch_cli::init_project_template;
+    use reporch_cli::init_legacy_v1_project_template;
     use studio_core::{NATIVE_PACKAGE_RESERVED_PATHS, ProblemType};
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -666,7 +690,7 @@ mod tests {
     fn fixture() -> (TempDir, ReleaseManifestV1) {
         let temporary = TempDir::new().unwrap();
         let source = temporary.path().join("source");
-        init_project_template(
+        init_legacy_v1_project_template(
             &source,
             "Native round trip",
             Uuid::now_v7(),

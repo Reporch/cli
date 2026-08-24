@@ -10,9 +10,9 @@ use studio_core::{ManifestFile, ReleaseManifestV1, ReleaseManifestV2};
 use uuid::Uuid;
 
 use crate::local_project::{
-    AUTHORING_FILE_NAME, LEGACY_MANIFEST_FILE_NAME, ProjectDiffV1, ProjectStatusV1, RemoteLinkV1,
-    atomic_create_new, atomic_replace, ensure_real_directory, hash_regular_project_file,
-    reject_non_regular_destination,
+    AUTHORING_FILE_NAME, LEGACY_BACKUP_FILE_NAME, LEGACY_MANIFEST_FILE_NAME, ProjectDiffV1,
+    ProjectStatusV1, RemoteLinkV1, atomic_create_new, atomic_replace, ensure_real_directory,
+    hash_regular_project_file, reject_non_regular_destination,
 };
 
 pub const AUTHORING_V1_BACKUP_FILE_NAME: &str = "reporch.pre-v2.yaml";
@@ -354,9 +354,24 @@ pub fn migrate_project(directory: &Path) -> Result<MigrationOutcomeV2> {
                 root.display()
             );
         }
-        let outcome = crate::local_project::migrate_legacy_project(&root)?;
-        if let Some(backup) = outcome.backup_file {
+        let legacy_bytes = fs::read(&legacy)?;
+        let schema = serde_json::from_slice::<serde_json::Value>(&legacy_bytes)?
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .context("generated manifest has no schema")?
+            .to_owned();
+        if schema == studio_core::RELEASE_MANIFEST_SCHEMA_V2 {
+            let manifest: ReleaseManifestV2 = serde_json::from_slice(&legacy_bytes)?;
+            manifest.validate_references()?;
+            let backup = root.join(LEGACY_BACKUP_FILE_NAME);
+            atomic_create_new(&backup, &legacy_bytes)?;
             backup_files.push(backup);
+            write_authoring_spec_create_new(&root, &AuthoringSpecV2::from_manifest(&manifest))?;
+        } else {
+            let outcome = crate::local_project::migrate_legacy_project(&root)?;
+            if let Some(backup) = outcome.backup_file {
+                backup_files.push(backup);
+            }
         }
     }
     let spec = migrate_v1_authoring_file(&root)?;

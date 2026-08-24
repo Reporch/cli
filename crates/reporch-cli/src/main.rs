@@ -25,7 +25,10 @@ use cli_output::{CliOutput, ColorMode, OutputFormat};
 use reporch_cli::local_sandbox::{LocalSandboxOptions, OciRuntime};
 use reporch_cli::studio_remote;
 use reporch_cli::{NativeAuthOptions, device_auth_config};
-use studio_core::{PackageProfile, ReleaseManifestV1, compatibility_report, validate_manifest};
+use studio_core::{
+    CompatibilityIssueV1, CompatibilityReportV1, CompatibilitySeverity, PackageProfile,
+    ReleaseManifestV1, VersionedReleaseManifest, compatibility_report, validate_manifest,
+};
 use studio_native_auth::qualification_keyring_canary;
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use uuid::Uuid;
@@ -1249,11 +1252,7 @@ fn migrate(options: &MigrateOptions, yes: bool, output: &CliOutput) -> Result<()
         }
     }
 
-    // Keep the public migrate command on the V1 compatibility path until every
-    // authoring command consumes AuthoringSpecV2. The V2 migration is already
-    // implemented and tested, but exposing it early would strand a project in
-    // a format the remaining 0.x command handlers cannot edit yet.
-    let outcome = reporch_cli::local_project::migrate_legacy_project(&options.directory)?;
+    let outcome = reporch_cli::local_project_v2::migrate_project(&options.directory)?;
     let human = if outcome.migrated {
         format!("Migrated {}", outcome.directory.display())
     } else {
@@ -1472,8 +1471,17 @@ fn command_name(command: &Command) -> &'static str {
 
 async fn submit_project(options: SubmitOptions, output: &CliOutput) -> Result<()> {
     let root = reporch_cli::local_project::discover_project(Path::new("."))?;
-    let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
-    let checked = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let checked_file_count = if reporch_cli::local_project_v2::is_v2_project(&root)? {
+        let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+        reporch_cli::local_project_v2::compile_authoring_spec(&root, &spec, Uuid::nil())?
+            .files
+            .len()
+    } else {
+        let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
+        reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?
+            .files
+            .len()
+    };
     let push = studio_remote::push_operation(&studio_remote::PushOptions {
         connection: options.connection.clone(),
         manifest: None,
@@ -1511,7 +1519,7 @@ async fn submit_project(options: SubmitOptions, output: &CliOutput) -> Result<()
     let result = serde_json::json!({
         "schema": "reporch.submit-result.v1",
         "check": {
-            "file_count": checked.files.len(),
+            "file_count": checked_file_count,
             "valid": true,
         },
         "push": push,
@@ -1533,12 +1541,9 @@ async fn qualification_self_test() -> Result<()> {
         Uuid::now_v7(),
     )?;
     let manifest_bytes = fs::read(temporary.path().join("reporch.problem.json"))?;
-    let manifest: ReleaseManifestV1 = serde_json::from_slice(&manifest_bytes)?;
-    let authoring = reporch_cli::local_project::read_authoring_spec(temporary.path())?;
-    let issues = validate_manifest(&manifest);
-    if !issues.is_empty() {
-        bail!("generated qualification manifest did not pass static validation");
-    }
+    let manifest: VersionedReleaseManifest = serde_json::from_slice(&manifest_bytes)?;
+    manifest.validate_references()?;
+    let authoring = reporch_cli::local_project_v2::read_authoring_spec(temporary.path())?;
 
     println!(
         "{}",
@@ -1549,7 +1554,7 @@ async fn qualification_self_test() -> Result<()> {
             "target_arch": std::env::consts::ARCH,
             "credential_store_round_trip": true,
             "generated_manifest_valid": true,
-            "generated_authoring_spec_valid": authoring.project_id == manifest.project_id,
+            "generated_authoring_spec_valid": authoring.project_id == manifest.project_id(),
             "problem_type_count": 6,
             "passed": true,
         }))?
@@ -1639,25 +1644,35 @@ fn import_package(
     profile: PackageProfile,
     output: &CliOutput,
 ) -> Result<()> {
-    let manifest = match profile {
-        PackageProfile::Icpc202509 => icpc_import::import_icpc_2025_09(input, directory)?,
-        PackageProfile::IcpcLegacy => icpc_legacy::import_icpc_legacy(input, directory)?,
-        PackageProfile::DomjudgeZip => icpc_import::import_domjudge_zip(input, directory)?,
+    let manifest: VersionedReleaseManifest = match profile {
+        PackageProfile::Icpc202509 => icpc_import::import_icpc_2025_09(input, directory)?.into(),
+        PackageProfile::IcpcLegacy => icpc_legacy::import_icpc_legacy(input, directory)?.into(),
+        PackageProfile::DomjudgeZip => icpc_import::import_domjudge_zip(input, directory)?.into(),
         PackageProfile::PolygonCompatible => {
-            polygon_import::import_polygon_package(input, directory)?
+            polygon_import::import_polygon_package(input, directory)?.into()
         }
-        PackageProfile::ReporchNative => native_package::import_native(input, directory)?,
+        PackageProfile::ReporchNative => native_package::import_native_versioned(input, directory)?,
     };
-    reporch_cli::local_project::write_authoring_spec_create_new(
-        directory,
-        &reporch_format::AuthoringSpecV1::from_manifest(&manifest),
-    )?;
+    match &manifest {
+        VersionedReleaseManifest::V1(manifest) => {
+            reporch_cli::local_project::write_authoring_spec_create_new(
+                directory,
+                &reporch_format::AuthoringSpecV1::from_manifest(manifest),
+            )?;
+        }
+        VersionedReleaseManifest::V2(manifest) => {
+            reporch_cli::local_project_v2::write_authoring_spec_create_new(
+                directory,
+                &reporch_format::AuthoringSpecV2::from_manifest(manifest),
+            )?;
+        }
+    }
     let data = serde_json::json!({
         "schema": "reporch.package-import-result.v1",
         "profile": profile,
         "input": input,
         "directory": directory,
-        "project_id": manifest.project_id,
+        "project_id": manifest.project_id(),
         "manifest_digest": manifest.digest()?,
     });
     output.emit(
@@ -1674,26 +1689,34 @@ fn export_package(
     source_root: Option<&Path>,
     cli_output: &CliOutput,
 ) -> Result<()> {
-    let manifest = read_manifest(manifest_path)?;
+    let manifest = read_versioned_manifest(manifest_path)?;
     let source_root = source_root
         .map(Path::to_path_buf)
         .or_else(|| manifest_path.parent().map(Path::to_path_buf))
         .context("manifest path has no parent directory")?;
     match profile {
-        PackageProfile::Icpc202509 => {
-            icpc_export::export_icpc_2025_09(&manifest, &source_root, output)?
-        }
-        PackageProfile::IcpcLegacy => {
-            icpc_legacy::export_icpc_legacy(&manifest, &source_root, output)?
-        }
-        PackageProfile::DomjudgeZip => {
-            icpc_export::export_domjudge_zip(&manifest, &source_root, output)?
-        }
-        PackageProfile::PolygonCompatible => {
-            polygon_export::export_polygon_package(&manifest, &source_root, output)?
-        }
+        PackageProfile::Icpc202509 => icpc_export::export_icpc_2025_09(
+            require_v1_external_manifest(&manifest, profile)?,
+            &source_root,
+            output,
+        )?,
+        PackageProfile::IcpcLegacy => icpc_legacy::export_icpc_legacy(
+            require_v1_external_manifest(&manifest, profile)?,
+            &source_root,
+            output,
+        )?,
+        PackageProfile::DomjudgeZip => icpc_export::export_domjudge_zip(
+            require_v1_external_manifest(&manifest, profile)?,
+            &source_root,
+            output,
+        )?,
+        PackageProfile::PolygonCompatible => polygon_export::export_polygon_package(
+            require_v1_external_manifest(&manifest, profile)?,
+            &source_root,
+            output,
+        )?,
         PackageProfile::ReporchNative => {
-            native_package::export_native(&manifest, &source_root, output)?
+            native_package::export_native_versioned(&manifest, &source_root, output)?
         }
     }
     let data = serde_json::json!({
@@ -1709,14 +1732,58 @@ fn export_package(
     )
 }
 
+fn require_v1_external_manifest(
+    manifest: &VersionedReleaseManifest,
+    profile: PackageProfile,
+) -> Result<&ReleaseManifestV1> {
+    match manifest {
+        VersionedReleaseManifest::V1(manifest) => Ok(manifest),
+        VersionedReleaseManifest::V2(_) => bail!(
+            "V2 export to {profile:?} is not lossless yet; use reporch-native or inspect `reporch manifest compatibility --profile {}`",
+            match profile {
+                PackageProfile::Icpc202509 => "icpc202509",
+                PackageProfile::IcpcLegacy => "icpc-legacy",
+                PackageProfile::PolygonCompatible => "polygon-compatible",
+                PackageProfile::DomjudgeZip => "domjudge-zip",
+                PackageProfile::ReporchNative => "reporch-native",
+            }
+        ),
+    }
+}
+
 fn compatibility(
     path: &Path,
     profile: PackageProfile,
     strict: bool,
     output: &CliOutput,
 ) -> Result<()> {
-    let manifest = read_manifest(path)?;
-    let report = compatibility_report(&manifest, profile);
+    let manifest = read_versioned_manifest(path)?;
+    let report = match &manifest {
+        VersionedReleaseManifest::V1(manifest) => compatibility_report(manifest, profile),
+        VersionedReleaseManifest::V2(manifest) if profile == PackageProfile::ReporchNative => {
+            CompatibilityReportV1 {
+                schema: studio_core::COMPATIBILITY_REPORT_SCHEMA_V1.into(),
+                source_profile: manifest.package_profile,
+                target_profile: profile,
+                exportable: true,
+                lossless: true,
+                issues: vec![],
+            }
+        }
+        VersionedReleaseManifest::V2(manifest) => CompatibilityReportV1 {
+            schema: studio_core::COMPATIBILITY_REPORT_SCHEMA_V1.into(),
+            source_profile: manifest.package_profile,
+            target_profile: profile,
+            exportable: false,
+            lossless: false,
+            issues: vec![CompatibilityIssueV1 {
+                code: "compatibility.v2_external_export_pending".into(),
+                severity: CompatibilitySeverity::Error,
+                message: "this V2 project uses semantics that require the versioned external-profile exporter".into(),
+                path: None,
+            }],
+        },
+    };
     if strict && !report.exportable {
         bail!("manifest cannot be exported to the requested profile");
     }
@@ -1731,14 +1798,24 @@ fn compatibility(
     )
 }
 
+fn read_versioned_manifest(path: &Path) -> Result<VersionedReleaseManifest> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+#[cfg(test)]
 fn read_manifest(path: &Path) -> Result<ReleaseManifestV1> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
 fn validate(path: &Path, print_digest: bool, output: &CliOutput) -> Result<()> {
-    let manifest = read_manifest(path)?;
-    let issues = validate_manifest(&manifest);
+    let manifest = read_versioned_manifest(path)?;
+    manifest.validate_references()?;
+    let issues = match &manifest {
+        VersionedReleaseManifest::V1(manifest) => validate_manifest(manifest),
+        VersionedReleaseManifest::V2(_) => Vec::new(),
+    };
     if !issues.is_empty() {
         bail!(
             "manifest validation failed with {} issue(s): {}",
@@ -1746,7 +1823,7 @@ fn validate(path: &Path, print_digest: bool, output: &CliOutput) -> Result<()> {
             serde_json::to_string(&issues)?
         );
     }
-    local_manifest::verify_files(path, &manifest)?;
+    local_manifest::verify_versioned_files(path, &manifest)?;
     let digest = manifest.digest()?;
     let data = serde_json::json!({
         "schema": "reporch.manifest-validation-result.v1",
@@ -1772,7 +1849,12 @@ fn validate(path: &Path, print_digest: bool, output: &CliOutput) -> Result<()> {
 
 #[cfg(test)]
 pub(crate) fn init_project(directory: &Path, title: &str) -> Result<()> {
-    reporch_cli::init_project_with_id(directory, title, Uuid::now_v7())
+    reporch_cli::init_legacy_v1_project_template(
+        directory,
+        title,
+        Uuid::now_v7(),
+        studio_core::ProblemType::Standard,
+    )
 }
 
 #[cfg(test)]

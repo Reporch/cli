@@ -4,9 +4,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use studio_core::ReleaseManifestV1;
+use studio_core::VersionedReleaseManifest;
 
+#[cfg(test)]
 pub(crate) fn verify_files(manifest_path: &Path, manifest: &ReleaseManifestV1) -> Result<()> {
+    verify_versioned_files(manifest_path, &manifest.clone().into())
+}
+
+pub(crate) fn verify_versioned_files(
+    manifest_path: &Path,
+    manifest: &VersionedReleaseManifest,
+) -> Result<()> {
     let source_root = manifest_directory(manifest_path)?;
     let source_root = fs::canonicalize(source_root)
         .with_context(|| format!("resolve manifest directory {}", source_root.display()))?;
@@ -15,7 +25,7 @@ pub(crate) fn verify_files(manifest_path: &Path, manifest: &ReleaseManifestV1) -
         "manifest directory is not a directory"
     );
 
-    for expected in &manifest.files {
+    for expected in manifest.files() {
         verify_file(
             &source_root,
             &expected.path,
@@ -110,7 +120,13 @@ mod tests {
 
     fn generated_project() -> (tempfile::TempDir, PathBuf, ReleaseManifestV1) {
         let temporary = tempfile::tempdir().unwrap();
-        reporch_cli::init_project_with_id(temporary.path(), "Integrity", Uuid::now_v7()).unwrap();
+        reporch_cli::init_legacy_v1_project_template(
+            temporary.path(),
+            "Integrity",
+            Uuid::now_v7(),
+            studio_core::ProblemType::Standard,
+        )
+        .unwrap();
         let manifest_path = temporary.path().join("reporch.problem.json");
         let manifest = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         (temporary, manifest_path, manifest)

@@ -393,8 +393,8 @@ fn signed_rootless_execution_wires_generators_validators_checkers_interactors_an
     let interactive = tempfile::tempdir().unwrap();
     init(interactive.path(), Some("interactive"));
     let interactive_spec =
-        reporch_cli::local_project::read_authoring_spec(interactive.path()).unwrap();
-    let test_id = interactive_spec.judging.tests[0].id.to_string();
+        reporch_cli::local_project_v2::read_authoring_spec(interactive.path()).unwrap();
+    let test_id = interactive_spec.testing.tests[0].id.to_string();
     let transcript = fake_runtime_command(
         runtime.path(),
         interactive.path(),
@@ -415,8 +415,8 @@ fn signed_rootless_execution_wires_generators_validators_checkers_interactors_an
 
     let grader = tempfile::tempdir().unwrap();
     init(grader.path(), Some("grader"));
-    let grader_spec = reporch_cli::local_project::read_authoring_spec(grader.path()).unwrap();
-    let grader_test_id = grader_spec.judging.tests[0].id.to_string();
+    let grader_spec = reporch_cli::local_project_v2::read_authoring_spec(grader.path()).unwrap();
+    let grader_test_id = grader_spec.testing.tests[0].id.to_string();
     let graded = fake_runtime_command(
         runtime.path(),
         grader.path(),

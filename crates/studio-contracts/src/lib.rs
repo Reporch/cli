@@ -1,16 +1,16 @@
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
-use reporch_format::AuthoringSpecV1;
+use reporch_format::VersionedAuthoringSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use studio_core::{
     AuthoringSettingsV1, ManifestFile, PackageProfile, ProblemType, Project, ProjectMembership,
-    ProjectRole, ReleaseManifestV1, ReviewApprovalSourceV1, ReviewDecisionKindV1,
-    ReviewDecisionRecord, ReviewPoolStatusV1, ReviewRecord, ReviewState, ReviewStatusV1,
-    Sha256Digest, SubjectRef, TestLabCheckerV1, TestLabDraftV1, ValidationIssue,
-    ValidationStagePlanV1, WaiverRecord, WaiverRevocationRecord, WaiverStatusV1,
+    ProjectRole, ReviewApprovalSourceV1, ReviewDecisionKindV1, ReviewDecisionRecord,
+    ReviewPoolStatusV1, ReviewRecord, ReviewState, ReviewStatusV1, Sha256Digest, SubjectRef,
+    TestLabCheckerV1, TestLabDraftV1, ValidationIssue, ValidationStagePlanV1,
+    VersionedReleaseManifest, WaiverRecord, WaiverRevocationRecord, WaiverStatusV1,
 };
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -24,7 +24,7 @@ pub struct WorkingCopyV1 {
     pub schema: String,
     pub project_id: Uuid,
     pub revision: i64,
-    pub spec: AuthoringSpecV1,
+    pub spec: VersionedAuthoringSpec,
     pub updated_by: SubjectRef,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -33,7 +33,7 @@ pub struct WorkingCopyV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateWorkingCopyRequestV1 {
-    pub spec: AuthoringSpecV1,
+    pub spec: VersionedAuthoringSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -640,7 +640,7 @@ impl ReviewResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateCommitRequest {
     pub message: String,
-    pub manifest: ReleaseManifestV1,
+    pub manifest: VersionedReleaseManifest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -658,7 +658,7 @@ pub struct CommitDetailResponse {
     pub project_id: Uuid,
     pub sequence: i64,
     pub manifest_digest: Sha256Digest,
-    pub manifest: ReleaseManifestV1,
+    pub manifest: VersionedReleaseManifest,
     pub authored_by: SubjectRef,
     pub message: String,
     pub created_at: DateTime<Utc>,

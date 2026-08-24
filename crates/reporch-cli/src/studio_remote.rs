@@ -31,8 +31,8 @@ use studio_contracts::{
     WorkingCopyReadinessV1, WorkingCopyV1,
 };
 use studio_core::{
-    ManifestFile, ProblemType, ProjectRole, ReleaseManifestV1, ReviewDecisionKindV1, Sha256Digest,
-    SubjectRef, validate_manifest,
+    ManifestFile, ProblemType, ProjectRole, ReviewDecisionKindV1, Sha256Digest, SubjectRef,
+    VersionedReleaseManifest, validate_manifest,
 };
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use tempfile::NamedTempFile;
@@ -1700,8 +1700,8 @@ pub async fn restore_revision_operation(
 }
 
 fn diff_revisions(from: &CommitDetailResponse, to: &CommitDetailResponse) -> RevisionDiffV1 {
-    let from_spec = reporch_format::AuthoringSpecV1::from_manifest(&from.manifest);
-    let to_spec = reporch_format::AuthoringSpecV1::from_manifest(&to.manifest);
+    let from_spec = reporch_format::VersionedAuthoringSpec::from_manifest(&from.manifest);
+    let to_spec = reporch_format::VersionedAuthoringSpec::from_manifest(&to.manifest);
     let from_json = serde_json::to_value(&from_spec).expect("AuthoringSpec serializes");
     let to_json = serde_json::to_value(&to_spec).expect("AuthoringSpec serializes");
     let mut metadata_changed = Vec::new();
@@ -1720,13 +1720,13 @@ fn diff_revisions(from: &CommitDetailResponse, to: &CommitDetailResponse) -> Rev
 
     let from_files = from
         .manifest
-        .files
+        .files()
         .iter()
         .map(|file| (file.path.as_str(), file))
         .collect::<std::collections::BTreeMap<_, _>>();
     let to_files = to
         .manifest
-        .files
+        .files()
         .iter()
         .map(|file| (file.path.as_str(), file))
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -1958,7 +1958,8 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         "Studio returned a mismatched commit"
     );
     ensure!(
-        commit.manifest.project_id == options.project_id && commit.manifest.commit_id == commit_id,
+        commit.manifest.project_id() == options.project_id
+            && commit.manifest.commit_id() == commit_id,
         "commit manifest identity mismatch"
     );
     ensure!(
@@ -1970,7 +1971,7 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
     let staging = tempfile::Builder::new()
         .prefix(".reporch-pull-")
         .tempdir_in(parent)?;
-    for file in &commit.manifest.files {
+    for file in commit.manifest.files() {
         let descriptor = client
             .commit_file_download(options.project_id, commit_id, &file.path)
             .await?;
@@ -1992,8 +1993,15 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         &staging.path().join("reporch.problem.json"),
         &commit.manifest,
     )?;
-    let authoring_spec = reporch_format::AuthoringSpecV1::from_manifest(&commit.manifest);
-    crate::local_project::write_authoring_spec_create_new(staging.path(), &authoring_spec)?;
+    let authoring_spec = reporch_format::VersionedAuthoringSpec::from_manifest(&commit.manifest);
+    match &authoring_spec {
+        reporch_format::VersionedAuthoringSpec::V1(spec) => {
+            crate::local_project::write_authoring_spec_create_new(staging.path(), spec)?;
+        }
+        reporch_format::VersionedAuthoringSpec::V2(spec) => {
+            crate::local_project_v2::write_authoring_spec_create_new(staging.path(), spec)?;
+        }
+    }
     let working_copy_revision = match client.get_working_copy(options.project_id).await {
         Ok(working_copy) if working_copy.spec == authoring_spec => {
             Some(working_copy.revision.to_string())
@@ -2035,7 +2043,7 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         project_id: options.project_id,
         commit_id,
         directory: options.directory.clone(),
-        file_count: commit.manifest.files.len(),
+        file_count: commit.manifest.files().len(),
     })
 }
 
@@ -2056,7 +2064,11 @@ pub async fn push_operation(options: &PushOptions) -> Result<PushOperationResult
         return push_authoring_operation(options).await;
     };
     let manifest = read_manifest(manifest_path)?;
-    let issues = validate_manifest(&manifest);
+    manifest.validate_references()?;
+    let issues = match &manifest {
+        VersionedReleaseManifest::V1(manifest) => validate_manifest(manifest),
+        VersionedReleaseManifest::V2(_) => Vec::new(),
+    };
     if !issues.is_empty() {
         bail!(
             "manifest validation failed with {} issue(s): {}",
@@ -2080,14 +2092,15 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
             "--source-root must match the discovered reporch.yaml project root"
         );
     }
-    let spec = crate::local_project::read_authoring_spec(&root)?;
+    let spec = read_versioned_authoring_spec(&root)?;
+    let project_id = spec.project_id();
     let mut state = crate::local_project::read_local_state(&root)?;
     let remote = state
         .remote
         .as_ref()
         .context("project is not linked; run reporch project link")?;
     ensure!(
-        remote.project_id == spec.project_id,
+        remote.project_id == project_id,
         "local link and reporch.yaml project IDs differ"
     );
     ensure!(
@@ -2102,20 +2115,28 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         capabilities
             .authoring_spec_versions
             .iter()
-            .any(|schema| schema == reporch_format::AUTHORING_SPEC_SCHEMA_V1),
+            .any(|schema| schema == spec.schema()),
         "Studio does not support {}",
-        reporch_format::AUTHORING_SPEC_SCHEMA_V1
+        spec.schema()
     );
 
-    let upload_manifest = crate::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let upload_manifest = compile_versioned_authoring_spec(&root, &spec, Uuid::nil())?;
+    ensure!(
+        capabilities
+            .release_manifest_versions
+            .iter()
+            .any(|schema| schema == upload_manifest.schema()),
+        "Studio does not support {}",
+        upload_manifest.schema()
+    );
     let uploaded = upload_manifest_files(&client, options, &upload_manifest, &root).await?;
 
     if uploaded == 0
         && let Some(last_commit_id) = state.last_commit_id
     {
-        let candidate = crate::local_project::compile_authoring_spec(&root, &spec, last_commit_id)?;
+        let candidate = compile_versioned_authoring_spec(&root, &spec, last_commit_id)?;
         if state.baseline_working_digest.as_deref() == Some(candidate.digest()?.as_str()) {
-            let commits = client.list_commits(spec.project_id).await?;
+            let commits = client.list_commits(project_id).await?;
             if let Some(head) = commits.items.first()
                 && head.id == last_commit_id
                 && head.manifest_digest == candidate.digest()?
@@ -2134,7 +2155,7 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         }
     }
 
-    let remote_copy = client.get_working_copy(spec.project_id).await?;
+    let remote_copy = client.get_working_copy(project_id).await?;
     if let Some(base_revision) = state.base_revision.as_deref() {
         let base_revision: i64 = base_revision
             .parse()
@@ -2154,7 +2175,7 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
     } else {
         client
             .update_working_copy(
-                spec.project_id,
+                project_id,
                 remote_copy.revision,
                 &UpdateWorkingCopyRequestV1 { spec: spec.clone() },
             )
@@ -2173,7 +2194,7 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         .or_insert(operation_key("cli-push", None)?)
         .clone();
     crate::local_project::write_local_state(&root, &state)?;
-    let readiness = client.working_copy_readiness(spec.project_id).await?;
+    let readiness = client.working_copy_readiness(project_id).await?;
     ensure!(
         readiness.can_commit,
         "working copy is not ready: {}",
@@ -2181,14 +2202,14 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
     );
     let commit = client
         .commit_working_copy(
-            spec.project_id,
+            project_id,
             &CommitWorkingCopyRequestV1 {
                 message: options.message.clone(),
             },
             &commit_key,
         )
         .await?;
-    let manifest = crate::local_project::compile_authoring_spec(&root, &spec, commit.id)?;
+    let manifest = compile_versioned_authoring_spec(&root, &spec, commit.id)?;
     let manifest_digest = manifest.digest()?;
     ensure!(
         commit.manifest_digest == manifest_digest,
@@ -2199,7 +2220,7 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         commit,
     };
 
-    crate::local_project::write_generated_manifest_atomic(&root, &manifest)?;
+    write_versioned_generated_manifest_atomic(&root, &manifest)?;
     state.baseline_working_digest = Some(manifest_digest.to_string());
     state.last_commit_id = Some(result.commit.id);
     state.last_validation_run_id = None;
@@ -2213,18 +2234,18 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
 
 async fn push_manifest(
     options: &PushOptions,
-    manifest: ReleaseManifestV1,
+    manifest: VersionedReleaseManifest,
     source_root: PathBuf,
 ) -> Result<PushOperationResult> {
     let client = StudioApiClient::connect(&options.connection).await?;
     let uploaded = upload_manifest_files(&client, options, &manifest, &source_root).await?;
     let manifest_digest = manifest.digest()?;
     if uploaded == 0 {
-        let commits = client.list_commits(manifest.project_id).await?;
+        let commits = client.list_commits(manifest.project_id()).await?;
         if let Some(head) = commits.items.first()
             && is_unchanged_remote_head(
                 uploaded,
-                manifest.commit_id,
+                manifest.commit_id(),
                 &manifest_digest,
                 head.id,
                 &head.manifest_digest,
@@ -2244,7 +2265,7 @@ async fn push_manifest(
     }
     let commit = client
         .create_commit(
-            manifest.project_id,
+            manifest.project_id(),
             &CreateCommitRequest {
                 message: options.message.clone(),
                 manifest: manifest.clone(),
@@ -2252,7 +2273,7 @@ async fn push_manifest(
         )
         .await?;
     ensure!(
-        commit.id == manifest.commit_id,
+        commit.id == manifest.commit_id(),
         "Studio returned a mismatched commit ID"
     );
     ensure!(
@@ -2268,18 +2289,18 @@ async fn push_manifest(
 async fn upload_manifest_files(
     client: &StudioApiClient,
     options: &PushOptions,
-    manifest: &ReleaseManifestV1,
+    manifest: &VersionedReleaseManifest,
     source_root: &Path,
 ) -> Result<usize> {
     let remote = client
-        .list_files(manifest.project_id)
+        .list_files(manifest.project_id())
         .await?
         .items
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect::<HashMap<_, _>>();
     let mut uploaded = 0_usize;
-    for file in &manifest.files {
+    for file in manifest.files() {
         let source = source_root.join(&file.path);
         verify_local_file(&source, file).await?;
         if remote.get(&file.path).is_some_and(|remote| {
@@ -2292,7 +2313,7 @@ async fn upload_manifest_files(
         }
         let upload = client
             .begin_upload(
-                manifest.project_id,
+                manifest.project_id(),
                 &BeginFileUploadRequest {
                     path: file.path.clone(),
                     sha256: file.sha256.clone(),
@@ -2304,9 +2325,15 @@ async fn upload_manifest_files(
             .await?;
         client.upload_file(&source, &upload).await?;
         let status = client
-            .complete_upload(manifest.project_id, upload.upload.id)
+            .complete_upload(manifest.project_id(), upload.upload.id)
             .await?;
-        wait_for_upload(client, manifest.project_id, status, options.timeout_seconds).await?;
+        wait_for_upload(
+            client,
+            manifest.project_id(),
+            status,
+            options.timeout_seconds,
+        )
+        .await?;
         uploaded += 1;
     }
     Ok(uploaded)
@@ -3319,7 +3346,43 @@ fn validate_wait_timeout(value: u64) -> Result<()> {
     Ok(())
 }
 
-fn read_manifest(path: &Path) -> Result<ReleaseManifestV1> {
+fn read_versioned_authoring_spec(root: &Path) -> Result<reporch_format::VersionedAuthoringSpec> {
+    let path = root.join(crate::local_project::AUTHORING_FILE_NAME);
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    reporch_format::parse_versioned_authoring_spec(&bytes)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
+fn compile_versioned_authoring_spec(
+    root: &Path,
+    spec: &reporch_format::VersionedAuthoringSpec,
+    commit_id: Uuid,
+) -> Result<VersionedReleaseManifest> {
+    match spec {
+        reporch_format::VersionedAuthoringSpec::V1(spec) => {
+            crate::local_project::compile_authoring_spec(root, spec, commit_id).map(Into::into)
+        }
+        reporch_format::VersionedAuthoringSpec::V2(spec) => {
+            crate::local_project_v2::compile_authoring_spec(root, spec, commit_id).map(Into::into)
+        }
+    }
+}
+
+fn write_versioned_generated_manifest_atomic(
+    root: &Path,
+    manifest: &VersionedReleaseManifest,
+) -> Result<PathBuf> {
+    match manifest {
+        VersionedReleaseManifest::V1(manifest) => {
+            crate::local_project::write_generated_manifest_atomic(root, manifest)
+        }
+        VersionedReleaseManifest::V2(manifest) => {
+            crate::local_project_v2::write_generated_manifest_atomic(root, manifest)
+        }
+    }
+}
+
+fn read_manifest(path: &Path) -> Result<VersionedReleaseManifest> {
     let metadata = fs::metadata(path).with_context(|| format!("inspect {}", path.display()))?;
     ensure!(
         metadata.is_file() && metadata.len() <= 32 * 1024 * 1024,
