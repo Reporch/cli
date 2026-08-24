@@ -5,10 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use studio_core::{
-    ExecutionSpecV2, JudgingSpec, ManifestError, ManifestFile, OutputSubmissionSpec,
-    OutputSubmissionSpecV2, PackageProfile, ProblemType, PublicationSpecV1,
+    CheckerConfigSpecV2, CheckerMutationSpecV2, CheckerUnitSpecV2, ExecutionHarnessV1,
+    ExecutionSpecV2, ExpectedVerdict, GeneratedCaseRefV2, GeneratorMatrixStrategyV2,
+    GeneratorRecipeSpecV2, GeneratorSpecV2, HarnessKindV2, HarnessProfileSpecV2, HarnessSpecV2,
+    InteractiveSpecV2, JudgingSpec, ManifestError, ManifestFile, OutputSubmissionSpec,
+    OutputSubmissionSpecV2, PackageProfile, ProblemType, ProgramSpecV2, PublicationSpecV1,
     RELEASE_MANIFEST_SCHEMA_V1, RELEASE_MANIFEST_SCHEMA_V2, ReleaseManifestV1, ReleaseManifestV2,
-    SolutionSpec, SourceAttribution, TestingSpecV2, validate_relative_path,
+    ScoreAggregationV2, SolutionRoleV2, SolutionSpec, SolutionSpecV2, SourceAttribution,
+    TestCaseOriginV2, TestCaseRoleV2, TestCaseSpecV2, TestGroupSpecV2, TestingSpecV2,
+    ValidatorSetSpecV2, ValidatorUnitSpecV2, validate_relative_path,
 };
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
@@ -226,6 +231,304 @@ impl AuthoringSpecV2 {
         }
     }
 
+    pub fn migrate_v1(spec: &AuthoringSpecV1) -> Result<Self, AuthoringSpecError> {
+        spec.validate_references()?;
+        let group_ids: BTreeMap<String, Uuid> = spec
+            .judging
+            .groups
+            .iter()
+            .map(|group| (group.id.clone(), Uuid::now_v7()))
+            .collect();
+        let groups = spec
+            .judging
+            .groups
+            .iter()
+            .map(|group| {
+                Ok(TestGroupSpecV2 {
+                    id: group_ids[&group.id],
+                    name: group.id.clone(),
+                    points: group.points,
+                    depends_on: group
+                        .depends_on
+                        .iter()
+                        .map(|id| {
+                            group_ids.get(id).copied().ok_or_else(|| {
+                                AuthoringSpecError::Migration(format!(
+                                    "group {} depends on missing group {id}",
+                                    group.id
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    feedback_policy: group.feedback_policy,
+                    aggregation: if spec.problem_type == ProblemType::Scored {
+                        ScoreAggregationV2::GroupMinimum
+                    } else {
+                        ScoreAggregationV2::AllOrNothing
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, AuthoringSpecError>>()?;
+
+        let generator_ids: BTreeMap<String, Uuid> = spec
+            .judging
+            .generators
+            .iter()
+            .map(|generator| (generator.id.clone(), Uuid::now_v7()))
+            .collect();
+        let mut generators: Vec<GeneratorSpecV2> = spec
+            .judging
+            .generators
+            .iter()
+            .map(|generator| GeneratorSpecV2 {
+                program: ProgramSpecV2 {
+                    id: generator_ids[&generator.id],
+                    name: generator.id.clone(),
+                    source_path: generator.source_path.clone(),
+                    language: generator.language.clone(),
+                    arguments: generator.arguments.clone(),
+                },
+                recipes: Vec::new(),
+            })
+            .collect();
+
+        let sample_inputs: BTreeSet<&str> = spec
+            .publication
+            .iter()
+            .flat_map(|publication| publication.samples.iter())
+            .map(|sample| sample.input_file.as_str())
+            .collect();
+        let mut tests = Vec::with_capacity(spec.judging.tests.len());
+        for test in &spec.judging.tests {
+            let mapped_groups = test
+                .groups
+                .iter()
+                .map(|id| {
+                    group_ids.get(id).copied().ok_or_else(|| {
+                        AuthoringSpecError::Migration(format!(
+                            "test {} references missing group {id}",
+                            test.name
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let generated = if let Some(generator_name) = &test.generated_by {
+                let generator_id = generator_ids.get(generator_name).copied().ok_or_else(|| {
+                    AuthoringSpecError::Migration(format!(
+                        "test {} references missing generator {generator_name}",
+                        test.name
+                    ))
+                })?;
+                let seed = test.seed.ok_or_else(|| {
+                    AuthoringSpecError::Migration(format!(
+                        "generated test {} has no fixed seed",
+                        test.name
+                    ))
+                })?;
+                let recipe_id = Uuid::now_v7();
+                let generator = generators
+                    .iter_mut()
+                    .find(|generator| generator.program.id == generator_id)
+                    .ok_or_else(|| {
+                        AuthoringSpecError::Migration("generator mapping disappeared".into())
+                    })?;
+                generator.recipes.push(GeneratorRecipeSpecV2 {
+                    id: recipe_id,
+                    name: format!("migrated-{}", test.name),
+                    argument_template: test.generator_arguments.clone(),
+                    parameters: BTreeMap::new(),
+                    matrix: GeneratorMatrixStrategyV2::Cartesian,
+                    seed_start: seed,
+                    seed_step: 1,
+                    count: 1,
+                    group_ids: mapped_groups.clone(),
+                });
+                Some(GeneratedCaseRefV2 {
+                    generator_id,
+                    recipe_id,
+                    ordinal: 0,
+                    seed,
+                })
+            } else {
+                None
+            };
+            tests.push(TestCaseSpecV2 {
+                id: test.id,
+                name: test.name.clone(),
+                role: if sample_inputs.contains(test.input_file.as_str()) {
+                    TestCaseRoleV2::Sample
+                } else {
+                    TestCaseRoleV2::Secret
+                },
+                origin: if generated.is_some() {
+                    TestCaseOriginV2::Generated
+                } else {
+                    TestCaseOriginV2::Manual
+                },
+                input_file: test.input_file.clone(),
+                answer_file: test.answer_file.clone(),
+                group_ids: mapped_groups,
+                points: None,
+                generated,
+            });
+        }
+
+        let primary_validator = spec
+            .judging
+            .validator_path
+            .as_ref()
+            .map(|path| ProgramSpecV2 {
+                id: Uuid::now_v7(),
+                name: "validator".into(),
+                source_path: path.clone(),
+                language: spec
+                    .judging
+                    .validator_language
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+                arguments: Vec::new(),
+            });
+        let mut extra_validators: Vec<ProgramSpecV2> = spec
+            .judging
+            .extra_validators
+            .iter()
+            .map(|validator| ProgramSpecV2 {
+                id: Uuid::now_v7(),
+                name: validator.id.clone(),
+                source_path: validator.source_path.clone(),
+                language: validator.language.clone(),
+                arguments: validator.arguments.clone(),
+            })
+            .collect();
+        for (index, path) in spec.judging.extra_validator_paths.iter().enumerate() {
+            if !extra_validators
+                .iter()
+                .any(|validator| validator.source_path == *path)
+            {
+                extra_validators.push(ProgramSpecV2 {
+                    id: Uuid::now_v7(),
+                    name: format!("extra-validator-{}", index + 1),
+                    source_path: path.clone(),
+                    language: spec
+                        .judging
+                        .validator_language
+                        .clone()
+                        .unwrap_or_else(|| "unknown".into()),
+                    arguments: Vec::new(),
+                });
+            }
+        }
+
+        let solutions = spec
+            .solutions
+            .iter()
+            .enumerate()
+            .map(|(index, solution)| SolutionSpecV2 {
+                program: ProgramSpecV2 {
+                    id: Uuid::now_v7(),
+                    name: solution.name.clone(),
+                    source_path: solution.source_path.clone(),
+                    language: solution.language.clone(),
+                    arguments: Vec::new(),
+                },
+                role: match solution.expected_verdict {
+                    ExpectedVerdict::Accepted if index == 0 => SolutionRoleV2::Reference,
+                    ExpectedVerdict::Accepted => SolutionRoleV2::Alternative,
+                    ExpectedVerdict::WrongAnswer => SolutionRoleV2::KnownWrong,
+                    _ => SolutionRoleV2::Alternative,
+                },
+                expected_verdict: solution.expected_verdict,
+                expected_score: solution.expected_score.clone(),
+                group_expectations: Vec::new(),
+                tags: Vec::new(),
+                notes: String::new(),
+            })
+            .collect();
+
+        let execution = migrate_execution_v1(spec)?;
+        Ok(Self {
+            schema: AUTHORING_SPEC_SCHEMA_V2.into(),
+            project_id: spec.project_id,
+            problem_type: spec.problem_type,
+            package_profile: spec.package_profile,
+            default_locale: spec.default_locale.clone(),
+            title: spec.title.clone(),
+            statements: spec.statements.clone(),
+            tutorials: BTreeMap::new(),
+            files: spec
+                .files
+                .iter()
+                .map(|file| AuthoringFileV2 {
+                    path: file.path.clone(),
+                    media_type: file.media_type.clone(),
+                    executable: file.executable,
+                })
+                .collect(),
+            toolchains: spec.toolchains.clone(),
+            testing: TestingSpecV2 {
+                limits: spec.judging.limits.clone(),
+                groups,
+                tests,
+                generators,
+                validators: ValidatorSetSpecV2 {
+                    primary: primary_validator,
+                    extra: extra_validators,
+                    unit_tests: spec
+                        .judging
+                        .validator_tests
+                        .iter()
+                        .map(|test| ValidatorUnitSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: test.name.clone(),
+                            input_file: test.input_file.clone(),
+                            expected_valid: test.expected_valid,
+                        })
+                        .collect(),
+                },
+                checker: CheckerConfigSpecV2 {
+                    checker: spec.judging.checker.clone(),
+                    unit_tests: spec
+                        .judging
+                        .checker_tests
+                        .iter()
+                        .map(|test| CheckerUnitSpecV2 {
+                            id: Uuid::now_v7(),
+                            name: test.name.clone(),
+                            input_file: test.input_file.clone(),
+                            answer_file: test.answer_file.clone(),
+                            output_file: test.output_file.clone(),
+                            expected_accepted: test.expected_accepted,
+                        })
+                        .collect(),
+                    mutation: CheckerMutationSpecV2::default(),
+                },
+                solutions,
+                stress_suites: Vec::new(),
+                detect_duplicates: true,
+                verify_determinism: true,
+            },
+            execution,
+            output_submissions: spec
+                .output_submissions
+                .iter()
+                .map(|submission| OutputSubmissionSpecV2 {
+                    id: Uuid::now_v7(),
+                    name: submission.name.clone(),
+                    outputs: submission.outputs.clone(),
+                    expected_verdict: submission.expected_verdict,
+                    expected_score: submission.expected_score.clone(),
+                })
+                .collect(),
+            sources: spec.sources.clone(),
+            publication: spec.publication.clone(),
+            policy_version: spec.policy_version.clone(),
+        })
+    }
+
+    pub fn migrate_manifest_v1(manifest: &ReleaseManifestV1) -> Result<Self, AuthoringSpecError> {
+        Self::migrate_v1(&AuthoringSpecV1::from_manifest(manifest))
+    }
+
     pub fn validate_references(&self) -> Result<(), AuthoringSpecError> {
         if self.schema != AUTHORING_SPEC_SCHEMA_V2 {
             return Err(AuthoringSpecError::UnsupportedSchema(self.schema.clone()));
@@ -292,6 +595,86 @@ impl AuthoringSpecV2 {
             policy_version: self.policy_version.clone(),
         }
     }
+}
+
+fn migrate_execution_v1(spec: &AuthoringSpecV1) -> Result<ExecutionSpecV2, AuthoringSpecError> {
+    let interactive_profile = match &spec.judging.harness {
+        Some(ExecutionHarnessV1::InteractiveStdio { profiles, .. }) => profiles
+            .iter()
+            .next()
+            .map(|(language, profile)| (language.clone(), profile.interactor_source_path.clone())),
+        _ => None,
+    };
+    let interactive = spec
+        .judging
+        .interactor_path
+        .clone()
+        .map(|path| {
+            (
+                spec.judging
+                    .interactor_language
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+                path,
+            )
+        })
+        .or(interactive_profile)
+        .map(|(language, source_path)| InteractiveSpecV2 {
+            interactor: ProgramSpecV2 {
+                id: Uuid::now_v7(),
+                name: "interactor".into(),
+                source_path,
+                language,
+                arguments: Vec::new(),
+            },
+            idle_timeout_ms: 2_000,
+            transcript_limit_kib: 1_024,
+            unit_tests: Vec::new(),
+        });
+
+    let harness = match &spec.judging.harness {
+        Some(ExecutionHarnessV1::CustomImpl { profiles, .. }) => {
+            let kind = match spec.problem_type {
+                ProblemType::Library => HarnessKindV2::Library,
+                ProblemType::Grader => HarnessKindV2::Grader,
+                _ => {
+                    return Err(AuthoringSpecError::Migration(
+                        "custom implementation harness requires a library or grader problem".into(),
+                    ));
+                }
+            };
+            Some(HarnessSpecV2 {
+                kind,
+                interface_files: Vec::new(),
+                public_files: Vec::new(),
+                private_files: spec.judging.grader_path.iter().cloned().collect(),
+                stub_templates: BTreeMap::new(),
+                profiles: profiles
+                    .iter()
+                    .map(|(language, profile)| {
+                        (
+                            language.clone(),
+                            HarnessProfileSpecV2 {
+                                language: language.clone(),
+                                source_path: profile.source_path.clone(),
+                                asset_paths: profile.asset_paths.clone(),
+                                include_dirs: Vec::new(),
+                                compile_script: profile.compile_script.clone(),
+                                run_script: profile.run_script.clone(),
+                                compile_command: profile.compile_command.clone(),
+                                run_command: profile.run_command.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+        }
+        _ => None,
+    };
+    Ok(ExecutionSpecV2 {
+        interactive,
+        harness,
+    })
 }
 
 pub fn parse_authoring_spec(bytes: &[u8]) -> Result<AuthoringSpecV1, AuthoringSpecError> {
@@ -597,6 +980,8 @@ pub enum AuthoringSpecError {
     DuplicatePath(String),
     #[error("materialized file inventory does not match reporch.yaml")]
     InventoryMismatch,
+    #[error("authoring migration failed: {0}")]
+    Migration(String),
     #[error("invalid YAML: {0}")]
     Yaml(#[from] serde_yaml_ng::Error),
     #[error("invalid authoring reference: {0}")]
@@ -731,6 +1116,24 @@ mod tests {
         assert!(matches!(
             parse_versioned_authoring_spec(&bytes).unwrap(),
             VersionedAuthoringSpec::V1(_)
+        ));
+    }
+
+    #[test]
+    fn v1_migration_creates_a_valid_v2_document_without_changing_file_inventory() {
+        let v1 = minimal_spec();
+        let v2 = AuthoringSpecV2::migrate_v1(&v1).unwrap();
+        assert_eq!(v2.project_id, v1.project_id);
+        assert_eq!(v2.problem_type, v1.problem_type);
+        assert_eq!(v2.statements, v1.statements);
+        assert_eq!(
+            v2.files.iter().map(|file| &file.path).collect::<Vec<_>>(),
+            v1.files.iter().map(|file| &file.path).collect::<Vec<_>>()
+        );
+        let bytes = to_authoring_yaml_v2(&v2).unwrap();
+        assert!(matches!(
+            parse_versioned_authoring_spec(&bytes).unwrap(),
+            VersionedAuthoringSpec::V2(_)
         ));
     }
 
