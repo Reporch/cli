@@ -1919,7 +1919,7 @@ pub async fn create_operation(options: &CreateOptions) -> Result<ProjectResponse
         .await?;
     if let Some(directory) = &options.directory {
         crate::init_project_template(directory, title, project.id, options.problem_type.into())?;
-        crate::local_project::link_project(directory, &options.connection.api_url, project.id)?;
+        crate::local_project_v2::link_project(directory, &options.connection.api_url, project.id)?;
     }
     Ok(project)
 }

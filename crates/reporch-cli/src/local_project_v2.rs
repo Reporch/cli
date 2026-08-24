@@ -484,4 +484,23 @@ mod tests {
         assert!(migrate_project(temporary.path()).unwrap().migrated);
         assert!(!migrate_project(temporary.path()).unwrap().migrated);
     }
+
+    #[test]
+    fn freshly_initialized_v2_project_can_be_linked_without_v1_parsing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let local_id = Uuid::now_v7();
+        let remote_id = Uuid::now_v7();
+        crate::init_project_with_id(temporary.path(), "Linked V2", local_id).unwrap();
+
+        let status =
+            link_project(temporary.path(), "https://studio.reporch.com/", remote_id).unwrap();
+
+        assert_eq!(status.project_id, remote_id);
+        assert!(status.linked);
+        assert_eq!(
+            read_authoring_spec(temporary.path()).unwrap().project_id,
+            remote_id
+        );
+        assert_eq!(status.remote.unwrap().api_url, "https://studio.reporch.com");
+    }
 }
