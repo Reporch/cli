@@ -1962,8 +1962,51 @@ async fn run_interactor(
 
 pub(super) async fn grader(options: GraderOptions, output: &CliOutput) -> Result<()> {
     match options.command {
-        GraderCommand::Set { source, language } => {
+        GraderCommand::Set {
+            source,
+            language,
+            submission_template,
+            compile_script,
+            compile_command,
+            run_script,
+            run_command,
+            asset,
+            interface_file,
+            public_file,
+        } => {
             let source = relative_string(&source)?;
+            let submission_template = submission_template
+                .as_deref()
+                .map(relative_string)
+                .transpose()?;
+            let compile_script = compile_script.as_deref().map(relative_string).transpose()?;
+            let run_script = run_script.as_deref().map(relative_string).transpose()?;
+            let assets = asset
+                .iter()
+                .map(|path| relative_string(path))
+                .collect::<Result<Vec<_>>>()?;
+            let interface_files = interface_file
+                .iter()
+                .map(|path| relative_string(path))
+                .collect::<Result<Vec<_>>>()?;
+            let public_files = public_file
+                .iter()
+                .map(|path| relative_string(path))
+                .collect::<Result<Vec<_>>>()?;
+            let normalize_command =
+                |value: Option<String>, label: &str| -> Result<Option<String>> {
+                    let Some(value) = value else {
+                        return Ok(None);
+                    };
+                    let value = value.trim();
+                    ensure!(
+                        !value.is_empty() && value.len() <= 4_096,
+                        "{label} must be between 1 and 4096 characters"
+                    );
+                    Ok(Some(value.to_owned()))
+                };
+            let compile_command = normalize_command(compile_command, "compile command")?;
+            let run_command = normalize_command(run_command, "run command")?;
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |root, spec| {
@@ -1974,6 +2017,10 @@ pub(super) async fn grader(options: GraderOptions, output: &CliOutput) -> Result
                         ),
                         "grader can only be configured for a library or grader problem"
                     );
+                    ensure!(
+                        !language.trim().is_empty() && language.len() <= 50,
+                        "grader language must be between 1 and 50 characters"
+                    );
                     reporch_cli::local_project_v2::declare_project_file(
                         root,
                         spec,
@@ -1981,6 +2028,37 @@ pub(super) async fn grader(options: GraderOptions, output: &CliOutput) -> Result
                         source_media_type(&language),
                         false,
                     )?;
+                    if let Some(path) = submission_template.as_deref() {
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            path,
+                            source_media_type(&language),
+                            false,
+                        )?;
+                    }
+                    for path in assets
+                        .iter()
+                        .chain(interface_files.iter())
+                        .chain(public_files.iter())
+                    {
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            path,
+                            source_media_type(&language),
+                            false,
+                        )?;
+                    }
+                    for path in compile_script.iter().chain(run_script.iter()) {
+                        reporch_cli::local_project_v2::declare_project_file(
+                            root,
+                            spec,
+                            path,
+                            "text/x-shellscript",
+                            true,
+                        )?;
+                    }
                     let kind = if spec.problem_type == ProblemType::Library {
                         HarnessKindV2::Library
                     } else {
@@ -1995,20 +2073,131 @@ pub(super) async fn grader(options: GraderOptions, output: &CliOutput) -> Result
                         profiles: Default::default(),
                     });
                     harness.kind = kind;
+                    let existing = harness.profiles.remove(&language);
+                    if let Some(old_source) = existing
+                        .as_ref()
+                        .map(|profile| profile.source_path.as_str())
+                        .filter(|old_source| *old_source != source)
+                        && !harness
+                            .profiles
+                            .values()
+                            .any(|profile| profile.source_path == old_source)
+                    {
+                        harness.private_files.retain(|path| path != old_source);
+                    }
                     if !harness.private_files.contains(&source) {
                         harness.private_files.push(source.clone());
                     }
+                    for path in &interface_files {
+                        if !harness.interface_files.contains(path) {
+                            harness.interface_files.push(path.clone());
+                        }
+                    }
+                    for path in &public_files {
+                        if !harness.public_files.contains(path) {
+                            harness.public_files.push(path.clone());
+                        }
+                    }
+                    let submission_source_path = submission_template
+                        .clone()
+                        .or_else(|| {
+                            existing
+                                .as_ref()
+                                .and_then(|profile| profile.submission_source_path.clone())
+                        })
+                        .context(
+                            "grader set requires --submission-template when the profile has no safe contestant template",
+                        )?;
+                    ensure!(
+                        submission_source_path != source
+                            && !harness.private_files.contains(&submission_source_path),
+                        "contestant submission template must be distinct from every private grader source"
+                    );
+                    let selected_compile_script = if compile_command.is_some() {
+                        None
+                    } else {
+                        compile_script.clone().or_else(|| {
+                            existing
+                                .as_ref()
+                                .and_then(|profile| profile.compile_script.clone())
+                        })
+                    };
+                    let selected_run_script = if run_command.is_some() {
+                        None
+                    } else {
+                        run_script.clone().or_else(|| {
+                            existing
+                                .as_ref()
+                                .and_then(|profile| profile.run_script.clone())
+                        })
+                    };
+                    let selected_compile_command = if compile_script.is_some() {
+                        None
+                    } else {
+                        compile_command.clone().or_else(|| {
+                            existing
+                                .as_ref()
+                                .and_then(|profile| profile.compile_command.clone())
+                        })
+                    };
+                    let selected_run_command = if run_script.is_some() {
+                        None
+                    } else {
+                        run_command.clone().or_else(|| {
+                            existing
+                                .as_ref()
+                                .and_then(|profile| profile.run_command.clone())
+                        })
+                    };
+                    ensure!(
+                        selected_compile_script.is_some() || selected_compile_command.is_some(),
+                        "grader profile requires --compile-script or --compile-command"
+                    );
+                    ensure!(
+                        selected_run_script.is_some() || selected_run_command.is_some(),
+                        "grader profile requires --run-script or --run-command"
+                    );
+                    let mut asset_paths = existing
+                        .as_ref()
+                        .map(|profile| profile.asset_paths.clone())
+                        .unwrap_or_default();
+                    if let Some(old_source) = existing
+                        .as_ref()
+                        .map(|profile| profile.source_path.as_str())
+                        .filter(|old_source| *old_source != source)
+                    {
+                        asset_paths.retain(|path| path != old_source);
+                    }
+                    asset_paths.extend(assets.iter().cloned());
+                    asset_paths.extend(interface_files.iter().cloned());
+                    asset_paths.extend(public_files.iter().cloned());
+                    asset_paths.extend([source.clone(), submission_source_path.clone()]);
+                    asset_paths.extend(selected_compile_script.iter().cloned());
+                    asset_paths.extend(selected_run_script.iter().cloned());
+                    if let Some(path) = harness.stub_templates.get(&language) {
+                        asset_paths.push(path.clone());
+                    }
+                    asset_paths.sort();
+                    asset_paths.dedup();
+                    ensure!(
+                        asset_paths.len() <= 500,
+                        "grader profile cannot contain more than 500 assets"
+                    );
                     harness.profiles.insert(
                         language.clone(),
                         HarnessProfileSpecV2 {
                             language: language.clone(),
                             source_path: source.clone(),
-                            asset_paths: vec![source.clone()],
-                            include_dirs: Vec::new(),
-                            compile_script: None,
-                            run_script: None,
-                            compile_command: None,
-                            run_command: None,
+                            submission_source_path: Some(submission_source_path),
+                            asset_paths,
+                            include_dirs: existing
+                                .as_ref()
+                                .map(|profile| profile.include_dirs.clone())
+                                .unwrap_or_default(),
+                            compile_script: selected_compile_script,
+                            run_script: selected_run_script,
+                            compile_command: selected_compile_command,
+                            run_command: selected_run_command,
                         },
                     );
                     Ok(())

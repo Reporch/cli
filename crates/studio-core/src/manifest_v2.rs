@@ -323,7 +323,11 @@ pub enum HarnessKindV2 {
 #[serde(deny_unknown_fields)]
 pub struct HarnessProfileSpecV2 {
     pub language: String,
+    /// Judge-side grader/manager source linked with the contestant program.
     pub source_path: String,
+    /// Harmless contestant source template replaced by the submitted program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_source_path: Option<String>,
     #[serde(default)]
     pub asset_paths: Vec<String>,
     #[serde(default)]
@@ -686,6 +690,43 @@ impl ReleaseManifestV2 {
             }
         }
         if let Some(harness) = &self.execution.harness {
+            if harness.profiles.is_empty() || harness.profiles.len() > 20 {
+                return Err(ManifestError::InvalidConfiguration(
+                    "library/grader harness requires 1 to 20 language profiles".into(),
+                ));
+            }
+            let private_paths = harness
+                .private_files
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if private_paths.is_empty() {
+                return Err(ManifestError::InvalidConfiguration(
+                    "library/grader harness requires a private grader source".into(),
+                ));
+            }
+            let shared_public_paths = harness
+                .interface_files
+                .iter()
+                .chain(harness.public_files.iter())
+                .chain(harness.stub_templates.values())
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if private_paths.len() != harness.private_files.len()
+                || harness
+                    .interface_files
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != harness.interface_files.len()
+                || harness.public_files.iter().collect::<BTreeSet<_>>().len()
+                    != harness.public_files.len()
+                || !private_paths.is_disjoint(&shared_public_paths)
+            {
+                return Err(ManifestError::InvalidConfiguration(
+                    "harness visibility lists contain duplicates or private/public overlap".into(),
+                ));
+            }
             for path in harness
                 .interface_files
                 .iter()
@@ -695,8 +736,93 @@ impl ReleaseManifestV2 {
             {
                 require_file(&paths, path)?;
             }
-            for profile in harness.profiles.values() {
+            for (language, profile) in &harness.profiles {
+                if language.trim().is_empty()
+                    || language != &profile.language
+                    || profile.language.len() > 50
+                    || profile.asset_paths.is_empty()
+                    || profile.asset_paths.len() > 500
+                    || profile.asset_paths.iter().collect::<BTreeSet<_>>().len()
+                        != profile.asset_paths.len()
+                    || (profile.compile_script.is_none()
+                        && profile
+                            .compile_command
+                            .as_deref()
+                            .is_none_or(|command| command.trim().is_empty()))
+                    || (profile.run_script.is_none()
+                        && profile
+                            .run_command
+                            .as_deref()
+                            .is_none_or(|command| command.trim().is_empty()))
+                    || profile
+                        .compile_command
+                        .as_deref()
+                        .is_some_and(|command| command.trim().is_empty() || command.len() > 4_096)
+                    || profile
+                        .run_command
+                        .as_deref()
+                        .is_some_and(|command| command.trim().is_empty() || command.len() > 4_096)
+                {
+                    return Err(ManifestError::InvalidConfiguration(format!(
+                        "harness profile {language} is incomplete"
+                    )));
+                }
                 require_file(&paths, &profile.source_path)?;
+                match &profile.submission_source_path {
+                    Some(path) => {
+                        require_file(&paths, path)?;
+                        if !private_paths.contains(profile.source_path.as_str())
+                            || private_paths.contains(path.as_str())
+                        {
+                            return Err(ManifestError::InvalidConfiguration(format!(
+                                "harness profile {} has ambiguous grader/template visibility",
+                                profile.language
+                            )));
+                        }
+                    }
+                    None if private_paths.contains(profile.source_path.as_str()) => {
+                        return Err(ManifestError::InvalidConfiguration(format!(
+                            "legacy harness profile {} cannot use a private submission template",
+                            profile.language
+                        )));
+                    }
+                    None => {}
+                }
+                let profile_assets = profile
+                    .asset_paths
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
+                if profile.submission_source_path.is_none()
+                    && private_paths.is_disjoint(&profile_assets)
+                {
+                    return Err(ManifestError::InvalidConfiguration(format!(
+                        "legacy harness profile {} omits its private grader",
+                        profile.language
+                    )));
+                }
+                let required_assets = std::iter::once(profile.source_path.as_str())
+                    .chain(profile.submission_source_path.iter().map(String::as_str))
+                    .chain(profile.compile_script.iter().map(String::as_str))
+                    .chain(profile.run_script.iter().map(String::as_str))
+                    .chain(harness.interface_files.iter().map(String::as_str))
+                    .chain(harness.public_files.iter().map(String::as_str))
+                    .chain(
+                        harness
+                            .stub_templates
+                            .get(&profile.language)
+                            .into_iter()
+                            .map(String::as_str),
+                    );
+                if !required_assets
+                    .into_iter()
+                    .all(|path| profile_assets.contains(path))
+                {
+                    return Err(ManifestError::InvalidConfiguration(format!(
+                        "harness profile {} omits a required asset",
+                        profile.language
+                    )));
+                }
                 for path in profile
                     .asset_paths
                     .iter()
@@ -842,6 +968,109 @@ mod tests {
         let manifest = minimal_manifest();
         manifest.validate_references().unwrap();
         assert_eq!(manifest.digest().unwrap(), manifest.digest().unwrap());
+    }
+
+    fn harness_manifest(explicit_source_roles: bool) -> ReleaseManifestV2 {
+        let mut manifest = minimal_manifest();
+        manifest.problem_type = ProblemType::Grader;
+        for path in [
+            "cpp/grader.cpp",
+            "cpp/solution.cpp",
+            "cpp/compile.sh",
+            "cpp/run.sh",
+        ] {
+            manifest.files.push(ManifestFile {
+                path: path.into(),
+                sha256: Sha256Digest::from_bytes(path.as_bytes()),
+                size_bytes: path.len() as u64,
+                media_type: "text/plain".into(),
+                executable: path.ends_with(".sh"),
+            });
+        }
+        manifest.execution.harness = Some(HarnessSpecV2 {
+            kind: HarnessKindV2::Grader,
+            interface_files: vec![],
+            public_files: vec![],
+            private_files: vec!["cpp/grader.cpp".into()],
+            stub_templates: BTreeMap::new(),
+            profiles: BTreeMap::from([(
+                "cpp".into(),
+                HarnessProfileSpecV2 {
+                    language: "cpp".into(),
+                    source_path: if explicit_source_roles {
+                        "cpp/grader.cpp".into()
+                    } else {
+                        "cpp/solution.cpp".into()
+                    },
+                    submission_source_path: explicit_source_roles
+                        .then(|| "cpp/solution.cpp".into()),
+                    asset_paths: vec![
+                        "cpp/grader.cpp".into(),
+                        "cpp/solution.cpp".into(),
+                        "cpp/compile.sh".into(),
+                        "cpp/run.sh".into(),
+                    ],
+                    include_dirs: vec![],
+                    compile_script: Some("cpp/compile.sh".into()),
+                    run_script: Some("cpp/run.sh".into()),
+                    compile_command: None,
+                    run_command: None,
+                },
+            )]),
+        });
+        manifest
+    }
+
+    #[test]
+    fn harness_accepts_explicit_and_legacy_source_roles_without_ambiguity() {
+        let current = harness_manifest(true);
+        current.validate_references().unwrap();
+        let legacy = harness_manifest(false);
+        legacy.validate_references().unwrap();
+
+        let mut legacy_json = serde_json::to_value(current).unwrap();
+        legacy_json["execution"]["harness"]["profiles"]["cpp"]
+            .as_object_mut()
+            .unwrap()
+            .remove("submission_source_path");
+        legacy_json["execution"]["harness"]["profiles"]["cpp"]["source_path"] =
+            serde_json::Value::String("cpp/solution.cpp".into());
+        let reparsed: ReleaseManifestV2 = serde_json::from_value(legacy_json).unwrap();
+        reparsed.validate_references().unwrap();
+    }
+
+    #[test]
+    fn harness_rejects_private_templates_and_missing_private_assets() {
+        let mut ambiguous = harness_manifest(true);
+        let profile = ambiguous
+            .execution
+            .harness
+            .as_mut()
+            .unwrap()
+            .profiles
+            .get_mut("cpp")
+            .unwrap();
+        profile.submission_source_path = Some("cpp/grader.cpp".into());
+        assert!(matches!(
+            ambiguous.validate_references(),
+            Err(ManifestError::InvalidConfiguration(_))
+        ));
+
+        let mut missing_private_asset = harness_manifest(false);
+        missing_private_asset
+            .execution
+            .harness
+            .as_mut()
+            .unwrap()
+            .profiles
+            .get_mut("cpp")
+            .unwrap()
+            .asset_paths
+            .retain(|path| path != "cpp/grader.cpp");
+        assert!(matches!(
+            missing_private_asset.validate_references(),
+            Err(ManifestError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]
