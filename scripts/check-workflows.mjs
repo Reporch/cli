@@ -129,6 +129,11 @@ assert.match(
 );
 assert.match(publishedE2e, /unset GH_TOKEN/);
 assert.match(publishedE2e, /Remove-Item Env:GH_TOKEN/);
+assert.match(
+  publishedE2e,
+  /\[System\.IO\.File\]::WriteAllText\([\s\S]*\(\(\$evidenceChecksums -join "`n"\) \+ "`n"\)/,
+  "Windows evidence checksum manifests must use portable LF line endings"
+);
 assert.match(publishedE2e, /scripts\/qualify-installed-auth\.mjs/);
 assert.match(publishedE2e, /dbus-run-session/);
 assert.match(publishedE2e, /credential_store_round_trip/);
