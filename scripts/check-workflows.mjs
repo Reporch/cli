@@ -122,6 +122,11 @@ for (const target of [
   );
 }
 assert.match(publishedE2e, /gh attestation verify/);
+assert.match(
+  publishedE2e,
+  /if \[ "\$RUNNER_OS" = macOS \]; then\s+\(cd "\$assets" && printf '%s\\n' "\$checksum" \| shasum -a 256 --check\)/,
+  "published macOS qualification must use the native shasum verifier"
+);
 assert.match(publishedE2e, /unset GH_TOKEN/);
 assert.match(publishedE2e, /Remove-Item Env:GH_TOKEN/);
 assert.match(publishedE2e, /scripts\/qualify-installed-auth\.mjs/);

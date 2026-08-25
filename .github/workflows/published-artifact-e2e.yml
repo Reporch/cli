@@ -91,10 +91,12 @@ jobs:
             --pattern "$archive_name" --pattern SHA256SUMS --dir "$assets"
           checksum=$(grep -F "  ./$archive_name" "$assets/SHA256SUMS")
           test -n "$checksum"
-          if command -v sha256sum >/dev/null; then
-            (cd "$assets" && printf '%s\n' "$checksum" | sha256sum --check --strict)
-          else
+          # macOS 15 ships a BSD sha256sum compatibility command that does not
+          # support GNU --check/--strict, so select the verifier by runner OS.
+          if [ "$RUNNER_OS" = macOS ]; then
             (cd "$assets" && printf '%s\n' "$checksum" | shasum -a 256 --check)
+          else
+            (cd "$assets" && printf '%s\n' "$checksum" | sha256sum --check --strict)
           fi
           archive="$assets/$archive_name"
           gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
