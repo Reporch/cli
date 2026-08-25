@@ -30,7 +30,7 @@ use reporch_cli::{NativeAuthOptions, device_auth_config};
 #[cfg(test)]
 use studio_core::ReleaseManifestV1;
 use studio_core::{
-    PackageProfile, VersionedReleaseManifest, compatibility_report, validate_manifest,
+    PackageProfile, ProblemType, VersionedReleaseManifest, compatibility_report, validate_manifest,
 };
 use studio_native_auth::qualification_keyring_canary;
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
@@ -106,6 +106,8 @@ enum Command {
     Verify(studio_remote::ValidateOptions),
     /// Check, push, validate, and submit the current project for review.
     Submit(SubmitOptions),
+    /// Publish a verified release. Shorthand for `publication publish`.
+    Publish(studio_remote::PublishOptions),
     /// Authenticate this native client with Reporch without storing tokens in files.
     Auth {
         #[command(subcommand)]
@@ -392,6 +394,8 @@ enum ReviewCommand {
     Request(studio_remote::ReviewPoolRequestOptions),
     /// List claimable assignments. Requires the review-pool entitlement.
     Inbox(studio_remote::ReviewPoolInboxOptions),
+    /// Show one digest-bound review.
+    Show(studio_remote::ReviewShowOptions),
     /// Show a review-pool request or assignment.
     Status(studio_remote::ReviewPoolTargetOptions),
     /// Atomically claim a review-pool request.
@@ -647,6 +651,15 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             output.emit("verify", &validation, human)
         }
         Command::Submit(options) => submit_project(options, output).await,
+        Command::Publish(options) => {
+            confirm_publication(yes, no_input)?;
+            let publication = studio_remote::publish_operation(&options).await?;
+            output.emit(
+                "publish",
+                &publication,
+                &format!("Publication status: {:?}", publication.status),
+            )
+        }
         Command::Auth { command } => match command {
             AuthCommand::Login(options) => auth_login(&options, output).await,
             AuthCommand::Status(options) => auth_status(&options, output).await,
@@ -1114,6 +1127,14 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     &format!("{} claimable review(s)", inbox.items.len()),
                 )
             }
+            ReviewCommand::Show(options) => {
+                let review = studio_remote::show_review_operation(&options).await?;
+                output.emit(
+                    "review show",
+                    &review,
+                    &format!("Review {} · {:?}", review.id, review.status),
+                )
+            }
             ReviewCommand::Status(options) => {
                 let request = studio_remote::review_pool_status_operation(&options).await?;
                 output.emit(
@@ -1397,6 +1418,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Output(_) => "output",
         Command::Verify(_) => "verify",
         Command::Submit(_) => "submit",
+        Command::Publish(_) => "publish",
         Command::Auth { command } => match command {
             AuthCommand::Login(_) => "auth login",
             AuthCommand::Status(_) => "auth status",
@@ -1458,6 +1480,7 @@ fn command_name(command: &Command) -> &'static str {
             ReviewCommand::List(_) => "review list",
             ReviewCommand::Request(_) => "review request",
             ReviewCommand::Inbox(_) => "review inbox",
+            ReviewCommand::Show(_) => "review show",
             ReviewCommand::Status(_) => "review status",
             ReviewCommand::Claim(_) => "review claim",
             ReviewCommand::Cancel(_) => "review cancel",
@@ -1554,15 +1577,8 @@ async fn qualification_self_test() -> Result<()> {
         .context("OS credential-store canary")?;
 
     let temporary = tempfile::tempdir().context("create qualification fixture directory")?;
-    reporch_cli::init_project_with_id(
-        temporary.path(),
-        "Reporch Studio CLI qualification",
-        Uuid::now_v7(),
-    )?;
-    let manifest_bytes = fs::read(temporary.path().join("reporch.problem.json"))?;
-    let manifest: VersionedReleaseManifest = serde_json::from_slice(&manifest_bytes)?;
-    manifest.validate_references()?;
-    let authoring = reporch_cli::local_project_v2::read_authoring_spec(temporary.path())?;
+    let (validated_problem_types, package_profiles, compatibility_report_count) =
+        qualification_authoring_matrix(temporary.path())?;
 
     println!(
         "{}",
@@ -1573,12 +1589,79 @@ async fn qualification_self_test() -> Result<()> {
             "target_arch": std::env::consts::ARCH,
             "credential_store_round_trip": true,
             "generated_manifest_valid": true,
-            "generated_authoring_spec_valid": authoring.project_id == manifest.project_id(),
-            "problem_type_count": 6,
+            "generated_authoring_spec_valid": true,
+            "problem_types": validated_problem_types,
+            "problem_type_count": validated_problem_types.len(),
+            "package_profiles": package_profiles,
+            "package_profile_count": package_profiles.len(),
+            "compatibility_report_count": compatibility_report_count,
             "passed": true,
         }))?
     );
     Ok(())
+}
+
+fn qualification_authoring_matrix(
+    root: &Path,
+) -> Result<(Vec<ProblemType>, Vec<PackageProfile>, usize)> {
+    let problem_types = [
+        ("standard", ProblemType::Standard),
+        ("scored", ProblemType::Scored),
+        ("interactive", ProblemType::Interactive),
+        ("output-only", ProblemType::OutputOnly),
+        ("library", ProblemType::Library),
+        ("grader", ProblemType::Grader),
+    ];
+    let package_profiles = [
+        PackageProfile::ReporchNative,
+        PackageProfile::Icpc202509,
+        PackageProfile::IcpcLegacy,
+        PackageProfile::PolygonCompatible,
+        PackageProfile::DomjudgeZip,
+    ];
+    let mut validated_problem_types = Vec::with_capacity(problem_types.len());
+    let mut compatibility_report_count = 0_usize;
+
+    for (directory_name, problem_type) in problem_types {
+        let project_directory = root.join(directory_name);
+        let project_id = Uuid::now_v7();
+        reporch_cli::init_project_template(
+            &project_directory,
+            &format!("Reporch CLI {directory_name} qualification"),
+            project_id,
+            problem_type,
+        )?;
+        let manifest_bytes = fs::read(project_directory.join("reporch.problem.json"))?;
+        let manifest: VersionedReleaseManifest = serde_json::from_slice(&manifest_bytes)?;
+        manifest.validate_references()?;
+        let authoring = reporch_cli::local_project_v2::read_authoring_spec(&project_directory)?;
+        ensure!(
+            authoring.project_id == project_id && authoring.problem_type == problem_type,
+            "generated AuthoringSpecV2 changed the requested problem identity or type"
+        );
+        let VersionedReleaseManifest::V2(manifest) = manifest else {
+            bail!("new project template did not generate ReleaseManifestV2")
+        };
+        ensure!(
+            manifest.project_id == project_id && manifest.problem_type == problem_type,
+            "generated ReleaseManifestV2 changed the requested problem identity or type"
+        );
+        for profile in package_profiles {
+            let report = versioned_package::compatibility_v2(&manifest, profile)?;
+            ensure!(
+                report.schema == studio_core::COMPATIBILITY_REPORT_SCHEMA_V1
+                    && report.target_profile == profile,
+                "package compatibility report was not bound to the requested profile"
+            );
+            compatibility_report_count += 1;
+        }
+        validated_problem_types.push(problem_type);
+    }
+    Ok((
+        validated_problem_types,
+        package_profiles.to_vec(),
+        compatibility_report_count,
+    ))
 }
 
 async fn auth_login(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
@@ -1937,5 +2020,39 @@ mod interrupt_regression_tests {
             0
         };
         assert_eq!(exit_code, 130);
+    }
+}
+
+#[cfg(test)]
+mod qualification_regression_tests {
+    use super::*;
+
+    #[test]
+    fn installed_self_test_matrix_really_compiles_every_type_and_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (problem_types, profiles, report_count) =
+            qualification_authoring_matrix(temporary.path()).unwrap();
+        assert_eq!(
+            problem_types,
+            vec![
+                ProblemType::Standard,
+                ProblemType::Scored,
+                ProblemType::Interactive,
+                ProblemType::OutputOnly,
+                ProblemType::Library,
+                ProblemType::Grader,
+            ]
+        );
+        assert_eq!(
+            profiles,
+            vec![
+                PackageProfile::ReporchNative,
+                PackageProfile::Icpc202509,
+                PackageProfile::IcpcLegacy,
+                PackageProfile::PolygonCompatible,
+                PackageProfile::DomjudgeZip,
+            ]
+        );
+        assert_eq!(report_count, problem_types.len() * profiles.len());
     }
 }

@@ -74,6 +74,14 @@ jq -e '.data.validation.detail.status == "passed"' <<<"${submit_json}" >/dev/nul
 [[ "$(jq -er '.last_validation_run_id' "${project_dir}/.reporch/state.json")" == \
   "${validation_id}" ]]
 
+review_json="$(${cli} --format json --no-input --cwd "${project_dir}" review show \
+  --review-id "${review_id}")"
+jq -e --arg review_id "${review_id}" --arg project_id "${project_id}" '
+  .data.id == $review_id
+  and .data.project_id == $project_id
+  and .data.status == "in_review"
+' <<<"${review_json}" >/dev/null
+
 pool_json="$(${cli} --format json --no-input --cwd "${project_dir}" review request \
   --review-id "${review_id}" \
   --pool \

@@ -89,6 +89,11 @@ assert.match(
 );
 assert.match(
   release,
+  /\.compatibility_report_count == 30/,
+  "future releases must exercise all six problem types across all five package profiles"
+);
+assert.match(
+  release,
   /name: installed-auth-\$\{\{ matrix\.target \}\}/,
   "installed authentication evidence must be retained per release target"
 );
@@ -137,6 +142,11 @@ assert.match(
 assert.match(publishedE2e, /scripts\/qualify-installed-auth\.mjs/);
 assert.match(publishedE2e, /dbus-run-session/);
 assert.match(publishedE2e, /credential_store_round_trip/);
+assert.match(
+  publishedE2e,
+  /\.compatibility_report_count == 30/,
+  "published artifacts must prove the complete type/profile compatibility matrix"
+);
 assert.match(publishedE2e, /authenticated_studio_request/);
 assert.match(publishedE2e, /retention-days: 90/);
 const installedAuth = readFileSync("scripts/qualify-installed-auth.mjs", "utf8");

@@ -137,6 +137,8 @@ JSON manifest instead when reproducing an existing commit. Compatibility
 commands report unsupported or lossy features instead of silently discarding
 them. After an approved release is built, publication is always explicit:
 `reporch publication publish` asks for confirmation, or requires `--yes` in CI.
+`reporch publish` is the shorter equivalent for the linked project's latest
+ready release.
 
 Shell completion scripts are generated from the exact installed command tree:
 
