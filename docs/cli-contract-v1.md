@@ -33,13 +33,14 @@ connection metadata and never tokens.
 
 The 1.x command families are:
 
-- `migrate`, `check`, `doctor`, `completion`, `verify`, and `submit`;
+- `migrate`, `check`, `doctor`, `completion`, `verify`, `submit`, and the
+  `publish` shorthand;
 - `auth login|status|logout`;
 - `project init|create|link|list|show|status|diff|pull|push|open|validate|package`;
 - `statement`, `test`, `generator`, `validator`, `checker`, `solution`,
   `interactor`, `grader`, and `output` authoring commands;
 - `member search|list|add|update|remove`;
-- `review submit|request|inbox|status|claim|cancel|approve|request-changes`;
+- `review submit|request|inbox|show|list|status|claim|cancel|approve|request-changes`;
 - `waiver list|create|revoke`;
 - `validation list|show|watch` and `events watch`;
 - `release build|list|show|download`;

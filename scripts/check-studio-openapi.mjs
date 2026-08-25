@@ -16,6 +16,7 @@ assert.equal(actualChecksum, expectedChecksum, "Studio OpenAPI artifact checksum
 
 const document = JSON.parse(openApiBytes.toString("utf8"));
 const requiredPaths = [
+  "/api/v1/projects/{project_id}/reviews/{review_id}",
   "/api/v1/projects/{project_id}/reviews/{review_id}/pool-request",
   "/api/v1/review-pool/inbox",
   "/api/v1/review-pool/{request_id}",

@@ -321,6 +321,10 @@ jobs:
               and .generated_manifest_valid == true
               and .generated_authoring_spec_valid == true
               and .problem_type_count == 6
+              and (.problem_types | sort) == ["grader", "interactive", "library", "output_only", "scored", "standard"]
+              and .package_profile_count == 5
+              and (.package_profiles | sort) == ["domjudge_zip", "icpc202509", "icpc_legacy", "polygon_compatible", "reporch_native"]
+              and .compatibility_report_count == 30
               and .passed == true
             ' "$evidence" >/dev/null
           }
@@ -347,6 +351,10 @@ jobs:
                 and .generated_manifest_valid == true
                 and .generated_authoring_spec_valid == true
                 and .problem_type_count == 6
+                and (.problem_types | sort) == ["grader", "interactive", "library", "output_only", "scored", "standard"]
+                and .package_profile_count == 5
+                and (.package_profiles | sort) == ["domjudge_zip", "icpc202509", "icpc_legacy", "polygon_compatible", "reporch_native"]
+                and .compatibility_report_count == 30
                 and .passed == true
               ' "$evidence" >/dev/null
             done
@@ -422,7 +430,11 @@ jobs:
             & $entry.Binary qualification-self-test | Set-Content -Encoding utf8 $entry.Evidence
             if ($LASTEXITCODE -ne 0) { throw 'installed qualification self-test failed' }
             $result = Get-Content -Raw $entry.Evidence | ConvertFrom-Json
-            if (!$result.passed -or !$result.credential_store_round_trip -or !$result.generated_manifest_valid -or !$result.generated_authoring_spec_valid -or $result.version -ne $env:VERSION) {
+            $expectedProblemTypes = @('grader', 'interactive', 'library', 'output_only', 'scored', 'standard')
+            $expectedProfiles = @('domjudge_zip', 'icpc202509', 'icpc_legacy', 'polygon_compatible', 'reporch_native')
+            $actualProblemTypes = @($result.problem_types | Sort-Object)
+            $actualProfiles = @($result.package_profiles | Sort-Object)
+            if (!$result.passed -or !$result.credential_store_round_trip -or !$result.generated_manifest_valid -or !$result.generated_authoring_spec_valid -or $result.version -ne $env:VERSION -or $result.problem_type_count -ne 6 -or (Compare-Object $expectedProblemTypes $actualProblemTypes) -or $result.package_profile_count -ne 5 -or (Compare-Object $expectedProfiles $actualProfiles) -or $result.compatibility_report_count -ne 30) {
               throw 'installed qualification evidence mismatch'
             }
           }

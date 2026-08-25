@@ -355,6 +355,16 @@ pub struct ListReviewsOptions {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+pub struct ReviewShowOptions {
+    #[command(flatten)]
+    pub connection: RemoteConnectionOptions,
+    #[arg(long)]
+    pub project_id: Option<Uuid>,
+    #[arg(long)]
+    pub review_id: Uuid,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
 pub struct ApproveReviewOptions {
     #[command(flatten)]
     pub connection: RemoteConnectionOptions,
@@ -1070,6 +1080,14 @@ impl StudioApiClient {
             url.query_pairs_mut().append_pair("cursor", cursor);
         }
         self.json(self.http.get(url)).await
+    }
+
+    async fn get_review(&self, project_id: Uuid, review_id: Uuid) -> Result<ReviewResponse> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("projects/{project_id}/reviews/{review_id}"))?),
+        )
+        .await
     }
 
     async fn decide_review(
@@ -2804,6 +2822,20 @@ pub async fn list_reviews(options: &ListReviewsOptions) -> Result<()> {
         serde_json::to_string_pretty(&list_reviews_operation(options).await?)?
     );
     Ok(())
+}
+
+pub async fn show_review_operation(options: &ReviewShowOptions) -> Result<ReviewResponse> {
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let review = StudioApiClient::connect(&options.connection)
+        .await?
+        .get_review(project_id, options.review_id)
+        .await?;
+    ensure_review_scope(&review, project_id, None)?;
+    ensure!(
+        review.id == options.review_id,
+        "Studio returned a different review"
+    );
+    Ok(review)
 }
 
 pub async fn request_review_pool_operation(

@@ -99,6 +99,7 @@ fn the_documented_1_x_command_surface_cannot_be_removed_accidentally() {
             "output",
             "verify",
             "submit",
+            "publish",
             "auth",
             "project",
             "member",
@@ -140,6 +141,7 @@ fn the_documented_1_x_command_surface_cannot_be_removed_accidentally() {
                 "list",
                 "request",
                 "inbox",
+                "show",
                 "status",
                 "claim",
                 "cancel",
@@ -494,6 +496,31 @@ fn publication_is_fail_closed_without_interactive_confirmation() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error_code"], "input.invalid");
+    assert!(value["message"].as_str().unwrap().contains("--yes"));
+}
+
+#[test]
+fn publish_shorthand_is_fail_closed_without_interactive_confirmation() {
+    let project_id = uuid::Uuid::now_v7().to_string();
+    let release_id = uuid::Uuid::now_v7().to_string();
+    let output = reporch()
+        .args([
+            "--format",
+            "json",
+            "--no-input",
+            "publish",
+            "--project-id",
+            &project_id,
+            "--release-id",
+            &release_id,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["command"], "publish");
     assert_eq!(value["error_code"], "input.invalid");
     assert!(value["message"].as_str().unwrap().contains("--yes"));
 }
