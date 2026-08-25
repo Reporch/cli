@@ -58,6 +58,66 @@ create_json="$(${cli} --format json --no-input project create \
   --idempotency-key "live-create-${run_id}")"
 project_id="$(jq -er '.data.id' <<<"${create_json}")"
 
+baseline_push_json="$(${cli} --format json --no-input --cwd "${project_dir}" project push \
+  --message 'CLI baseline before Web round trip')"
+jq -e --arg project_id "${project_id}" '
+  .data.commit.project_id == $project_id
+' <<<"${baseline_push_json}" >/dev/null
+
+web_copy="$(curl --fail-with-body --silent --show-error \
+  -H "x-studio-dev-subject: ${author}" \
+  "${api_url}/api/v1/projects/${project_id}/working-copy")"
+web_revision="$(jq -er '.revision' <<<"${web_copy}")"
+web_title="Web to CLI semantic round trip"
+web_update_request="$(jq --arg title "${web_title}" \
+  '{spec: .spec} | .spec.title.ko = $title' <<<"${web_copy}")"
+web_saved="$(curl --fail-with-body --silent --show-error -X PUT \
+  -H "x-studio-dev-subject: ${author}" \
+  -H 'content-type: application/json' \
+  -H "If-Match: \"${web_revision}\"" \
+  --data-binary "${web_update_request}" \
+  "${api_url}/api/v1/projects/${project_id}/working-copy")"
+jq -e --arg title "${web_title}" --argjson previous "${web_revision}" '
+  .revision == ($previous + 1) and .spec.title.ko == $title
+' <<<"${web_saved}" >/dev/null
+
+web_commit_json="$(curl --fail-with-body --silent --show-error -X POST \
+  -H "x-studio-dev-subject: ${author}" \
+  -H 'content-type: application/json' \
+  -H "Idempotency-Key: web-roundtrip-${run_id}" \
+  --data-binary '{"message":"Web semantic round trip"}' \
+  "${api_url}/api/v1/projects/${project_id}/working-copy/commits")"
+web_commit_id="$(jq -er '.id' <<<"${web_commit_json}")"
+roundtrip_dir="${run_dir}/web-cli-roundtrip"
+pull_json="$(${cli} --format json --no-input project pull \
+  --project-id "${project_id}" \
+  --commit-id "${web_commit_id}" \
+  --directory "${roundtrip_dir}")"
+jq -e --arg project_id "${project_id}" --arg commit_id "${web_commit_id}" '
+  .data.project_id == $project_id and .data.commit_id == $commit_id
+' <<<"${pull_json}" >/dev/null
+jq -e --arg title "${web_title}" '.title.ko == $title' \
+  "${roundtrip_dir}/reporch.problem.json" >/dev/null
+
+printf '# CLI to Web semantic round trip\n' >"${roundtrip_dir}/statements/en.md"
+${cli} --format json --no-input --cwd "${roundtrip_dir}" statement add \
+  --locale en \
+  --path statements/en.md \
+  --title 'CLI English statement' >/dev/null
+cli_roundtrip_push="$(${cli} --format json --no-input --cwd "${roundtrip_dir}" project push \
+  --message 'CLI to Web semantic round trip')"
+jq -e --arg project_id "${project_id}" '
+  .data.commit.project_id == $project_id and .data.uploaded_files == 1
+' <<<"${cli_roundtrip_push}" >/dev/null
+web_after_cli="$(curl --fail-with-body --silent --show-error \
+  -H "x-studio-dev-subject: ${author}" \
+  "${api_url}/api/v1/projects/${project_id}/working-copy")"
+jq -e '
+  .spec.title.en == "CLI English statement"
+  and .spec.statements.en == "statements/en.md"
+' <<<"${web_after_cli}" >/dev/null
+project_dir="${roundtrip_dir}"
+
 check_json="$(${cli} --format json --no-input --cwd "${project_dir}" check)"
 jq -e '
   .data.valid == true
@@ -133,6 +193,7 @@ jq -n \
   '{
     status: "passed",
     manual_ids_supplied: false,
+    web_cli_semantic_round_trip: true,
     author_claim_exit_code: 5,
     project_id: $project_id,
     validation_id: $validation_id,
