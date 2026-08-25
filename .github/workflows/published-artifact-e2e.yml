@@ -91,10 +91,12 @@ jobs:
             --pattern "$archive_name" --pattern SHA256SUMS --dir "$assets"
           checksum=$(grep -F "  ./$archive_name" "$assets/SHA256SUMS")
           test -n "$checksum"
-          if command -v sha256sum >/dev/null; then
-            (cd "$assets" && printf '%s\n' "$checksum" | sha256sum --check --strict)
-          else
+          # macOS 15 ships a BSD sha256sum compatibility command that does not
+          # support GNU --check/--strict, so select the verifier by runner OS.
+          if [ "$RUNNER_OS" = macOS ]; then
             (cd "$assets" && printf '%s\n' "$checksum" | shasum -a 256 --check)
+          else
+            (cd "$assets" && printf '%s\n' "$checksum" | sha256sum --check --strict)
           fi
           archive="$assets/$archive_name"
           gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
@@ -190,9 +192,26 @@ jobs:
           if (!$auth.passed -or !$auth.device_authorization -or !$auth.os_credential_restore -or !$auth.authenticated_studio_request -or !$auth.remote_revocation -or !$auth.local_credential_removal) {
             throw 'installed OAuth evidence mismatch'
           }
-          Get-ChildItem $evidence -Filter '*.json' | Sort-Object Name | ForEach-Object {
+          $evidenceChecksums = @(Get-ChildItem $evidence -Filter '*.json' | Sort-Object Name | ForEach-Object {
             "{0}  ./{1}" -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant(), $_.Name
-          } | Set-Content -Encoding ascii (Join-Path $evidence 'SHA256SUMS')
+          })
+          $evidenceChecksumPath = Join-Path $evidence 'SHA256SUMS'
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText(
+            $evidenceChecksumPath,
+            (($evidenceChecksums -join "`n") + "`n"),
+            $utf8NoBom
+          )
+          foreach ($line in Get-Content $evidenceChecksumPath) {
+            if ($line -notmatch '^([a-f0-9]{64})  \./([^/]+\.json)$') {
+              throw 'generated evidence checksum entry is invalid'
+            }
+            $expectedHash = $Matches[1]
+            $evidenceFile = Join-Path $evidence $Matches[2]
+            if ((Get-FileHash -Algorithm SHA256 $evidenceFile).Hash.ToLowerInvariant() -ne $expectedHash) {
+              throw 'generated evidence checksum mismatch'
+            }
+          }
 
       - name: Preserve exact installed-artifact evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
