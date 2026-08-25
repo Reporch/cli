@@ -82,6 +82,16 @@ assert.match(publisher, /"--tag",\s*npmTag/);
 assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prerelease/);
 assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --latest/);
 assert.match(release, /qualify-published-artifacts:/);
+assert.match(
+  release,
+  /scripts\/qualify-installed-auth\.mjs/,
+  "every future release must exercise installed Device OAuth and the OS credential store"
+);
+assert.match(
+  release,
+  /name: installed-auth-\$\{\{ matrix\.target \}\}/,
+  "installed authentication evidence must be retained per release target"
+);
 assert.match(release, /start-beta-window:/);
 assert.match(release, /node scripts\/verify-stability-window\.mjs/);
 const stability = readFileSync(".github/workflows/rc-stability.yml", "utf8");
@@ -97,4 +107,34 @@ assert.doesNotMatch(
   /jobs:\n\s+monitor:\n(?:.|\n)*?timeout-minutes: 20\n\s+env:\n\s+GH_TOKEN:/,
   "the npm dogfood process must not inherit an issue-write token"
 );
+const publishedE2e = readFileSync(".github/workflows/published-artifact-e2e.yml", "utf8");
+for (const target of [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]) {
+  assert.match(
+    publishedE2e,
+    new RegExp(`target: ${target.replaceAll("-", "\\-")}`),
+    `published-artifact E2E must preserve ${target}`
+  );
+}
+assert.match(publishedE2e, /gh attestation verify/);
+assert.match(publishedE2e, /unset GH_TOKEN/);
+assert.match(publishedE2e, /Remove-Item Env:GH_TOKEN/);
+assert.match(publishedE2e, /scripts\/qualify-installed-auth\.mjs/);
+assert.match(publishedE2e, /dbus-run-session/);
+assert.match(publishedE2e, /credential_store_round_trip/);
+assert.match(publishedE2e, /authenticated_studio_request/);
+assert.match(publishedE2e, /retention-days: 90/);
+const installedAuth = readFileSync("scripts/qualify-installed-auth.mjs", "utf8");
+assert.match(installedAuth, /server\.listen\(0, "127\.0\.0\.1"/);
+assert.match(installedAuth, /request\.headers\.authorization !== `Bearer \$\{accessToken\}`/);
+assert.match(installedAuth, /REPORCH_STUDIO_ALLOW_INSECURE_HTTP: "true"/);
+assert.match(installedAuth, /delete environment\[key\]/);
+assert.match(installedAuth, /key\.startsWith\("REPORCH_"\)/);
+assert.match(installedAuth, /REPORCH_CONFIG_HOME: configHome/);
+assert.doesNotMatch(installedAuth, /0\.0\.0\.0/);
 console.log(`workflow contract passed for ${workflows.length} workflows`);
