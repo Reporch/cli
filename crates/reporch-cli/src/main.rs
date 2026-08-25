@@ -33,6 +33,8 @@ use studio_core::{
     PackageProfile, ProblemType, VersionedReleaseManifest, compatibility_report, validate_manifest,
 };
 use studio_native_auth::qualification_keyring_canary;
+
+const COMPLETION_GENERATOR_STACK_BYTES: usize = 8 * 1024 * 1024;
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use uuid::Uuid;
 
@@ -1362,13 +1364,21 @@ fn link_local_project(
 
 fn generate_completion(shell: CompletionShell, output: &CliOutput) -> Result<()> {
     output.ensure_human_format("completion")?;
-    let mut command = Args::command();
-    clap_complete::generate(
-        clap_complete::Shell::from(shell),
-        &mut command,
-        "reporch",
-        &mut std::io::stdout(),
-    );
+    std::thread::Builder::new()
+        .name("reporch-completion".into())
+        .stack_size(COMPLETION_GENERATOR_STACK_BYTES)
+        .spawn(move || {
+            let mut command = Args::command();
+            clap_complete::generate(
+                clap_complete::Shell::from(shell),
+                &mut command,
+                "reporch",
+                &mut std::io::stdout(),
+            );
+        })
+        .context("spawn completion generator")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("completion generator panicked"))?;
     Ok(())
 }
 
