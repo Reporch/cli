@@ -1,6 +1,6 @@
 {
   "name": "@reporch/cli",
-  "version": "1.0.0-rc.2",
+  "version": "1.0.0-rc.3",
   "description": "Official command-line client for Reporch Studio",
   "license": "Apache-2.0",
   "repository": {
@@ -27,11 +27,11 @@
     "node": ">=20"
   },
   "optionalDependencies": {
-    "@reporch/cli-darwin-arm64": "1.0.0-rc.2",
-    "@reporch/cli-darwin-x64": "1.0.0-rc.2",
-    "@reporch/cli-linux-arm64-gnu": "1.0.0-rc.2",
-    "@reporch/cli-linux-x64-gnu": "1.0.0-rc.2",
-    "@reporch/cli-win32-x64-msvc": "1.0.0-rc.2"
+    "@reporch/cli-darwin-arm64": "1.0.0-rc.3",
+    "@reporch/cli-darwin-x64": "1.0.0-rc.3",
+    "@reporch/cli-linux-arm64-gnu": "1.0.0-rc.3",
+    "@reporch/cli-linux-x64-gnu": "1.0.0-rc.3",
+    "@reporch/cli-win32-x64-msvc": "1.0.0-rc.3"
   },
   "publishConfig": {
     "access": "public",

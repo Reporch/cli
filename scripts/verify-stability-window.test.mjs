@@ -9,7 +9,7 @@ const closedAt = "2026-09-23T19:00:16Z";
 function issues(overrides = {}) {
   return [{
     number: 29,
-    title: "Reporch CLI 1.0.0-rc.2 — 30-day stability window",
+    title: "Reporch CLI 1.0.0-rc.3 — 30-day stability window",
     createdAt: openedAt,
     closedAt,
     ...overrides,
