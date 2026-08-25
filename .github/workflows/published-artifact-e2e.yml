@@ -1,0 +1,203 @@
+name: Published artifact E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published Reporch CLI version to qualify
+        required: true
+        default: 1.0.0-rc.2
+        type: string
+
+permissions:
+  contents: read
+  attestations: read
+
+concurrency:
+  group: published-artifact-e2e-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^1\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          test "$(npm view "@reporch/cli@$VERSION" version)" = "$VERSION"
+          tag="v$VERSION"
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)" = "$tag"
+          {
+            echo "version=$VERSION"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  qualify:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive_kind: tar
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_kind: tar
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive_kind: tar
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_kind: tar
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive_kind: zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+
+      - name: Qualify the published Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/release-assets"
+          install_dir="$RUNNER_TEMP/native-install"
+          evidence="$RUNNER_TEMP/published-artifact-evidence"
+          project="$RUNNER_TEMP/authoring-project"
+          archive_name="reporch-v${VERSION}-${TARGET}.tar.gz"
+          mkdir "$assets" "$install_dir" "$evidence"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$archive_name" --pattern SHA256SUMS --dir "$assets"
+          checksum=$(grep -F "  ./$archive_name" "$assets/SHA256SUMS")
+          test -n "$checksum"
+          if command -v sha256sum >/dev/null; then
+            (cd "$assets" && printf '%s\n' "$checksum" | sha256sum --check --strict)
+          else
+            (cd "$assets" && printf '%s\n' "$checksum" | shasum -a 256 --check)
+          fi
+          archive="$assets/$archive_name"
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          unset GH_TOKEN
+          tar -xzf "$archive" -C "$install_dir"
+          native="$install_dir/reporch-v${VERSION}-${TARGET}/reporch"
+          test -x "$native"
+          test "$("$native" --version)" = "reporch $VERSION"
+
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y dbus-x11 gnome-keyring
+            export native evidence
+            # The single-quoted child script intentionally receives exported variables.
+            # shellcheck disable=SC2016
+            dbus-run-session -- bash -euo pipefail -c '
+              eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+              "$native" qualification-self-test > "$evidence/self-test.json"
+              node "$GITHUB_WORKSPACE/scripts/qualify-installed-auth.mjs" \
+                --binary "$native" --evidence "$evidence/auth-e2e.json"
+            '
+          else
+            "$native" qualification-self-test > "$evidence/self-test.json"
+            node "$GITHUB_WORKSPACE/scripts/qualify-installed-auth.mjs" \
+              --binary "$native" --evidence "$evidence/auth-e2e.json"
+          fi
+          "$native" --format json project init --title "Published artifact E2E" \
+            --directory "$project" > "$evidence/project-init.json"
+          "$native" --cwd "$project" --format json check > "$evidence/project-check.json"
+          jq -e --arg version "$VERSION" '
+            .schema == "reporch.cli-installed-self-test.v1"
+            and .version == $version
+            and .credential_store_round_trip == true
+            and .problem_type_count == 6
+            and .passed == true
+          ' "$evidence/self-test.json" >/dev/null
+          jq -e '
+            .schema == "reporch.cli-installed-auth-e2e.v1"
+            and .device_authorization == true
+            and .os_credential_restore == true
+            and .authenticated_studio_request == true
+            and .remote_revocation == true
+            and .local_credential_removal == true
+            and .passed == true
+          ' "$evidence/auth-e2e.json" >/dev/null
+          jq -e '.schema == "reporch.cli-result.v1" and .command == "project init"' \
+            "$evidence/project-init.json" >/dev/null
+          jq -e '.schema == "reporch.cli-result.v1" and .command == "check" and .data.valid == true' \
+            "$evidence/project-check.json" >/dev/null
+          (cd "$evidence" && if command -v sha256sum >/dev/null; then sha256sum ./*.json; else shasum -a 256 ./*.json; fi) \
+            > "$evidence/SHA256SUMS"
+
+      - name: Qualify the published Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = Join-Path $env:RUNNER_TEMP 'release-assets'
+          $install = Join-Path $env:RUNNER_TEMP 'native-install'
+          $evidence = Join-Path $env:RUNNER_TEMP 'published-artifact-evidence'
+          $project = Join-Path $env:RUNNER_TEMP 'authoring-project'
+          $archiveName = "reporch-v$env:VERSION-$env:TARGET.zip"
+          New-Item -ItemType Directory $assets, $install, $evidence | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+            --pattern $archiveName --pattern SHA256SUMS --dir $assets
+          $checksumLine = Get-Content (Join-Path $assets 'SHA256SUMS') |
+            Where-Object { $_ -match [regex]::Escape("  ./$archiveName") }
+          if (@($checksumLine).Count -ne 1 -or $checksumLine -notmatch '^([a-f0-9]{64})  \./(.+)$') {
+            throw 'published checksum entry is missing or ambiguous'
+          }
+          $archive = Join-Path $assets $archiveName
+          if ((Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant() -ne $Matches[1]) {
+            throw 'published archive checksum mismatch'
+          }
+          gh attestation verify $archive --repo $env:GITHUB_REPOSITORY
+          Remove-Item Env:GH_TOKEN
+          Expand-Archive -LiteralPath $archive -DestinationPath $install
+          $native = Join-Path $install "reporch-v$env:VERSION-$env:TARGET/reporch.exe"
+          if ((& $native --version) -ne "reporch $env:VERSION") { throw 'native version mismatch' }
+          & $native qualification-self-test |
+            Set-Content -Encoding utf8 (Join-Path $evidence 'self-test.json')
+          if ($LASTEXITCODE -ne 0) { throw 'installed self-test failed' }
+          node "$env:GITHUB_WORKSPACE/scripts/qualify-installed-auth.mjs" `
+            --binary $native --evidence (Join-Path $evidence 'auth-e2e.json')
+          if ($LASTEXITCODE -ne 0) { throw 'installed OAuth E2E failed' }
+          & $native --format json project init --title 'Published artifact E2E' --directory $project |
+            Set-Content -Encoding utf8 (Join-Path $evidence 'project-init.json')
+          if ($LASTEXITCODE -ne 0) { throw 'project initialization failed' }
+          & $native --cwd $project --format json check |
+            Set-Content -Encoding utf8 (Join-Path $evidence 'project-check.json')
+          if ($LASTEXITCODE -ne 0) { throw 'project check failed' }
+          $auth = Get-Content -Raw (Join-Path $evidence 'auth-e2e.json') | ConvertFrom-Json
+          if (!$auth.passed -or !$auth.device_authorization -or !$auth.os_credential_restore -or !$auth.authenticated_studio_request -or !$auth.remote_revocation -or !$auth.local_credential_removal) {
+            throw 'installed OAuth evidence mismatch'
+          }
+          Get-ChildItem $evidence -Filter '*.json' | Sort-Object Name | ForEach-Object {
+            "{0}  ./{1}" -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content -Encoding ascii (Join-Path $evidence 'SHA256SUMS')
+
+      - name: Preserve exact installed-artifact evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: published-e2e-${{ matrix.target }}
+          path: ${{ runner.temp }}/published-artifact-evidence
+          if-no-files-found: error
+          retention-days: 90

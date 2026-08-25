@@ -267,6 +267,7 @@ jobs:
       ARCHIVE_KIND: ${{ matrix.archive_kind }}
       NPM_PACKAGE: ${{ matrix.npm_package }}
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24.2.0"
@@ -291,6 +292,7 @@ jobs:
           archive="$assets/reporch-v${VERSION}-${TARGET}.tar.gz"
           test -f "$archive"
           gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          unset GH_TOKEN
           tar -xzf "$archive" -C "$install_dir"
           native="$install_dir/reporch-v${VERSION}-${TARGET}/reporch"
           test -x "$native"
@@ -331,6 +333,9 @@ jobs:
               "$native" qualification-self-test > "$RUNNER_TEMP/native-self-test.json"
               "$npm_binary" qualification-self-test > "$RUNNER_TEMP/npm-self-test.json"
               "$native" --format json auth status > "$RUNNER_TEMP/auth-status.json"
+              node "$GITHUB_WORKSPACE/scripts/qualify-installed-auth.mjs" \
+                --binary "$native" \
+                --evidence "$RUNNER_TEMP/installed-auth-e2e.json"
             '
             for evidence in "$RUNNER_TEMP/native-self-test.json" "$RUNNER_TEMP/npm-self-test.json"; do
               jq -e --arg version "$VERSION" '
@@ -347,7 +352,20 @@ jobs:
             run_flow "$native" "$RUNNER_TEMP/native-self-test.json"
             run_flow "$npm_binary" "$RUNNER_TEMP/npm-self-test.json"
             "$native" --format json auth status > "$RUNNER_TEMP/auth-status.json"
+            node "$GITHUB_WORKSPACE/scripts/qualify-installed-auth.mjs" \
+              --binary "$native" \
+              --evidence "$RUNNER_TEMP/installed-auth-e2e.json"
           fi
+
+          jq -e '
+            .schema == "reporch.cli-installed-auth-e2e.v1"
+            and .device_authorization == true
+            and .os_credential_restore == true
+            and .authenticated_studio_request == true
+            and .remote_revocation == true
+            and .local_credential_removal == true
+            and .passed == true
+          ' "$RUNNER_TEMP/installed-auth-e2e.json" >/dev/null
 
           "$native" --format json project init --title "RC qualification" --directory "$project" \
             > "$RUNNER_TEMP/project-init.json"
@@ -380,6 +398,7 @@ jobs:
           $archive = Join-Path $assets "reporch-v$env:VERSION-$env:TARGET.zip"
           if (!(Test-Path -LiteralPath $archive -PathType Leaf)) { throw 'native archive is missing' }
           gh attestation verify $archive --repo $env:GITHUB_REPOSITORY
+          Remove-Item Env:GH_TOKEN
           Expand-Archive -LiteralPath $archive -DestinationPath $install
           $native = Join-Path $install "reporch-v$env:VERSION-$env:TARGET/reporch.exe"
           if ((& $native --version) -ne "reporch $env:VERSION") { throw 'native version mismatch' }
@@ -405,6 +424,14 @@ jobs:
               throw 'installed qualification evidence mismatch'
             }
           }
+          node "$env:GITHUB_WORKSPACE/scripts/qualify-installed-auth.mjs" `
+            --binary $native `
+            --evidence (Join-Path $env:RUNNER_TEMP 'installed-auth-e2e.json')
+          if ($LASTEXITCODE -ne 0) { throw 'installed OAuth qualification failed' }
+          $authEvidence = Get-Content -Raw (Join-Path $env:RUNNER_TEMP 'installed-auth-e2e.json') | ConvertFrom-Json
+          if (!$authEvidence.passed -or !$authEvidence.device_authorization -or !$authEvidence.os_credential_restore -or !$authEvidence.authenticated_studio_request -or !$authEvidence.remote_revocation -or !$authEvidence.local_credential_removal) {
+            throw 'installed OAuth qualification evidence mismatch'
+          }
           & $native --format json project init --title 'RC qualification' --directory $project |
             Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'project-init.json')
           if ($LASTEXITCODE -ne 0) { throw 'project initialization failed' }
@@ -418,6 +445,14 @@ jobs:
           if ($status.schema -ne 'reporch.cli-result.v1' -or $status.data.authenticated) {
             throw 'auth status contract mismatch'
           }
+
+      - name: Preserve installed authentication evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installed-auth-${{ matrix.target }}
+          path: ${{ runner.temp }}/installed-auth-e2e.json
+          if-no-files-found: error
+          retention-days: 90
 
   start-beta-window:
     needs: [verify-source, qualify-published-artifacts]
