@@ -231,7 +231,7 @@ async fn resolve_runtime(runtime: OciRuntime) -> Result<String> {
         }
     }
     .context(
-        "no requested OCI runtime is available; install and start rootless Podman (recommended) or rootless Docker, or run `reporch verify` for official Studio verification",
+        "no requested OCI runtime is available; install and start rootless Podman (recommended; on macOS run `podman machine init` then `podman machine start`) or rootless Docker. Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification",
     )
 }
 
@@ -270,7 +270,7 @@ async fn require_rootless(runtime: &str) -> Result<()> {
     };
     if !output.status.success() {
         bail!(
-            "OCI runtime security inspection failed; start the rootless {runtime} daemon and retry, or run `reporch verify` for official Studio verification"
+            "OCI runtime security inspection failed; start the rootless {runtime} daemon and retry. Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification"
         );
     }
     let rootless = if runtime == "podman" {
@@ -287,7 +287,7 @@ async fn require_rootless(runtime: &str) -> Result<()> {
     };
     if !rootless {
         bail!(
-            "local sandbox requires a rootless Podman or Docker daemon; configure rootless mode and restart {runtime}, or run `reporch verify` for official Studio verification"
+            "local sandbox requires a rootless Podman or Docker daemon; configure rootless mode and restart {runtime} (on macOS, rootless Podman is the recommended local path). Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification"
         );
     }
     Ok(())

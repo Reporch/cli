@@ -361,10 +361,12 @@ enum GraderCommand {
 
 #[derive(Debug, Clone, ClapArgs)]
 struct RuntimeProgramRunOptions {
-    #[arg(long)]
+    /// Solution name, UUID, or declared source path (for example `accepted` or `solutions/accepted.cpp`).
+    #[arg(long, value_name = "NAME|UUID|PATH")]
     solution: String,
-    #[arg(long)]
-    test: Uuid,
+    /// Test name, UUID, or declared input path (for example `sample-1` or `tests/1.in`).
+    #[arg(long, value_name = "NAME|UUID|PATH")]
+    test: String,
     #[arg(long)]
     output: Option<PathBuf>,
     #[command(flatten)]
@@ -471,6 +473,7 @@ struct RuntimeOptions {
     /// Signed toolchain catalog ID. Inferred from the configured language when omitted.
     #[arg(long)]
     toolchain: Option<String>,
+    /// Secure OCI runtime. Local author-code execution requires rootless Podman or Docker and never falls back to the host.
     #[arg(long, value_enum, default_value_t = RuntimeKind::Auto)]
     runtime: RuntimeKind,
     #[arg(long, default_value_t = 30)]
@@ -1642,7 +1645,7 @@ pub fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
             output.emit(
                 "solution matrix",
                 &spec.solutions,
-                &format!("{} solution expectation(s)", spec.solutions.len()),
+                &legacy_solution_matrix_human(&spec.solutions),
             )
         }
         SolutionCommand::Add(options) => {
@@ -1797,17 +1800,8 @@ async fn run_interactor(
         .interactor_language
         .as_deref()
         .context("configured interactor has no language")?;
-    let solution = spec
-        .solutions
-        .iter()
-        .find(|solution| solution.name == options.solution)
-        .with_context(|| format!("solution was not found: {}", options.solution))?;
-    let test = spec
-        .judging
-        .tests
-        .iter()
-        .find(|test| test.id == options.test)
-        .with_context(|| format!("test case was not found: {}", options.test))?;
+    let solution = find_legacy_solution(&spec, &options.solution)?;
+    let test = find_legacy_test(&spec, &options.test)?;
     let run_options = options.runtime.into_run_options();
     let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
         run_options.toolchain_id.as_deref(),
@@ -1891,22 +1885,13 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         .grader_language
         .as_deref()
         .context("configured grader has no language")?;
-    let solution = spec
-        .solutions
-        .iter()
-        .find(|solution| solution.name == options.solution)
-        .with_context(|| format!("solution was not found: {}", options.solution))?;
+    let solution = find_legacy_solution(&spec, &options.solution)?;
     ensure!(
         reporch_cli::toolchain::resolve_for_language(None, grader_language)?.language
             == reporch_cli::toolchain::resolve_for_language(None, &solution.language)?.language,
         "local grader linking requires the solution and grader to use the same C or C++ toolchain"
     );
-    let test = spec
-        .judging
-        .tests
-        .iter()
-        .find(|test| test.id == options.test)
-        .with_context(|| format!("test case was not found: {}", options.test))?;
+    let test = find_legacy_test(&spec, &options.test)?;
     let answer_path = test
         .answer_file
         .as_deref()
@@ -2093,9 +2078,16 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
             )
         }
         OutputCommand::Remove { name } => {
+            let mut pruned = 0_usize;
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
+                    let removed_paths = spec
+                        .output_submissions
+                        .iter()
+                        .filter(|submission| submission.name == name)
+                        .flat_map(|submission| submission.outputs.values().cloned())
+                        .collect::<Vec<_>>();
                     let before = spec.output_submissions.len();
                     spec.output_submissions
                         .retain(|submission| submission.name != name);
@@ -2103,13 +2095,16 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                         before != spec.output_submissions.len(),
                         "output submission was not found"
                     );
+                    pruned = prune_legacy_output_file_declarations(spec, &removed_paths);
                     Ok(())
                 },
             )?;
             output.emit(
                 "output remove",
                 &spec.output_submissions,
-                &format!("Removed output submission {name}"),
+                &format!(
+                    "Removed output submission {name}. Pruned {pruned} unused file declaration(s); files remain on disk."
+                ),
             )
         }
         OutputCommand::Test { name, runtime } => {
@@ -2321,6 +2316,94 @@ fn emit_unit_report(
         bail!("validation did not pass for {failed}");
     }
     output.emit(command, &report, "All configured unit cases passed")
+}
+
+fn find_legacy_solution<'a>(
+    spec: &'a reporch_format::AuthoringSpecV1,
+    selector: &str,
+) -> Result<&'a SolutionSpec> {
+    let matches = spec
+        .solutions
+        .iter()
+        .filter(|solution| solution.name == selector || solution.source_path == selector)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() <= 1,
+        "ambiguous solution selector {selector:?}; use a unique solution name from `reporch solution list`"
+    );
+    matches.into_iter().next().with_context(|| {
+            format!(
+                "solution was not found: {selector}; use a solution name or source path from `reporch solution list`"
+            )
+        })
+}
+
+fn find_legacy_test<'a>(
+    spec: &'a reporch_format::AuthoringSpecV1,
+    selector: &str,
+) -> Result<&'a TestCaseSpec> {
+    let parsed = Uuid::parse_str(selector).ok();
+    let matches = spec
+        .judging
+        .tests
+        .iter()
+        .filter(|test| {
+            parsed == Some(test.id) || test.name == selector || test.input_file == selector
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() <= 1,
+        "ambiguous test selector {selector:?}; use the exact UUID from `reporch test case list`"
+    );
+    matches.into_iter().next().with_context(|| {
+            format!(
+                "test case was not found: {selector}; use a test name, UUID, or input path from `reporch test case list`"
+            )
+        })
+}
+
+fn legacy_solution_matrix_human(solutions: &[SolutionSpec]) -> String {
+    let mut lines = vec![format!("{} solution expectation(s):", solutions.len())];
+    lines.extend(solutions.iter().map(|solution| {
+        let score = solution
+            .expected_score
+            .as_ref()
+            .map(|range| format!(" · score {}..{}", range.minimum, range.maximum))
+            .unwrap_or_default();
+        format!(
+            "- {} · {}{} · {}",
+            human_safe(&solution.name),
+            verdict_name(solution.expected_verdict),
+            score,
+            human_safe(&solution.source_path)
+        )
+    }));
+    lines.push("This lists expectations only; run `reporch verify` for execution evidence.".into());
+    lines.join("\n")
+}
+
+fn prune_legacy_output_file_declarations(
+    spec: &mut reporch_format::AuthoringSpecV1,
+    removed_paths: &[String],
+) -> usize {
+    let mut pruned = 0;
+    for path in removed_paths {
+        if spec
+            .output_submissions
+            .iter()
+            .any(|submission| submission.outputs.values().any(|value| value == path))
+        {
+            continue;
+        }
+        let mut candidate = spec.clone();
+        let before = candidate.files.len();
+        candidate.files.retain(|file| file.path != *path);
+        if before != candidate.files.len() && candidate.validate_references().is_ok() {
+            *spec = candidate;
+            pruned += 1;
+        }
+    }
+    pruned
 }
 
 fn selected_by_name<'a, T, F>(items: &'a [T], name: Option<&str>, key: F) -> Result<Vec<&'a T>>
@@ -2587,10 +2670,23 @@ fn validate_group_id(id: &str) -> Result<()> {
 fn normalize_name(value: &str) -> Result<String> {
     let value = value.trim();
     ensure!(
-        !value.is_empty() && value.chars().count() <= 255,
-        "name must contain 1-255 characters"
+        !value.is_empty() && value.chars().count() <= 255 && !value.chars().any(char::is_control),
+        "name must contain 1-255 characters and no control characters"
     );
     Ok(value.to_owned())
+}
+
+fn human_safe(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| {
+            if character.is_control() {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
 }
 
 fn relative_string(path: &Path) -> Result<String> {

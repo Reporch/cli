@@ -23,6 +23,8 @@ anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
+cap-std = "4.0.3"
+cap-primitives = "4.0.3"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
@@ -36,6 +38,7 @@ proptest = "1"
 quick-xml = { version = "0.41", features = ["serialize"] }
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls", "stream"] }
+rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
