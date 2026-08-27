@@ -698,6 +698,8 @@ fn sync_parent(path: &Path) -> Result<()> {
         let parent = path.parent().context("path has no parent directory")?;
         File::open(parent)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

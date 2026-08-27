@@ -1540,7 +1540,7 @@ fn build_init_journal(
             ));
             Ok(InitTransactionFile {
                 path: template.path.into(),
-                temporary_path: temporary_path.to_string_lossy().into_owned(),
+                temporary_path: portable_relative_path(&temporary_path)?,
                 sha256: studio_core::Sha256Digest::from_bytes(&template.content),
                 size_bytes: template.content.len() as u64,
             })
@@ -1552,11 +1552,31 @@ fn build_init_journal(
         files: transaction_files,
         directories: directories
             .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect(),
+            .map(|path| portable_relative_path(&path))
+            .collect::<Result<Vec<_>>>()?,
     };
     validate_init_journal(&journal)?;
     Ok(journal)
+}
+
+fn portable_relative_path(path: &Path) -> Result<String> {
+    let mut output = String::new();
+    for component in path.components() {
+        let std::path::Component::Normal(value) = component else {
+            bail!("project initialization path must be relative and normalized");
+        };
+        let value = value
+            .to_str()
+            .context("project initialization path must be valid UTF-8")?;
+        if !output.is_empty() {
+            output.push('/');
+        }
+        output.push_str(value);
+    }
+    if output.is_empty() {
+        bail!("project initialization path cannot be empty");
+    }
+    Ok(output)
 }
 
 fn write_init_journal(root: &cap_std::fs::Dir, journal: &InitTransactionJournal) -> Result<()> {
@@ -1784,6 +1804,33 @@ mod tests {
                 .join(&journal.files[0].temporary_path)
                 .exists()
         );
+    }
+
+    #[test]
+    fn transaction_journal_paths_are_portable_forward_slash_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let files = vec![TemplateFile::text(
+            "grader/private/assets/grader.cpp",
+            "int main() {}",
+            "text/x-c++src",
+        )];
+        let root =
+            cap_std::fs::Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+        let journal = build_init_journal(&root, &files).unwrap();
+
+        assert_eq!(journal.files[0].path, "grader/private/assets/grader.cpp");
+        assert!(
+            journal.files[0]
+                .temporary_path
+                .starts_with("grader/private/assets/.reporch-init-")
+        );
+        assert!(
+            journal
+                .files
+                .iter()
+                .all(|entry| !entry.temporary_path.contains('\\'))
+        );
+        assert!(journal.directories.iter().all(|path| !path.contains('\\')));
     }
 
     #[test]
