@@ -115,11 +115,12 @@ reporch project init \
 The target directory is empty by default. To initialize inside an existing
 checkout, opt in with `--allow-non-empty`; Reporch checks every generated path
 before writing, refuses collisions or stale `.reporch/state.json`, and writes
-through a capability-scoped transaction that rolls back newly created paths on
-failure. A durable journal also completes or safely rolls back an initialization
-interrupted by a process crash or power loss on the next `project init`.
-Unrelated files and pre-existing directories are preserved, and a generated
-file changed after an interruption is never deleted automatically.
+through a capability-scoped transaction. Before commit begins, a failure removes
+only Reporch's reserved staging paths. After any generated file is published, a
+durable journal preserves the transaction so the next identical `project init`
+can validate and finish it. Unrelated files and pre-existing directories are
+preserved, and a generated file changed after an interruption is never deleted
+automatically.
 
 The available problem types are `standard`, `scored`, `interactive`,
 `output-only`, `library`, and `grader`. Authoring commands cover statements,
@@ -155,8 +156,7 @@ meaning and file hashes. The backup is never overwritten.
 ## Package compatibility
 
 ```bash
-reporch manifest compatibility reporch.yaml \
-  --profile icpc202509 --strict
+reporch manifest compatibility --profile icpc202509 --strict
 
 reporch package export reporch.yaml problem.zip \
   --profile domjudge-zip
@@ -315,6 +315,13 @@ npm test
 `npm test` also verifies the checksum and required review-pool surface of the
 pinned Studio OpenAPI artifact. Contract drift therefore fails before a CLI
 release can be packaged.
+
+## Further documentation
+
+- [CLI 1.x automation contract](docs/cli-contract-v1.md)
+- [CLI 1.0 beta and stability gate](docs/1.0-beta.md)
+- [Toolchain index signing and key rotation](docs/toolchain-index.md)
+- [Security policy and private reporting](SECURITY.md)
 
 ## Release integrity
 
