@@ -165,6 +165,19 @@ fn classify_error(error: &Error) -> ClassifiedError {
             trace_id: remote.trace_id,
         };
     }
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<studio_native_auth::NativeAuthError>(),
+            Some(studio_native_auth::NativeAuthError::CredentialStoreTimeout)
+        )
+    }) {
+        return ClassifiedError {
+            exit_code: ExitCode::InfrastructureFailure,
+            error_code: "infrastructure.unavailable".into(),
+            retryable: true,
+            trace_id: None,
+        };
+    }
     let message = format!("{error:#}").to_ascii_lowercase();
     if message.contains("cancelled") || message.contains("canceled") {
         return ClassifiedError {
@@ -297,6 +310,16 @@ mod tests {
     fn retryable_infrastructure_errors_are_classified_separately() {
         let classified = classify_error(&anyhow!("Studio transport timeout"));
         assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
+        assert!(classified.retryable);
+    }
+
+    #[test]
+    fn credential_store_timeout_is_retryable_infrastructure_not_missing_auth() {
+        let error = anyhow::Error::new(studio_native_auth::NativeAuthError::CredentialStoreTimeout)
+            .context("read the OS credential store");
+        let classified = classify_error(&error);
+        assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
+        assert_eq!(classified.error_code, "infrastructure.unavailable");
         assert!(classified.retryable);
     }
 

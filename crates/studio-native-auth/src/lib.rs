@@ -28,6 +28,7 @@ const CALLBACK_TIMEOUT_SECONDS: u64 = 5 * 60;
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const TOKEN_SCHEMA_V1: &str = "reporch.native-token.v1";
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
+const CREDENTIAL_STORE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
 #[derive(Clone)]
 pub struct NativeAuthConfig {
@@ -580,6 +581,45 @@ pub trait TokenStore: Send + Sync {
 #[derive(Default)]
 pub struct KeyringTokenStore;
 
+async fn run_keyring_operation<T, F>(operation: F) -> Result<T, NativeAuthError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, KeyringError> + Send + 'static,
+{
+    run_keyring_operation_with_timeout(CREDENTIAL_STORE_TIMEOUT, operation).await
+}
+
+async fn run_keyring_operation_with_timeout<T, F>(
+    timeout: StdDuration,
+    operation: F,
+) -> Result<T, NativeAuthError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, KeyringError> + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    // Keep OS credential calls outside Tokio's blocking pool. Some platform keyrings can wait
+    // indefinitely for user approval, and a timed-out `spawn_blocking` task would still delay
+    // runtime shutdown. Dropping this handle deliberately detaches the operation so a CLI process
+    // can fail closed at the deadline; the operating system terminates it when the process exits.
+    let _worker = std::thread::Builder::new()
+        .name("reporch-credential-store".into())
+        .spawn(move || {
+            let _ = sender.send(operation());
+        })
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(result)) => {
+            result.map_err(|error| NativeAuthError::CredentialStore(error.to_string()))
+        }
+        Ok(Err(_)) => Err(NativeAuthError::CredentialStore(
+            "credential-store worker stopped unexpectedly".into(),
+        )),
+        Err(_) => Err(NativeAuthError::CredentialStoreTimeout),
+    }
+}
+
 /// Exercise the same OS credential-store adapter used for OAuth refresh tokens.
 /// The random canary is deleted before this function returns and is never logged.
 pub async fn qualification_keyring_canary() -> Result<(), NativeAuthError> {
@@ -627,7 +667,7 @@ pub async fn qualification_keyring_canary() -> Result<(), NativeAuthError> {
 impl TokenStore for KeyringTokenStore {
     async fn load(&self, key: &CredentialKey) -> Result<Option<StoredTokenSet>, NativeAuthError> {
         let key = key.clone();
-        let value = tokio::task::spawn_blocking(move || {
+        let value = run_keyring_operation(move || {
             let entry = Entry::new(&key.service, &key.account)?;
             match entry.get_password() {
                 Ok(value) => Ok(Some(value)),
@@ -635,9 +675,7 @@ impl TokenStore for KeyringTokenStore {
                 Err(error) => Err(error),
             }
         })
-        .await
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
-        .map_err(|error: KeyringError| NativeAuthError::CredentialStore(error.to_string()))?;
+        .await?;
         value
             .map(|value| {
                 serde_json::from_str(&value).map_err(|_| NativeAuthError::CredentialStoreCorrupt)
@@ -653,17 +691,13 @@ impl TokenStore for KeyringTokenStore {
         let key = key.clone();
         let value = serde_json::to_string(token)
             .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
-        tokio::task::spawn_blocking(move || {
-            Entry::new(&key.service, &key.account)?.set_password(&value)
-        })
-        .await
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))
+        run_keyring_operation(move || Entry::new(&key.service, &key.account)?.set_password(&value))
+            .await
     }
 
     async fn delete(&self, key: &CredentialKey) -> Result<(), NativeAuthError> {
         let key = key.clone();
-        tokio::task::spawn_blocking(move || {
+        run_keyring_operation(move || {
             let entry = Entry::new(&key.service, &key.account)?;
             match entry.delete_credential() {
                 Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
@@ -671,8 +705,6 @@ impl TokenStore for KeyringTokenStore {
             }
         })
         .await
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
-        .map_err(|error: KeyringError| NativeAuthError::CredentialStore(error.to_string()))
     }
 }
 
@@ -772,6 +804,8 @@ pub enum NativeAuthError {
     Browser(String),
     #[error("OS credential store failed: {0}")]
     CredentialStore(String),
+    #[error("OS credential store timed out; approve any system credential prompt and retry")]
+    CredentialStoreTimeout,
     #[error("OS credential store contains an invalid Studio token")]
     CredentialStoreCorrupt,
 }
@@ -1418,5 +1452,24 @@ mod tests {
             Err(NativeAuthError::InvalidProviderResponse)
         ));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn credential_store_operation_times_out_without_blocking_the_cli() {
+        let started = std::time::Instant::now();
+        let result = run_keyring_operation_with_timeout(
+            StdDuration::from_millis(10),
+            || -> Result<(), KeyringError> {
+                std::thread::sleep(StdDuration::from_millis(250));
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(NativeAuthError::CredentialStoreTimeout)
+        ));
+        assert!(started.elapsed() < StdDuration::from_millis(150));
     }
 }
