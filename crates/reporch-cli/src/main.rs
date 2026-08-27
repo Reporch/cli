@@ -337,6 +337,7 @@ enum PackageCommand {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
+    /// Create a safe starter project without overwriting existing files.
     Init {
         #[arg(long)]
         title: String,
@@ -685,7 +686,10 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 output.emit(
                     "project init",
                     &status,
-                    &format!("Initialized {}", status.root.display()),
+                    &format!(
+                        "Initialized {}\nStarter includes: a statement, sample tests, and problem-type examples (accepted/reference and known-wrong when applicable).\nEdit the existing starter files before adding replacements.\nNext: run `reporch check`, then `reporch verify` for official execution evidence.",
+                        status.root.display()
+                    ),
                 )
             }
             ProjectCommand::Link {
@@ -1299,7 +1303,16 @@ fn check_project(output: &CliOutput) -> Result<()> {
         let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
         let manifest =
             reporch_cli::local_project_v2::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+        validate_v2_static_semantics(&manifest)?;
         let digest = manifest.digest()?;
+        let validator_count = usize::from(manifest.testing.validators.primary.is_some())
+            + manifest.testing.validators.extra.len();
+        let checker_count = usize::from(matches!(
+            manifest.testing.checker.checker,
+            studio_core::CheckerSpec::Custom { .. }
+        ));
+        let interactor_count = usize::from(manifest.execution.interactive.is_some());
+        let harness_count = usize::from(manifest.execution.harness.is_some());
         let data = serde_json::json!({
             "schema": "reporch.check-result.v1",
             "authoring_schema": spec.schema,
@@ -1309,16 +1322,41 @@ fn check_project(output: &CliOutput) -> Result<()> {
             "file_count": manifest.files.len(),
             "digest": digest,
             "valid": true,
+            "validation_scope": "static",
+            "execution_performed": false,
+            "unexecuted": {
+                "solutions": manifest.testing.solutions.len(),
+                "validators": validator_count,
+                "generators": manifest.testing.generators.len(),
+                "custom_checkers": checker_count,
+                "interactors": interactor_count,
+                "grader_or_library_harnesses": harness_count,
+            },
+            "next_step": "reporch verify",
         });
         return output.emit(
             "check",
             &data,
-            &format!("Valid · {} file(s) · {digest}", manifest.files.len()),
+            &format!(
+                "Static check passed · {} file(s) · {digest}\nNot executed: {} solution(s), {validator_count} validator(s), {} generator(s), {checker_count} custom checker(s), {interactor_count} interactor(s), {harness_count} grader/library harness(es).\nNext: run `reporch verify` for official Studio execution evidence. Local component checks are available through `reporch validator run`, `reporch checker run`, and `reporch generator run`.",
+                manifest.files.len(),
+                manifest.testing.solutions.len(),
+                manifest.testing.generators.len(),
+            ),
         );
     }
     let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
     let manifest = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
     let digest = manifest.digest()?;
+    let validator_count = usize::from(manifest.judging.validator_path.is_some())
+        + manifest.judging.extra_validator_paths.len()
+        + manifest.judging.extra_validators.len();
+    let checker_count = usize::from(matches!(
+        manifest.judging.checker,
+        studio_core::CheckerSpec::Custom { .. }
+    ));
+    let interactor_count = usize::from(manifest.judging.interactor_path.is_some());
+    let grader_count = usize::from(manifest.judging.grader_path.is_some());
     let data = serde_json::json!({
         "schema": "reporch.check-result.v1",
         "project_id": spec.project_id,
@@ -1326,12 +1364,105 @@ fn check_project(output: &CliOutput) -> Result<()> {
         "file_count": manifest.files.len(),
         "digest": digest,
         "valid": true,
+        "validation_scope": "static",
+        "execution_performed": false,
+        "unexecuted": {
+            "solutions": manifest.solutions.len(),
+            "validators": validator_count,
+            "generators": manifest.judging.generators.len(),
+            "custom_checkers": checker_count,
+            "interactors": interactor_count,
+            "graders": grader_count,
+        },
+        "next_step": "reporch verify",
     });
     output.emit(
         "check",
         &data,
-        &format!("Valid · {} file(s) · {digest}", manifest.files.len()),
+        &format!(
+            "Static check passed · {} file(s) · {digest}\nNot executed: {} solution(s), {validator_count} validator(s), {} generator(s), {checker_count} custom checker(s), {interactor_count} interactor(s), {grader_count} grader(s).\nNext: run `reporch verify` for official Studio execution evidence. Local component checks are available through `reporch validator run`, `reporch checker run`, and `reporch generator run`.",
+            manifest.files.len(),
+            manifest.solutions.len(),
+            manifest.judging.generators.len(),
+        ),
     )
+}
+
+fn validate_v2_static_semantics(manifest: &studio_core::ReleaseManifestV2) -> Result<()> {
+    if manifest.problem_type == ProblemType::Scored {
+        for group in &manifest.testing.groups {
+            ensure!(
+                group.points.is_finite() && (0.0..=100.0).contains(&group.points),
+                "scored group `{}` points must be a finite value from 0 to 100, got {}",
+                group.name,
+                group.points
+            );
+        }
+        let total = manifest
+            .testing
+            .groups
+            .iter()
+            .map(|group| group.points)
+            .sum::<f64>();
+        ensure!(
+            (total - 100.0).abs() <= 1e-9,
+            "scored problem group points must total 100, got {total}; inspect with `reporch test group list` and remove or update starter groups"
+        );
+
+        let assigned_groups = manifest
+            .testing
+            .tests
+            .iter()
+            .flat_map(|test| test.group_ids.iter().copied())
+            .chain(
+                manifest
+                    .testing
+                    .generators
+                    .iter()
+                    .flat_map(|generator| generator.recipes.iter())
+                    .flat_map(|recipe| recipe.group_ids.iter().copied()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        for group in &manifest.testing.groups {
+            ensure!(
+                assigned_groups.contains(&group.id),
+                "scored group `{}` has no manual tests or generator recipes; assign one before verification",
+                group.name
+            );
+        }
+    }
+
+    let mut reference_count = 0_usize;
+    for solution in &manifest.testing.solutions {
+        if solution.role == studio_core::SolutionRoleV2::Reference {
+            reference_count += 1;
+        }
+        ensure!(
+            !matches!(
+                solution.role,
+                studio_core::SolutionRoleV2::Reference | studio_core::SolutionRoleV2::Oracle
+            ) || solution.expected_verdict == studio_core::ExpectedVerdict::Accepted,
+            "solution `{}` is a reference/oracle but its expected verdict is not accepted",
+            solution.program.name
+        );
+        ensure!(
+            solution.role != studio_core::SolutionRoleV2::KnownWrong
+                || solution.expected_verdict != studio_core::ExpectedVerdict::Accepted,
+            "solution `{}` is known-wrong but its expected verdict is accepted",
+            solution.program.name
+        );
+    }
+    ensure!(
+        reference_count <= 1,
+        "exactly one solution may have role reference; found {reference_count}"
+    );
+    if manifest.problem_type != ProblemType::OutputOnly {
+        ensure!(
+            reference_count == 1,
+            "one accepted reference solution is required; set it with `reporch solution update <name> --role reference --expected accepted`"
+        );
+    }
+    Ok(())
 }
 
 fn local_project_status(directory: &Path) -> Result<reporch_cli::local_project::ProjectStatusV1> {

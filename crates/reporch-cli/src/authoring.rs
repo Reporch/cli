@@ -528,6 +528,9 @@ struct SolutionAddOptions {
     language: String,
     #[arg(long, value_enum)]
     expected: Verdict,
+    /// How this solution is used by answer generation and verification.
+    #[arg(long, value_enum)]
+    role: Option<SolutionRoleOption>,
     #[arg(long)]
     minimum_score: Option<f64>,
     #[arg(long)]
@@ -539,6 +542,9 @@ struct SolutionUpdateOptions {
     name: String,
     #[arg(long, value_enum)]
     expected: Option<Verdict>,
+    /// Change how this solution is used by answer generation and verification.
+    #[arg(long, value_enum)]
+    role: Option<SolutionRoleOption>,
     #[arg(long)]
     minimum_score: Option<f64>,
     #[arg(long)]
@@ -553,6 +559,27 @@ enum Verdict {
     MemoryLimit,
     RuntimeError,
     Partial,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SolutionRoleOption {
+    Reference,
+    Alternative,
+    Oracle,
+    Brute,
+    KnownWrong,
+}
+
+impl From<SolutionRoleOption> for studio_core::SolutionRoleV2 {
+    fn from(value: SolutionRoleOption) -> Self {
+        match value {
+            SolutionRoleOption::Reference => Self::Reference,
+            SolutionRoleOption::Alternative => Self::Alternative,
+            SolutionRoleOption::Oracle => Self::Oracle,
+            SolutionRoleOption::Brute => Self::Brute,
+            SolutionRoleOption::KnownWrong => Self::KnownWrong,
+        }
+    }
 }
 
 impl From<Verdict> for ExpectedVerdict {
@@ -579,22 +606,29 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
             title,
         } => {
             let relative = relative_string(&path)?;
-            let spec =
-                reporch_cli::local_project::update_authoring_spec(Path::new("."), |root, spec| {
+            let spec = reporch_cli::local_project::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
                     reporch_cli::local_project::declare_project_file(
                         root,
                         spec,
                         &relative,
                         "text/markdown",
                         false,
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "create {relative} first, then rerun `reporch statement add --locale {locale} --path {relative}`"
+                        )
+                    })?;
                     spec.statements.insert(locale.clone(), relative.clone());
                     if let Some(title) = &title {
                         ensure!(!title.trim().is_empty(), "title cannot be empty");
                         spec.title.insert(locale.clone(), title.trim().to_owned());
                     }
                     Ok(())
-                })?;
+                },
+            )?;
             output.emit(
                 "statement add",
                 &spec.statements,
@@ -1612,6 +1646,10 @@ pub fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
             )
         }
         SolutionCommand::Add(options) => {
+            ensure!(
+                options.role.is_none(),
+                "solution roles require AuthoringSpecV2; run `reporch migrate --yes` first"
+            );
             let source = relative_string(&options.source)?;
             let expected_score = score_range(
                 options.minimum_score,
@@ -1651,6 +1689,10 @@ pub fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
             )
         }
         SolutionCommand::Update(options) => {
+            ensure!(
+                options.role.is_none(),
+                "solution roles require AuthoringSpecV2; run `reporch migrate --yes` first"
+            );
             let expected_score = match options.expected {
                 Some(expected) => {
                     score_range(options.minimum_score, options.maximum_score, expected)?

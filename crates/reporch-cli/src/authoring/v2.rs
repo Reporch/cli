@@ -45,7 +45,12 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
                         &relative,
                         "text/markdown",
                         false,
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "create {relative} first, then rerun `reporch statement add --locale {locale} --path {relative}`"
+                        )
+                    })?;
                     spec.statements.insert(locale.clone(), relative.clone());
                     if let Some(title) = &title {
                         ensure!(!title.trim().is_empty(), "title cannot be empty");
@@ -1130,19 +1135,25 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                         false,
                     )?;
                     let expected_verdict = options.expected.into();
-                    let role = match expected_verdict {
-                        studio_core::ExpectedVerdict::Accepted
-                            if !spec
-                                .testing
-                                .solutions
-                                .iter()
-                                .any(|solution| solution.role == SolutionRoleV2::Reference) =>
-                        {
-                            SolutionRoleV2::Reference
-                        }
-                        studio_core::ExpectedVerdict::WrongAnswer => SolutionRoleV2::KnownWrong,
-                        _ => SolutionRoleV2::Alternative,
-                    };
+                    let role =
+                        options
+                            .role
+                            .map(Into::into)
+                            .unwrap_or_else(|| match expected_verdict {
+                                studio_core::ExpectedVerdict::Accepted
+                                    if !spec.testing.solutions.iter().any(|solution| {
+                                        solution.role == SolutionRoleV2::Reference
+                                    }) =>
+                                {
+                                    SolutionRoleV2::Reference
+                                }
+                                studio_core::ExpectedVerdict::WrongAnswer => {
+                                    SolutionRoleV2::KnownWrong
+                                }
+                                _ => SolutionRoleV2::Alternative,
+                            });
+                    validate_solution_role(expected_verdict, role)?;
+                    ensure_reference_is_available(spec, role, None)?;
                     spec.testing.solutions.push(SolutionSpecV2 {
                         program: ProgramSpecV2 {
                             id: Uuid::now_v7(),
@@ -1177,14 +1188,25 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
-                    let solution = spec
+                    let solution_index = spec
                         .testing
                         .solutions
-                        .iter_mut()
-                        .find(|solution| solution.program.name == options.name)
+                        .iter()
+                        .position(|solution| solution.program.name == options.name)
                         .context("solution was not found")?;
-                    if let Some(expected) = options.expected {
-                        solution.expected_verdict = expected.into();
+                    let current = &spec.testing.solutions[solution_index];
+                    let expected_verdict = options
+                        .expected
+                        .map(Into::into)
+                        .unwrap_or(current.expected_verdict);
+                    let role = options.role.map(Into::into).unwrap_or(current.role);
+                    validate_solution_role(expected_verdict, role)?;
+                    ensure_reference_is_available(spec, role, Some(solution_index))?;
+
+                    let solution = &mut spec.testing.solutions[solution_index];
+                    solution.expected_verdict = expected_verdict;
+                    solution.role = role;
+                    if options.expected.is_some() {
                         solution.expected_score = expected_score.clone();
                     }
                     Ok(())
@@ -1247,6 +1269,47 @@ fn emit_solutions(command: &'static str, output: &CliOutput) -> Result<()> {
     )
 }
 
+fn validate_solution_role(
+    expected: studio_core::ExpectedVerdict,
+    role: SolutionRoleV2,
+) -> Result<()> {
+    ensure!(
+        !matches!(role, SolutionRoleV2::Reference | SolutionRoleV2::Oracle)
+            || expected == studio_core::ExpectedVerdict::Accepted,
+        "reference and oracle solutions must have expected verdict accepted"
+    );
+    ensure!(
+        role != SolutionRoleV2::KnownWrong || expected != studio_core::ExpectedVerdict::Accepted,
+        "known-wrong solutions cannot have expected verdict accepted"
+    );
+    Ok(())
+}
+
+fn ensure_reference_is_available(
+    spec: &reporch_format::AuthoringSpecV2,
+    requested_role: SolutionRoleV2,
+    ignored_index: Option<usize>,
+) -> Result<()> {
+    if requested_role != SolutionRoleV2::Reference {
+        return Ok(());
+    }
+    if let Some(existing) = spec
+        .testing
+        .solutions
+        .iter()
+        .enumerate()
+        .find(|(index, solution)| {
+            Some(*index) != ignored_index && solution.role == SolutionRoleV2::Reference
+        })
+        .map(|(_, solution)| &solution.program.name)
+    {
+        bail!(
+            "reference solution already exists: {existing}; demote or remove it first with `reporch solution update {existing} --role alternative`"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 struct GeneratedAnswerResult {
     test_id: Uuid,
@@ -1271,7 +1334,11 @@ pub(super) async fn answer(options: AnswerOptions, output: &CliOutput) -> Result
                 solution.role,
                 SolutionRoleV2::Reference | SolutionRoleV2::Oracle
             ),
-        "answer generation requires an accepted reference or oracle solution"
+        "answer generation requires an accepted reference or oracle solution; `{}` is {:?} with {:?}; run `reporch solution update {} --role reference --expected accepted` or select another solution",
+        solution.program.name,
+        solution.role,
+        solution.expected_verdict,
+        solution.program.name,
     );
     let selected = spec
         .testing

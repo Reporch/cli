@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-format"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 dependencies = [
  "serde",
  "serde_yaml_ng",

@@ -518,7 +518,9 @@ pub fn preflight_init_directory(directory: &Path) -> Result<()> {
         bail!("project directory must be a real directory");
     }
     if fs::read_dir(directory)?.next().transpose()?.is_some() {
-        bail!("refusing to initialize a non-empty project directory");
+        bail!(
+            "refusing to initialize a non-empty project directory; choose `--directory <new-empty-directory>` or move existing files first; Reporch never overwrites existing files"
+        );
     }
     Ok(())
 }
