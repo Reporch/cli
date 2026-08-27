@@ -285,7 +285,7 @@ async fn require_rootless(runtime: &str) -> Result<()> {
     };
     if !rootless {
         bail!(
-            "local sandbox requires a rootless Podman or Docker daemon; configure rootless mode and restart {runtime} (on macOS, rootless Podman is the recommended local path). Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification"
+            "local sandbox requires a rootless Podman or Docker daemon; configure rootless mode and restart {runtime} (on macOS, rootless Podman is recommended: run `podman machine init` then `podman machine start`). Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification"
         );
     }
     Ok(())
