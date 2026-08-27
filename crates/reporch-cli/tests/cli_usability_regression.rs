@@ -278,11 +278,411 @@ fn manifest_commands_default_to_the_current_authoring_file() {
         let output = run(&nested, &["manifest", command]);
         assert!(output.status.success(), "{command}: {output:?}");
     }
-    let compatibility = run(
-        &nested,
-        &["--profile", "reporch-native", "manifest", "compatibility"],
-    );
+    let compatibility = run(&nested, &["manifest", "compatibility"]);
     assert!(compatibility.status.success(), "{compatibility:?}");
+
+    for profile in [
+        "reporch_native",
+        "icpc_202509",
+        "icpc_legacy",
+        "polygon_compatible",
+        "domjudge_zip",
+    ] {
+        let underscore_alias = run(
+            &nested,
+            &["--profile", profile, "manifest", "compatibility"],
+        );
+        assert!(
+            underscore_alias.status.success(),
+            "{profile}: {underscore_alias:?}"
+        );
+    }
+}
+
+#[test]
+fn literal_test_case_input_is_unambiguous_and_written_safely() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "standard").status.success());
+
+    let help = run(project.path(), &["test", "case", "add", "--help"]);
+    assert!(help.status.success(), "{help:?}");
+    let help = String::from_utf8(help.stdout).unwrap();
+    for expected in [
+        "--input <INPUT_FILE>",
+        "--input-text <TEXT>",
+        "--answer-text <TEXT>",
+    ] {
+        assert!(help.contains(expected), "missing {expected:?}:\n{help}");
+    }
+
+    let added = run_json(
+        project.path(),
+        &[
+            "test",
+            "case",
+            "add",
+            "--name",
+            "literal",
+            "--input-text",
+            "9 4",
+            "--answer-text",
+            "13",
+        ],
+    );
+    assert!(added.status.success(), "{added:?}");
+    let envelope: Value = serde_json::from_slice(&added.stdout).unwrap();
+    let added_case = envelope["data"].as_array().unwrap().last().unwrap();
+    let input = added_case["input_file"].as_str().unwrap();
+    let answer = added_case["answer_file"].as_str().unwrap();
+    assert_eq!(
+        fs::read_to_string(project.path().join(input)).unwrap(),
+        "9 4"
+    );
+    assert_eq!(
+        fs::read_to_string(project.path().join(answer)).unwrap(),
+        "13"
+    );
+    assert!(run(project.path(), &["check"]).status.success());
+
+    let ambiguous = run(
+        project.path(),
+        &[
+            "test",
+            "case",
+            "add",
+            "--name",
+            "ambiguous",
+            "--input",
+            "tests/1.in",
+            "--input-text",
+            "1",
+        ],
+    );
+    assert_eq!(ambiguous.status.code(), Some(2), "{ambiguous:?}");
+
+    let before = fs::read_dir(project.path().join("tests/manual"))
+        .unwrap()
+        .count();
+    let duplicate = run(
+        project.path(),
+        &[
+            "test",
+            "case",
+            "add",
+            "--name",
+            "literal",
+            "--input-text",
+            "must roll back",
+        ],
+    );
+    assert_eq!(duplicate.status.code(), Some(2), "{duplicate:?}");
+    assert_eq!(
+        fs::read_dir(project.path().join("tests/manual"))
+            .unwrap()
+            .count(),
+        before,
+        "a failed manifest update left a generated input behind"
+    );
+}
+
+#[test]
+fn validator_units_accept_literal_text_without_treating_it_as_a_path() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "standard").status.success());
+    let added = run_json(
+        project.path(),
+        &[
+            "validator",
+            "unit-add",
+            "--name",
+            "literal-valid",
+            "--input-text",
+            "1 2",
+            "--expected",
+            "valid",
+        ],
+    );
+    assert!(added.status.success(), "{added:?}");
+    let envelope: Value = serde_json::from_slice(&added.stdout).unwrap();
+    let unit = envelope["data"].as_array().unwrap().last().unwrap();
+    let path = unit["input_file"].as_str().unwrap();
+    assert!(path.starts_with("validator-tests/"), "{path}");
+    assert_eq!(
+        fs::read_to_string(project.path().join(path)).unwrap(),
+        "1 2"
+    );
+
+    let help = run(project.path(), &["validator", "unit-add", "--help"]);
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--input <INPUT_FILE>"), "{help}");
+    assert!(help.contains("--input-text <TEXT>"), "{help}");
+}
+
+#[test]
+fn package_export_uses_project_defaults_and_reports_structured_recovery() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "standard").status.success());
+
+    let exported = run_json(
+        project.path(),
+        &["package", "export", "reporch.yaml", "native.rpk"],
+    );
+    assert!(exported.status.success(), "{exported:?}");
+    let envelope: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert_eq!(envelope["data"]["profile"], "reporch_native");
+    assert!(project.path().join("native.rpk").is_file());
+
+    let stale = run_json(
+        project.path(),
+        &["package", "export", "reporch.yaml", "native.rpk"],
+    );
+    assert_eq!(stale.status.code(), Some(2), "{stale:?}");
+    let error: Value = serde_json::from_slice(&stale.stderr).unwrap();
+    assert!(error["message"].as_str().unwrap().contains("may be stale"));
+    assert_eq!(
+        error["details"]["schema"],
+        "reporch.package-destination-conflict.v1"
+    );
+    assert!(error["details"]["current_manifest_digest"].is_string());
+
+    let imported = run_json(
+        project.path(),
+        &[
+            "--profile",
+            "reporch-native",
+            "package",
+            "import",
+            "native.rpk",
+            "imported",
+        ],
+    );
+    assert!(imported.status.success(), "{imported:?}");
+    let import_conflict = run_json(
+        project.path(),
+        &[
+            "--profile",
+            "reporch-native",
+            "package",
+            "import",
+            "native.rpk",
+            "imported",
+        ],
+    );
+    assert_eq!(
+        import_conflict.status.code(),
+        Some(2),
+        "{import_conflict:?}"
+    );
+    let error: Value = serde_json::from_slice(&import_conflict.stderr).unwrap();
+    assert_eq!(
+        error["details"]["schema"],
+        "reporch.package-import-destination-conflict.v1"
+    );
+    assert_eq!(error["details"]["recovery"], "choose_new_empty_directory");
+
+    let blocked = run_json(
+        project.path(),
+        &[
+            "--profile",
+            "polygon-compatible",
+            "manifest",
+            "compatibility",
+            "--require-exportable",
+        ],
+    );
+    assert_eq!(blocked.status.code(), Some(1), "{blocked:?}");
+    let error: Value = serde_json::from_slice(&blocked.stderr).unwrap();
+    assert_eq!(error["error_code"], "operation.failed");
+    assert_eq!(
+        error["details"]["schema"],
+        "reporch.compatibility-report.v1"
+    );
+    assert_eq!(error["details"]["target_profile"], "polygon_compatible");
+    assert_eq!(error["details"]["exportable"], false);
+}
+
+#[test]
+fn scored_solution_ranges_update_without_repeating_the_verdict() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "scored").status.success());
+    let updated = run_json(
+        project.path(),
+        &[
+            "solution",
+            "update",
+            "partial-50",
+            "--minimum-score",
+            "40",
+            "--maximum-score",
+            "70",
+        ],
+    );
+    assert!(updated.status.success(), "{updated:?}");
+    let listed = run_json(project.path(), &["solution", "list"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let partial = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|solution| solution["program"]["name"] == "partial-50")
+        .unwrap();
+    assert_eq!(partial["expected_score"]["minimum"], 40.0);
+    assert_eq!(partial["expected_score"]["maximum"], 70.0);
+
+    let invalid = run(
+        project.path(),
+        &[
+            "solution",
+            "update",
+            "accepted",
+            "--minimum-score",
+            "80",
+            "--maximum-score",
+            "100",
+        ],
+    );
+    assert_eq!(invalid.status.code(), Some(2), "{invalid:?}");
+    assert!(
+        String::from_utf8(invalid.stderr)
+            .unwrap()
+            .contains("score range is only valid for partial solutions")
+    );
+}
+
+#[test]
+fn scored_group_help_calls_the_positional_value_a_name() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "scored").status.success());
+    let help = run(project.path(), &["test", "group", "add", "--help"]);
+    assert!(help.status.success(), "{help:?}");
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("<NAME>"), "{help}");
+    assert!(!help.contains("<ID>"), "{help}");
+}
+
+#[test]
+fn schema_mismatch_points_to_the_declared_version_instead_of_a_random_field() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "library").status.success());
+    let yaml_path = project.path().join("reporch.yaml");
+    let yaml = fs::read_to_string(&yaml_path).unwrap().replacen(
+        "reporch.authoring-spec.v2",
+        "reporch.authoring-spec.v1",
+        1,
+    );
+    fs::write(yaml_path, yaml).unwrap();
+
+    let checked = run(project.path(), &["check"]);
+    assert_eq!(checked.status.code(), Some(2), "{checked:?}");
+    let stderr = String::from_utf8(checked.stderr).unwrap();
+    assert!(
+        stderr.contains("does not belong to declared schema"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("reporch.authoring-spec.v2"), "{stderr}");
+}
+
+#[test]
+fn verify_failure_lists_the_complete_recovery_sequence() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "standard").status.success());
+    let verified = run_json(project.path(), &["verify"]);
+    assert_eq!(verified.status.code(), Some(2), "{verified:?}");
+    let error: Value = serde_json::from_slice(&verified.stderr).unwrap();
+    for expected in [
+        "reporch auth login",
+        "reporch project create",
+        "reporch project link",
+        "reporch project push",
+        "reporch verify",
+    ] {
+        assert!(
+            error["message"].as_str().unwrap().contains(expected),
+            "missing {expected:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn output_mismatch_error_includes_actual_verdict_score_and_structured_report() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "output-only").status.success());
+    let yaml_path = project.path().join("reporch.yaml");
+    let mut yaml = fs::read_to_string(&yaml_path).unwrap();
+    let marker = "  name: known-wrong";
+    let section = yaml.find(marker).unwrap();
+    let verdict = yaml[section..]
+        .find("expected_verdict: wrong_answer")
+        .unwrap()
+        + section;
+    yaml.replace_range(
+        verdict..verdict + "expected_verdict: wrong_answer".len(),
+        "expected_verdict: accepted",
+    );
+    fs::write(yaml_path, yaml).unwrap();
+
+    let tested = run_json(project.path(), &["output", "test"]);
+    assert_eq!(tested.status.code(), Some(1), "{tested:?}");
+    let error: Value = serde_json::from_slice(&tested.stderr).unwrap();
+    assert_eq!(error["error_code"], "operation.failed");
+    let message = error["message"].as_str().unwrap();
+    for expected in [
+        "known-wrong",
+        "expected accepted",
+        "actual wrong_answer",
+        "score 0",
+    ] {
+        assert!(
+            message.contains(expected),
+            "missing {expected:?}: {message}"
+        );
+    }
+    assert_eq!(error["details"]["schema"], "reporch.output-test-report.v1");
+    assert_eq!(error["details"]["passed"], false);
+    assert_eq!(error["details"]["submissions"][1]["actual"], "wrong_answer");
+    assert_eq!(error["details"]["submissions"][1]["score"], 0.0);
+}
+
+#[test]
+fn library_solution_commands_stay_on_authoring_v2_without_manual_migration() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "library").status.success());
+    fs::write(
+        project.path().join("solutions/alternative.cpp"),
+        "int solve(int a, int b) { return a + b; }\n",
+    )
+    .unwrap();
+
+    let added = run_json(
+        project.path(),
+        &[
+            "solution",
+            "add",
+            "--name",
+            "alternative-library",
+            "--source",
+            "solutions/alternative.cpp",
+            "--language",
+            "cpp",
+            "--expected",
+            "accepted",
+            "--role",
+            "alternative",
+        ],
+    );
+    assert!(added.status.success(), "{added:?}");
+    let matrix = run_json(project.path(), &["solution", "matrix"]);
+    assert!(matrix.status.success(), "{matrix:?}");
+    let matrix: Value = serde_json::from_slice(&matrix.stdout).unwrap();
+    assert!(matrix["data"].as_array().unwrap().iter().any(|solution| {
+        solution["program"]["name"] == "alternative-library" && solution["role"] == "alternative"
+    }));
+    assert!(
+        fs::read_to_string(project.path().join("reporch.yaml"))
+            .unwrap()
+            .contains("schema: reporch.authoring-spec.v2")
+    );
+    assert!(run(project.path(), &["check"]).status.success());
 }
 
 #[test]

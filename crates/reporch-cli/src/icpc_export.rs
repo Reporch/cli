@@ -86,17 +86,21 @@ fn export_icpc_based(
         .and_then(|value| value.to_str())
         .context("output filename must provide an ASCII package name")?;
     let short_name = sanitize_name(output_stem);
+    let package_name = match target_profile {
+        PackageProfile::DomjudgeZip => "DOMjudge",
+        _ => "ICPC 2025-09",
+    };
     ensure!(
         output_stem == short_name
             && !short_name.is_empty()
             && short_name
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
-        "ICPC package name must contain only lowercase ASCII letters and digits"
+        "{package_name} package name must contain only lowercase ASCII letters and digits"
     );
     ensure!(
         output.extension().and_then(|value| value.to_str()) == Some("zip"),
-        "ICPC package output must use the .zip extension"
+        "{package_name} package output must use the .zip extension"
     );
 
     let mut entries = vec![ExportEntry {
@@ -1123,6 +1127,32 @@ mod tests {
         .unwrap();
         assert_eq!(imported.package_profile, PackageProfile::DomjudgeZip);
         assert!(validate_manifest(&imported).is_empty());
+    }
+
+    #[test]
+    fn domjudge_filename_errors_name_domjudge_instead_of_icpc() {
+        let temporary = tempfile::tempdir().unwrap();
+        super::super::init_project(temporary.path(), "DOMjudge Error").unwrap();
+        let mut manifest =
+            super::super::read_manifest(&temporary.path().join("reporch.problem.json")).unwrap();
+        add_validator(
+            &mut manifest,
+            temporary.path(),
+            "validators/main.py",
+            b"raise SystemExit(0)\n",
+        );
+        let error = export_domjudge_zip(
+            &manifest,
+            temporary.path(),
+            &temporary.path().join("Bad Name.zip"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DOMjudge package name must contain only lowercase ASCII")
+        );
+        assert!(!error.to_string().contains("ICPC package name"));
     }
 
     #[test]

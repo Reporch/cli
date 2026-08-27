@@ -39,7 +39,10 @@ pub fn is_v2_project(directory: &Path) -> Result<bool> {
         &root.join(AUTHORING_FILE_NAME),
         MAX_AUTHORING_SPEC_BYTES as u64,
     )?;
-    Ok(parse_authoring_spec_v2(&bytes).is_ok())
+    Ok(matches!(
+        reporch_format::parse_versioned_authoring_spec(&bytes)?,
+        reporch_format::VersionedAuthoringSpec::V2(_)
+    ))
 }
 
 pub fn read_authoring_spec(directory: &Path) -> Result<AuthoringSpecV2> {

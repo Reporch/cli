@@ -3,6 +3,7 @@ use std::io::IsTerminal as _;
 use anyhow::Error;
 use clap::ValueEnum;
 use serde::Serialize;
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -46,6 +47,28 @@ struct ErrorEnvelope<'a> {
     message: String,
     retryable: bool,
     trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<&'a Value>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct DetailedCliError {
+    message: String,
+    details: Value,
+}
+
+pub fn detailed_error(message: impl Into<String>, details: impl Serialize) -> Error {
+    let details = serde_json::to_value(details).unwrap_or_else(|serialization_error| {
+        serde_json::json!({
+            "schema": "reporch.error-details-serialization.v1",
+            "message": serialization_error.to_string(),
+        })
+    });
+    Error::new(DetailedCliError {
+        message: message.into(),
+        details,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +125,11 @@ impl CliOutput {
             trace_id: classified
                 .trace_id
                 .unwrap_or_else(|| Uuid::now_v7().to_string()),
+            details: error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<DetailedCliError>()
+                    .map(|error| &error.details)
+            }),
         };
         match self.format {
             OutputFormat::Human => eprintln!("{}: {}", envelope.error_code, envelope.message),
@@ -188,7 +216,6 @@ fn classify_error(error: &Error) -> ClassifiedError {
         };
     }
     if message.contains("credential")
-        || message.contains("auth login")
         || message.contains("authentication")
         || message.contains("unauthorized")
     {
@@ -239,6 +266,8 @@ fn classify_error(error: &Error) -> ClassifiedError {
         };
     }
     if message.contains("validation did not pass")
+        || message.contains("output validation did not pass")
+        || message.contains("cannot be exported")
         || message.contains("release build failed")
         || message.contains("expected verdict")
     {

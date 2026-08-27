@@ -3359,9 +3359,13 @@ fn resolve_local_candidate(
             "local remote link does not match reporch.yaml"
         );
     }
-    let resolved_commit_id = commit_id
-        .or(state.last_commit_id)
-        .context("no commit is recorded; run reporch project push first")?;
+    let resolved_commit_id = commit_id.or(state.last_commit_id).with_context(|| {
+        if state.remote.is_some() {
+            "no commit is recorded; run `reporch project push`, then retry `reporch verify`"
+        } else {
+            "project is not linked and no commit is recorded. Run `reporch auth login`, `reporch project create --title \"<TITLE>\"`, `reporch project link --project-id <UUID>`, `reporch project push`, then `reporch verify`"
+        }
+    })?;
     Ok((resolved_project_id, resolved_commit_id, Some(root)))
 }
 
@@ -3375,7 +3379,7 @@ fn resolve_local_project_id(project_id: Option<Uuid>) -> Result<Uuid> {
     let state = crate::local_project::read_local_state(&root)?;
     let remote = state
         .remote
-        .context("project is not linked; run reporch project link")?;
+        .context("project is not linked; run `reporch auth login`, `reporch project create --title \"<TITLE>\"`, then `reporch project link --project-id <UUID>`")?;
     ensure!(
         remote.project_id == spec.project_id(),
         "local link and reporch.yaml project IDs differ"

@@ -46,7 +46,8 @@ struct CliInterrupted;
 #[command(
     name = "reporch",
     version,
-    about = "Create, validate, package, and sync Reporch problems"
+    about = "Create, validate, package, and sync Reporch problems",
+    after_help = "Quick start:\n  reporch new --title \"A + B\" --directory a-b\n  cd a-b\n  reporch check\n  reporch auth login\n  reporch project create --title \"A + B\"\n  reporch project link --project-id <UUID>\n  reporch project push\n  reporch verify\n\nRun `reporch <command> --help` for command-specific examples."
 )]
 struct Args {
     /// Resolve relative paths from this directory.
@@ -78,6 +79,8 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a safe starter problem. This is the shortest form of `project init`.
+    New(ProjectInitOptions),
     /// Migrate a pre-1.0 manifest to the human-editable reporch.yaml format.
     Migrate(MigrateOptions),
     /// Validate reporch.yaml and every declared local file without network access.
@@ -323,10 +326,13 @@ enum AuthCommand {
 
 #[derive(Debug, Subcommand)]
 enum PackageCommand {
+    /// Export a package. The project package profile and manifest directory are the defaults.
     Export {
+        #[arg(value_name = "MANIFEST")]
         manifest: PathBuf,
+        #[arg(value_name = "OUTPUT")]
         output: PathBuf,
-        #[arg(long)]
+        #[arg(long, value_name = "SOURCE_ROOT")]
         source_root: Option<PathBuf>,
     },
     Import {
@@ -335,23 +341,26 @@ enum PackageCommand {
     },
 }
 
+#[derive(Debug, Clone, ClapArgs)]
+struct ProjectInitOptions {
+    #[arg(long)]
+    title: String,
+    #[arg(long, default_value = ".")]
+    directory: PathBuf,
+    /// Initialize alongside unrelated existing files after checking every generated path for collisions.
+    #[arg(long)]
+    allow_non_empty: bool,
+    #[arg(long, value_enum, default_value_t = studio_remote::RemoteProblemType::Standard)]
+    problem_type: studio_remote::RemoteProblemType,
+    /// Bind the local manifest to an existing private Studio project.
+    #[arg(long)]
+    project_id: Option<Uuid>,
+}
+
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
     /// Create a safe starter project without overwriting existing files.
-    Init {
-        #[arg(long)]
-        title: String,
-        #[arg(long, default_value = ".")]
-        directory: PathBuf,
-        /// Initialize alongside unrelated existing files after checking every generated path for collisions.
-        #[arg(long)]
-        allow_non_empty: bool,
-        #[arg(long, value_enum, default_value_t = studio_remote::RemoteProblemType::Standard)]
-        problem_type: studio_remote::RemoteProblemType,
-        /// Bind the local manifest to an existing private Studio project.
-        #[arg(long)]
-        project_id: Option<Uuid>,
-    },
+    Init(ProjectInitOptions),
     /// Link the current directory to an existing private Studio project.
     Link {
         #[command(flatten)]
@@ -497,17 +506,23 @@ enum ManifestCommand {
         /// Immutable manifest or authoring YAML. When omitted, discovers the current project's reporch.yaml.
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
-        #[arg(long)]
-        strict: bool,
+        /// Exit 1 when the target format cannot represent this problem.
+        #[arg(long, visible_alias = "strict")]
+        require_exportable: bool,
     },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CompatibilityProfile {
+    #[value(name = "reporch-native", alias = "reporch_native")]
     ReporchNative,
+    #[value(name = "icpc202509", alias = "icpc_202509", alias = "icpc_2025_09")]
     Icpc202509,
+    #[value(name = "icpc-legacy", alias = "icpc_legacy")]
     IcpcLegacy,
+    #[value(name = "polygon-compatible", alias = "polygon_compatible")]
     PolygonCompatible,
+    #[value(name = "domjudge-zip", alias = "domjudge_zip")]
     DomjudgeZip,
 }
 
@@ -635,6 +650,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         .transpose()?;
 
     match command {
+        Command::New(options) => execute_project_init(options, "new", output),
         Command::Migrate(options) => migrate(&options, yes, output),
         Command::Check => check_project(output),
         Command::Statement(options) => authoring::statement(options, output),
@@ -678,35 +694,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             AuthCommand::Logout(options) => auth_logout(&options, output).await,
         },
         Command::Project { command } => match command {
-            ProjectCommand::Init {
-                title,
-                directory,
-                allow_non_empty,
-                problem_type,
-                project_id,
-            } => {
-                reporch_cli::init_project_template_with_optional_id(
-                    &directory,
-                    &title,
-                    project_id,
-                    problem_type.into(),
-                    allow_non_empty,
-                )?;
-                let status = local_project_status(&directory)?;
-                let existing_directory_note = if allow_non_empty {
-                    "\nExisting unrelated files were preserved; every generated path was collision-checked before writing."
-                } else {
-                    ""
-                };
-                output.emit(
-                    "project init",
-                    &status,
-                    &format!(
-                        "Initialized {}{existing_directory_note}\nStarter includes: a statement, sample tests, and problem-type examples (accepted/reference and known-wrong when applicable).\nEdit the existing starter files before adding replacements.\nNext: run `reporch check`, then `reporch verify` for official execution evidence.",
-                        status.root.display(),
-                    ),
-                )
-            }
+            ProjectCommand::Init(options) => execute_project_init(options, "project init", output),
             ProjectCommand::Link {
                 connection,
                 project_id,
@@ -1204,10 +1192,13 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             ManifestCommand::Digest { path } => {
                 validate(&resolve_manifest_path(path)?, true, output)
             }
-            ManifestCommand::Compatibility { path, strict } => compatibility(
+            ManifestCommand::Compatibility {
+                path,
+                require_exportable,
+            } => compatibility(
                 &resolve_manifest_path(path)?,
-                required_package_profile(package_profile)?,
-                strict,
+                package_profile.map(Into::into),
+                require_exportable,
                 output,
             ),
         },
@@ -1219,7 +1210,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             } => export_package(
                 &manifest,
                 &archive,
-                required_package_profile(package_profile)?,
+                package_profile.map(Into::into),
                 source_root.as_deref(),
                 output,
             ),
@@ -1288,6 +1279,34 @@ fn required_package_profile(profile: Option<CompatibilityProfile>) -> Result<Pac
     profile
         .map(Into::into)
         .context("--profile is required for package compatibility, import, and export commands")
+}
+
+fn execute_project_init(
+    options: ProjectInitOptions,
+    command: &str,
+    output: &CliOutput,
+) -> Result<()> {
+    reporch_cli::init_project_template_with_optional_id(
+        &options.directory,
+        &options.title,
+        options.project_id,
+        options.problem_type.into(),
+        options.allow_non_empty,
+    )?;
+    let status = local_project_status(&options.directory)?;
+    let existing_directory_note = if options.allow_non_empty {
+        "\nExisting unrelated files were preserved; every generated path was collision-checked before writing."
+    } else {
+        ""
+    };
+    output.emit(
+        command,
+        &status,
+        &format!(
+            "Initialized {}{existing_directory_note}\nStarter includes: a statement, sample tests, and problem-type examples (accepted/reference and known-wrong when applicable).\nEdit the existing starter files before adding replacements.\nNext: run `reporch check`. To verify remotely, run `reporch auth login`, create/link a Studio project, `reporch project push`, then `reporch verify`.",
+            status.root.display(),
+        ),
+    )
 }
 
 fn migrate(options: &MigrateOptions, yes: bool, output: &CliOutput) -> Result<()> {
@@ -1565,6 +1584,7 @@ fn confirm_publication(yes: bool, no_input: bool) -> Result<()> {
 
 fn command_name(command: &Command) -> &'static str {
     match command {
+        Command::New(_) => "new",
         Command::Migrate(_) => "migrate",
         Command::Check => "check",
         Command::Statement(_) => "statement",
@@ -1585,7 +1605,7 @@ fn command_name(command: &Command) -> &'static str {
             AuthCommand::Logout(_) => "auth logout",
         },
         Command::Project { command } => match command {
-            ProjectCommand::Init { .. } => "project init",
+            ProjectCommand::Init(_) => "project init",
             ProjectCommand::Link { .. } => "project link",
             ProjectCommand::List(_) => "project list",
             ProjectCommand::Show(_) => "project show",
@@ -1906,7 +1926,16 @@ fn import_package(
     profile: PackageProfile,
     output: &CliOutput,
 ) -> Result<()> {
-    ensure!(!directory.exists(), "import destination already exists");
+    if directory.exists() {
+        return Err(cli_output::detailed_error(
+            "import destination already exists. Choose a new empty directory; Reporch never merges or overwrites an import",
+            serde_json::json!({
+                "schema": "reporch.package-import-destination-conflict.v1",
+                "directory": directory,
+                "recovery": "choose_new_empty_directory",
+            }),
+        ));
+    }
     let manifest: VersionedReleaseManifest = if profile != PackageProfile::ReporchNative
         && versioned_package::contains_v2_sidecar(input)?
     {
@@ -1988,15 +2017,55 @@ impl Drop for ImportCleanup {
 fn export_package(
     manifest_path: &Path,
     output: &Path,
-    profile: PackageProfile,
+    profile: Option<PackageProfile>,
     source_root: Option<&Path>,
     cli_output: &CliOutput,
 ) -> Result<()> {
     let manifest = read_versioned_manifest(manifest_path)?;
+    let profile = profile.unwrap_or_else(|| manifest.package_profile());
+    let manifest_digest = manifest.digest()?;
+    if output.exists() {
+        return Err(cli_output::detailed_error(
+            format!(
+                "export destination already exists and may be stale; current manifest digest is {manifest_digest}. Choose a new output path. Reporch never overwrites packages"
+            ),
+            serde_json::json!({
+                "schema": "reporch.package-destination-conflict.v1",
+                "output": output,
+                "current_manifest_digest": manifest_digest,
+                "recovery": "choose_new_output_path",
+            }),
+        ));
+    }
     let source_root = source_root
         .map(Path::to_path_buf)
-        .or_else(|| manifest_path.parent().map(Path::to_path_buf))
-        .context("manifest path has no parent directory")?;
+        .or_else(|| {
+            manifest_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    let preflight_report = match (&manifest, profile) {
+        (_, PackageProfile::ReporchNative) => None,
+        (VersionedReleaseManifest::V1(manifest), profile) => {
+            Some(compatibility_report(manifest, profile))
+        }
+        (VersionedReleaseManifest::V2(manifest), profile) => {
+            Some(versioned_package::compatibility_v2(manifest, profile)?)
+        }
+    };
+    if let Some(report) = &preflight_report
+        && !report.exportable
+    {
+        return Err(cli_output::detailed_error(
+            format!(
+                "package cannot be exported to {}; inspect `details` for every blocking capability",
+                package_profile_name(profile)
+            ),
+            report,
+        ));
+    }
     let report = match (&manifest, profile) {
         (_, PackageProfile::ReporchNative) => {
             native_package::export_native_versioned(&manifest, &source_root, output)?;
@@ -2019,7 +2088,7 @@ fn export_package(
             Some(compatibility_report(manifest, profile))
         }
         (VersionedReleaseManifest::V2(manifest), target) => {
-            Some(versioned_package::export_v2_with_sidecar(
+            versioned_package::export_v2_with_sidecar(
                 manifest,
                 &source_root,
                 output,
@@ -2039,14 +2108,15 @@ fn export_package(
                     }
                     PackageProfile::ReporchNative => unreachable!(),
                 },
-            )?)
+            )?;
+            preflight_report
         }
     };
     let data = serde_json::json!({
         "schema": "reporch.package-export-result.v1",
         "profile": profile,
         "output": output,
-        "manifest_digest": manifest.digest()?,
+        "manifest_digest": manifest_digest,
         "compatibility": report,
     });
     cli_output.emit(
@@ -2056,21 +2126,35 @@ fn export_package(
     )
 }
 
+fn package_profile_name(profile: PackageProfile) -> &'static str {
+    match profile {
+        PackageProfile::ReporchNative => "reporch-native",
+        PackageProfile::Icpc202509 => "icpc202509",
+        PackageProfile::IcpcLegacy => "icpc-legacy",
+        PackageProfile::PolygonCompatible => "polygon-compatible",
+        PackageProfile::DomjudgeZip => "domjudge-zip",
+    }
+}
+
 fn compatibility(
     path: &Path,
-    profile: PackageProfile,
-    strict: bool,
+    profile: Option<PackageProfile>,
+    require_exportable: bool,
     output: &CliOutput,
 ) -> Result<()> {
     let manifest = read_versioned_manifest(path)?;
+    let profile = profile.unwrap_or_else(|| manifest.package_profile());
     let report = match &manifest {
         VersionedReleaseManifest::V1(manifest) => compatibility_report(manifest, profile),
         VersionedReleaseManifest::V2(manifest) => {
             versioned_package::compatibility_v2(manifest, profile)?
         }
     };
-    if strict && !report.exportable {
-        bail!("manifest cannot be exported to the requested profile");
+    if require_exportable && !report.exportable {
+        return Err(cli_output::detailed_error(
+            "manifest cannot be exported to the requested profile; inspect `details` for every blocking capability",
+            &report,
+        ));
     }
     output.emit(
         "manifest compatibility",

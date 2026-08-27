@@ -170,8 +170,10 @@ fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
     test_case(
         TestCaseCommand::Add(TestCaseAddOptions {
             name,
-            input: PathBuf::from(input),
+            input: Some(PathBuf::from(input)),
+            input_text: None,
             answer: (!answer.is_empty()).then(|| PathBuf::from(answer)),
+            answer_text: None,
             groups: vec![],
             generated_by: None,
             seed: None,
@@ -192,12 +194,13 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestCaseCommand::Add(options) => {
-            let input = relative_string(&options.input)?;
-            let answer = options.answer.as_deref().map(relative_string).transpose()?;
             let test_id = Uuid::now_v7();
-            let spec = reporch_cli::local_project_v2::update_authoring_spec(
-                Path::new("."),
-                |root, spec| {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let materialized = materialize_manual_case_files(&root, test_id, &options)?;
+            let input = materialized.input.clone();
+            let answer = materialized.answer.clone();
+            let updated =
+                reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
                     ensure_unique_test_name(spec, &options.name, None)?;
                     let group_ids = resolve_group_ids(spec, &options.groups)?;
                     let generated = if let Some(generator_name) = &options.generated_by {
@@ -263,8 +266,14 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
                         generated,
                     });
                     Ok(())
-                },
-            )?;
+                });
+            let spec = match updated {
+                Ok(spec) => spec,
+                Err(error) => {
+                    materialized.rollback();
+                    return Err(error);
+                }
+            };
             output.emit(
                 "test case add",
                 &spec.testing.tests,
@@ -836,23 +845,21 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                 &format!("Configured validator {source}"),
             )
         }
-        ValidatorCommand::UnitAdd {
-            name,
-            input,
-            expected,
-        } => {
-            let input = relative_string(&input)?;
-            let spec = reporch_cli::local_project_v2::update_authoring_spec(
-                Path::new("."),
-                |root, spec| {
+        ValidatorCommand::UnitAdd(options) => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let materialized = materialize_validator_unit_input(&root, &options)?;
+            let input = materialized.path.clone();
+            let updated =
+                reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
                     ensure!(
                         !spec
                             .testing
                             .validators
                             .unit_tests
                             .iter()
-                            .any(|unit| unit.name == name),
-                        "validator unit already exists: {name}"
+                            .any(|unit| unit.name == options.name),
+                        "validator unit already exists: {}",
+                        options.name
                     );
                     reporch_cli::local_project_v2::declare_project_file(
                         root,
@@ -866,17 +873,23 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                         .unit_tests
                         .push(ValidatorUnitSpecV2 {
                             id: Uuid::now_v7(),
-                            name: normalize_name(&name)?,
+                            name: normalize_name(&options.name)?,
                             input_file: input.clone(),
-                            expected_valid: matches!(expected, ValidityExpectation::Valid),
+                            expected_valid: matches!(options.expected, ValidityExpectation::Valid),
                         });
                     Ok(())
-                },
-            )?;
+                });
+            let spec = match updated {
+                Ok(spec) => spec,
+                Err(error) => {
+                    materialized.rollback();
+                    return Err(error);
+                }
+            };
             output.emit(
                 "validator unit-add",
                 &spec.testing.validators.unit_tests,
-                &format!("Added validator unit {name}"),
+                &format!("Added validator unit {}", options.name),
             )
         }
         ValidatorCommand::Run { name, runtime } => {
@@ -1179,12 +1192,8 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
             )
         }
         SolutionCommand::Update(options) => {
-            let expected_score = match options.expected {
-                Some(expected) => {
-                    score_range(options.minimum_score, options.maximum_score, expected)?
-                }
-                None => None,
-            };
+            let score_was_supplied =
+                options.minimum_score.is_some() || options.maximum_score.is_some();
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -1200,15 +1209,22 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                         .map(Into::into)
                         .unwrap_or(current.expected_verdict);
                     let role = options.role.map(Into::into).unwrap_or(current.role);
+                    let expected_score = if options.expected.is_some() || score_was_supplied {
+                        score_range_for_verdict(
+                            options.minimum_score,
+                            options.maximum_score,
+                            expected_verdict,
+                        )?
+                    } else {
+                        current.expected_score.clone()
+                    };
                     validate_solution_role(expected_verdict, role)?;
                     ensure_reference_is_available(spec, role, Some(solution_index))?;
 
                     let solution = &mut spec.testing.solutions[solution_index];
                     solution.expected_verdict = expected_verdict;
                     solution.role = role;
-                    if options.expected.is_some() {
-                        solution.expected_score = expected_score.clone();
-                    }
+                    solution.expected_score = expected_score;
                     Ok(())
                 },
             )?;
@@ -2556,13 +2572,31 @@ pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput
                 });
             }
             let report = OutputTestReport {
+                schema: "reporch.output-test-report.v1",
                 passed: reports.iter().all(|report| report.passed),
                 submissions: reports,
             };
-            ensure!(
-                report.passed,
-                "output validation did not pass: one or more submissions disagreed with the expected verdict"
-            );
+            if !report.passed {
+                let mismatches = report
+                    .submissions
+                    .iter()
+                    .filter(|submission| !submission.passed)
+                    .map(|submission| {
+                        format!(
+                            "{}: expected {}, actual {}, score {}",
+                            submission.name,
+                            submission.expected,
+                            submission.actual,
+                            submission.score
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(crate::cli_output::detailed_error(
+                    format!("output validation did not pass: {mismatches}"),
+                    &report,
+                ));
+            }
             output.emit(
                 "output test",
                 &report,

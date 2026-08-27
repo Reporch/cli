@@ -86,10 +86,23 @@ enum TestCaseCommand {
 struct TestCaseAddOptions {
     #[arg(long)]
     name: String,
-    #[arg(long)]
-    input: PathBuf,
-    #[arg(long)]
+    /// Read the test input from a project file.
+    #[arg(
+        long,
+        value_name = "INPUT_FILE",
+        required_unless_present = "input_text",
+        conflicts_with = "input_text"
+    )]
+    input: Option<PathBuf>,
+    /// Create a safe test input file from literal text.
+    #[arg(long, value_name = "TEXT", conflicts_with = "input")]
+    input_text: Option<String>,
+    /// Read the expected answer from a project file.
+    #[arg(long, value_name = "ANSWER_FILE", conflicts_with = "answer_text")]
     answer: Option<PathBuf>,
+    /// Create a safe expected-answer file from literal text.
+    #[arg(long, value_name = "TEXT", conflicts_with = "answer")]
+    answer_text: Option<String>,
     #[arg(long = "group")]
     groups: Vec<String>,
     #[arg(long)]
@@ -124,6 +137,8 @@ enum TestGroupCommand {
 
 #[derive(Debug, ClapArgs)]
 struct TestGroupAddOptions {
+    /// Stable human-readable group name (for example `samples` or `full-score`).
+    #[arg(value_name = "NAME")]
     id: String,
     #[arg(long)]
     points: f64,
@@ -219,20 +234,32 @@ enum ValidatorCommand {
         #[arg(long)]
         extra: bool,
     },
-    UnitAdd {
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        input: PathBuf,
-        #[arg(long, value_enum)]
-        expected: ValidityExpectation,
-    },
+    UnitAdd(ValidatorUnitAddOptions),
     Run {
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
         runtime: RuntimeOptions,
     },
+}
+
+#[derive(Debug, ClapArgs)]
+struct ValidatorUnitAddOptions {
+    #[arg(long)]
+    name: String,
+    /// Read the validator unit input from a project file.
+    #[arg(
+        long,
+        value_name = "INPUT_FILE",
+        required_unless_present = "input_text",
+        conflicts_with = "input_text"
+    )]
+    input: Option<PathBuf>,
+    /// Create a safe validator unit input file from literal text.
+    #[arg(long, value_name = "TEXT", conflicts_with = "input")]
+    input_text: Option<String>,
+    #[arg(long, value_enum)]
+    expected: ValidityExpectation,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -768,8 +795,10 @@ fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
     test_case(
         TestCaseCommand::Add(TestCaseAddOptions {
             name,
-            input: PathBuf::from(input),
+            input: Some(PathBuf::from(input)),
+            input_text: None,
             answer: (!answer.is_empty()).then(|| PathBuf::from(answer)),
+            answer_text: None,
             groups: vec![],
             generated_by: None,
             seed: None,
@@ -790,50 +819,58 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestCaseCommand::Add(options) => {
-            let input = relative_string(&options.input)?;
-            let answer = options.answer.as_deref().map(relative_string).transpose()?;
             let test_id = Uuid::now_v7();
-            let spec =
-                reporch_cli::local_project::update_authoring_spec(Path::new("."), |root, spec| {
-                    ensure_unique_test_name(spec, &options.name, None)?;
-                    ensure_groups_exist(spec, &options.groups)?;
-                    if let Some(generator) = &options.generated_by {
-                        ensure!(
-                            spec.judging
-                                .generators
-                                .iter()
-                                .any(|candidate| candidate.id == *generator),
-                            "unknown generator: {generator}"
-                        );
-                    }
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let materialized = materialize_manual_case_files(&root, test_id, &options)?;
+            let input = materialized.input.clone();
+            let answer = materialized.answer.clone();
+            let updated = reporch_cli::local_project::update_authoring_spec(&root, |root, spec| {
+                ensure_unique_test_name(spec, &options.name, None)?;
+                ensure_groups_exist(spec, &options.groups)?;
+                if let Some(generator) = &options.generated_by {
+                    ensure!(
+                        spec.judging
+                            .generators
+                            .iter()
+                            .any(|candidate| candidate.id == *generator),
+                        "unknown generator: {generator}"
+                    );
+                }
+                reporch_cli::local_project::declare_project_file(
+                    root,
+                    spec,
+                    &input,
+                    "text/plain",
+                    false,
+                )?;
+                if let Some(answer) = &answer {
                     reporch_cli::local_project::declare_project_file(
                         root,
                         spec,
-                        &input,
+                        answer,
                         "text/plain",
                         false,
                     )?;
-                    if let Some(answer) = &answer {
-                        reporch_cli::local_project::declare_project_file(
-                            root,
-                            spec,
-                            answer,
-                            "text/plain",
-                            false,
-                        )?;
-                    }
-                    spec.judging.tests.push(TestCaseSpec {
-                        id: test_id,
-                        name: normalize_name(&options.name)?,
-                        input_file: input.clone(),
-                        answer_file: answer.clone(),
-                        groups: options.groups.clone(),
-                        generated_by: options.generated_by.clone(),
-                        generator_arguments: vec![],
-                        seed: options.seed,
-                    });
-                    Ok(())
-                })?;
+                }
+                spec.judging.tests.push(TestCaseSpec {
+                    id: test_id,
+                    name: normalize_name(&options.name)?,
+                    input_file: input.clone(),
+                    answer_file: answer.clone(),
+                    groups: options.groups.clone(),
+                    generated_by: options.generated_by.clone(),
+                    generator_arguments: vec![],
+                    seed: options.seed,
+                });
+                Ok(())
+            });
+            let spec = match updated {
+                Ok(spec) => spec,
+                Err(error) => {
+                    materialized.rollback();
+                    return Err(error);
+                }
+            };
             output.emit(
                 "test case add",
                 &spec.judging.tests,
@@ -1380,32 +1417,36 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                 &format!("Configured validator {source}"),
             )
         }
-        ValidatorCommand::UnitAdd {
-            name,
-            input,
-            expected,
-        } => {
-            let input = relative_string(&input)?;
-            let spec =
-                reporch_cli::local_project::update_authoring_spec(Path::new("."), |root, spec| {
-                    reporch_cli::local_project::declare_project_file(
-                        root,
-                        spec,
-                        &input,
-                        "text/plain",
-                        false,
-                    )?;
-                    spec.judging.validator_tests.push(ValidatorTestSpec {
-                        name: normalize_name(&name)?,
-                        input_file: input.clone(),
-                        expected_valid: matches!(expected, ValidityExpectation::Valid),
-                    });
-                    Ok(())
-                })?;
+        ValidatorCommand::UnitAdd(options) => {
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let materialized = materialize_validator_unit_input(&root, &options)?;
+            let input = materialized.path.clone();
+            let updated = reporch_cli::local_project::update_authoring_spec(&root, |root, spec| {
+                reporch_cli::local_project::declare_project_file(
+                    root,
+                    spec,
+                    &input,
+                    "text/plain",
+                    false,
+                )?;
+                spec.judging.validator_tests.push(ValidatorTestSpec {
+                    name: normalize_name(&options.name)?,
+                    input_file: input.clone(),
+                    expected_valid: matches!(options.expected, ValidityExpectation::Valid),
+                });
+                Ok(())
+            });
+            let spec = match updated {
+                Ok(spec) => spec,
+                Err(error) => {
+                    materialized.rollback();
+                    return Err(error);
+                }
+            };
             output.emit(
                 "validator unit-add",
                 &spec.judging.validator_tests,
-                &format!("Added validator unit {name}"),
+                &format!("Added validator unit {}", options.name),
             )
         }
         ValidatorCommand::Run { name, runtime } => {
@@ -1696,12 +1737,8 @@ pub fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
                 options.role.is_none(),
                 "solution roles require AuthoringSpecV2; run `reporch migrate --yes` first"
             );
-            let expected_score = match options.expected {
-                Some(expected) => {
-                    score_range(options.minimum_score, options.maximum_score, expected)?
-                }
-                None => None,
-            };
+            let score_was_supplied =
+                options.minimum_score.is_some() || options.maximum_score.is_some();
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -1710,10 +1747,18 @@ pub fn solution(options: SolutionOptions, output: &CliOutput) -> Result<()> {
                         .iter_mut()
                         .find(|solution| solution.name == options.name)
                         .context("solution was not found")?;
-                    if let Some(expected) = options.expected {
-                        solution.expected_verdict = expected.into();
-                        solution.expected_score = expected_score.clone();
+                    let expected_verdict = options
+                        .expected
+                        .map(Into::into)
+                        .unwrap_or(solution.expected_verdict);
+                    if options.expected.is_some() || score_was_supplied {
+                        solution.expected_score = score_range_for_verdict(
+                            options.minimum_score,
+                            options.maximum_score,
+                            expected_verdict,
+                        )?;
                     }
+                    solution.expected_verdict = expected_verdict;
                     Ok(())
                 },
             )?;
@@ -2170,13 +2215,31 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                 });
             }
             let report = OutputTestReport {
+                schema: "reporch.output-test-report.v1",
                 passed: reports.iter().all(|report| report.passed),
                 submissions: reports,
             };
-            ensure!(
-                report.passed,
-                "output validation did not pass: one or more submissions disagreed with the expected verdict"
-            );
+            if !report.passed {
+                let mismatches = report
+                    .submissions
+                    .iter()
+                    .filter(|submission| !submission.passed)
+                    .map(|submission| {
+                        format!(
+                            "{}: expected {}, actual {}, score {}",
+                            submission.name,
+                            submission.expected,
+                            submission.actual,
+                            submission.score
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(crate::cli_output::detailed_error(
+                    format!("output validation did not pass: {mismatches}"),
+                    &report,
+                ));
+            }
             output.emit(
                 "output test",
                 &report,
@@ -2188,8 +2251,115 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
 
 #[derive(Debug, Serialize)]
 struct OutputTestReport {
+    schema: &'static str,
     passed: bool,
     submissions: Vec<OutputSubmissionResult>,
+}
+
+struct MaterializedManualCase {
+    input: String,
+    answer: Option<String>,
+    created: Vec<PathBuf>,
+}
+
+struct MaterializedValidatorInput {
+    path: String,
+    created: Option<PathBuf>,
+}
+
+impl MaterializedValidatorInput {
+    fn rollback(&self) {
+        if let Some(path) = &self.created {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn materialize_validator_unit_input(
+    root: &Path,
+    options: &ValidatorUnitAddOptions,
+) -> Result<MaterializedValidatorInput> {
+    if let Some(path) = &options.input {
+        return Ok(MaterializedValidatorInput {
+            path: relative_string(path)?,
+            created: None,
+        });
+    }
+    let path = format!("validator-tests/{}.in", Uuid::now_v7());
+    write_project_bytes_atomic(
+        root,
+        &path,
+        options
+            .input_text
+            .as_deref()
+            .context("provide --input INPUT_FILE or --input-text TEXT")?
+            .as_bytes(),
+    )?;
+    Ok(MaterializedValidatorInput {
+        created: Some(root.join(&path)),
+        path,
+    })
+}
+
+impl MaterializedManualCase {
+    fn rollback(&self) {
+        for path in &self.created {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn materialize_manual_case_files(
+    root: &Path,
+    test_id: Uuid,
+    options: &TestCaseAddOptions,
+) -> Result<MaterializedManualCase> {
+    let mut created = Vec::new();
+    let input = if let Some(path) = &options.input {
+        relative_string(path)?
+    } else {
+        let path = format!("tests/manual/{test_id}.in");
+        write_project_bytes_atomic(
+            root,
+            &path,
+            options
+                .input_text
+                .as_deref()
+                .context("provide --input INPUT_FILE or --input-text TEXT")?
+                .as_bytes(),
+        )?;
+        created.push(root.join(&path));
+        path
+    };
+    let answer_result = if let Some(path) = &options.answer {
+        relative_string(path).map(Some)
+    } else if let Some(text) = &options.answer_text {
+        let path = format!("tests/manual/{test_id}.ans");
+        if let Err(error) = write_project_bytes_atomic(root, &path, text.as_bytes()) {
+            for created_path in &created {
+                let _ = fs::remove_file(created_path);
+            }
+            return Err(error);
+        }
+        created.push(root.join(&path));
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    };
+    let answer = match answer_result {
+        Ok(answer) => answer,
+        Err(error) => {
+            for created_path in &created {
+                let _ = fs::remove_file(created_path);
+            }
+            return Err(error);
+        }
+    };
+    Ok(MaterializedManualCase {
+        input,
+        answer,
+        created,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -2612,7 +2782,15 @@ fn score_range(
     maximum: Option<f64>,
     verdict: Verdict,
 ) -> Result<Option<ExpectedScoreRange>> {
-    if !matches!(verdict, Verdict::Partial) {
+    score_range_for_verdict(minimum, maximum, verdict.into())
+}
+
+fn score_range_for_verdict(
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+    verdict: ExpectedVerdict,
+) -> Result<Option<ExpectedScoreRange>> {
+    if verdict != ExpectedVerdict::Partial {
         ensure!(
             minimum.is_none() && maximum.is_none(),
             "score range is only valid for partial solutions"

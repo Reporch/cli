@@ -32,14 +32,25 @@ checksum before extraction, then place `reporch` (or `reporch.exe`) on your
 ## Start a problem
 
 ```bash
-reporch auth login
-reporch project create --title "My problem" --directory ./my-problem
+reporch new --title "My problem" --directory ./my-problem
 cd my-problem
 # Edit the generated statements/ko.md and solutions/accepted.* starter files.
-reporch test                         # interactive, line-oriented guide
-reporch check                        # static and completely offline
-reporch submit                       # push, Studio verification, review request
+reporch test                                      # interactive, line-oriented guide
+reporch test case add --name edge \
+  --input-text "0 0" --answer-text "0"            # literal text, no files to prepare
+reporch check                                     # static and completely offline
+reporch auth login
+reporch project create --title "My problem"       # copy the returned project ID
+reporch project link --project-id <PROJECT_ID>
+reporch project push
+reporch verify
+reporch review submit
 ```
+
+`reporch --help` prints this complete quick start, and `reporch new` is the
+short form of `reporch project init`. File options are labeled explicitly as
+`INPUT_FILE`, `ANSWER_FILE`, and `SOURCE_FILE`; literal manual tests use
+`--input-text` and `--answer-text`.
 
 `reporch.yaml` is the human-editable source. `reporch.problem.json` is generated
 only after the server has assigned the immutable commit ID and bound every file
@@ -71,7 +82,9 @@ reporch --format json --no-input review submit
 ```
 
 Every JSON result uses `reporch.cli-result.v1`; every JSON error uses
-`reporch.cli-error.v1`. Stable exit codes distinguish domain failure (`1`),
+`reporch.cli-error.v1`. Errors may include a structured `details` object, such
+as a compatibility report or output-only verdict matrix, so CI never needs to
+parse JSON embedded inside `message`. Stable exit codes distinguish domain failure (`1`),
 invalid input (`2`), revision conflict (`3`), authentication (`4`), policy or
 quota denial (`5`), retryable infrastructure failure (`6`), and cancellation
 (`7`).
@@ -142,6 +155,22 @@ paths. It is an expectation summary, not execution evidence. `output remove`
 prunes declarations used only by the removed mapping but deliberately leaves
 the files on disk so cleanup remains recoverable.
 
+Validator unit inputs support the same unambiguous file-or-text split as manual
+tests:
+
+```bash
+reporch validator unit-add --name minimum-valid \
+  --input-text "1" --expected valid
+```
+
+Scored group creation uses a human-readable positional `NAME`. A partial
+solution's range can be updated without repeating its existing verdict:
+
+```bash
+reporch test group add full-score --points 100
+reporch solution update partial-50 --minimum-score 40 --maximum-score 70
+```
+
 ## Migrate an existing checkout
 
 ```bash
@@ -156,7 +185,7 @@ meaning and file hashes. The backup is never overwritten.
 ## Package compatibility
 
 ```bash
-reporch manifest compatibility --profile icpc202509 --strict
+reporch manifest compatibility --profile icpc202509 --require-exportable
 
 reporch package export reporch.yaml problem.zip \
   --profile domjudge-zip
@@ -164,6 +193,17 @@ reporch package export reporch.yaml problem.zip \
 reporch package import polygon-package.zip ./imported \
   --profile polygon-compatible
 ```
+
+Without `--profile`, compatibility and export use the `package_profile` in the
+current authoring file. Without `--source-root`, export uses the manifest's
+directory, including the common `reporch.yaml` path in the current directory.
+CLI profile names use hyphens, while underscore aliases such as
+`polygon_compatible` remain accepted for scripts that copy YAML enum values.
+Compatibility inspection returns exit 0 even when lossy or blocked;
+`--require-exportable` turns a blocked result into exit 1 with the full report
+in `details`. Existing package destinations are never replaced. The error
+includes the current manifest digest and explicitly warns when the old artifact
+may be stale.
 
 Run `reporch <command> --help` for every option. `reporch.yaml` is the source of
 truth, and compatibility/package export commands compile it in memory without
