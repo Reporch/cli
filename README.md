@@ -35,11 +35,9 @@ checksum before extraction, then place `reporch` (or `reporch.exe`) on your
 reporch auth login
 reporch project create --title "My problem" --directory ./my-problem
 cd my-problem
-reporch statement add --locale ko --path statement.md --title "My problem"
+# Edit the generated statements/ko.md and solutions/accepted.* starter files.
 reporch test                         # interactive, line-oriented guide
-reporch solution add --name reference --source solutions/reference.cpp \
-  --language cpp --expected accepted
-reporch check                        # completely offline
+reporch check                        # static and completely offline
 reporch submit                       # push, Studio verification, review request
 ```
 
@@ -47,6 +45,21 @@ reporch submit                       # push, Studio verification, review request
 only after the server has assigned the immutable commit ID and bound every file
 hash. UUIDs, SHA-256 values, and manifest internals never need to be entered by
 the author.
+
+`reporch check` validates the schema, paths, references, files, scoring groups,
+and solution roles. It never executes solutions, generators, validators, or
+checkers, and reports those unexecuted counts in both human and JSON output.
+Run `reporch verify` after linking and pushing for official Studio execution
+evidence. Component-specific local commands remain optional preflight checks.
+
+Every non-output-only problem has exactly one accepted `reference` solution.
+The starter already provides it. To replace it explicitly:
+
+```bash
+reporch solution update accepted --role alternative
+reporch solution add --name my-reference --source solutions/my-reference.cpp \
+  --language cpp --expected accepted --role reference
+```
 
 The same flow is deterministic in CI:
 

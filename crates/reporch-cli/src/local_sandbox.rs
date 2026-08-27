@@ -230,7 +230,9 @@ async fn resolve_runtime(runtime: OciRuntime) -> Result<String> {
             }
         }
     }
-    .context("no requested OCI runtime is available")
+    .context(
+        "no requested OCI runtime is available; install and start rootless Podman (recommended) or rootless Docker, or run `reporch verify` for official Studio verification",
+    )
 }
 
 pub async fn resolve_secure_runtime(runtime: OciRuntime) -> Result<String> {
@@ -267,7 +269,9 @@ async fn require_rootless(runtime: &str) -> Result<()> {
         bail!("unsupported OCI runtime");
     };
     if !output.status.success() {
-        bail!("OCI runtime security inspection failed");
+        bail!(
+            "OCI runtime security inspection failed; start the rootless {runtime} daemon and retry, or run `reporch verify` for official Studio verification"
+        );
     }
     let rootless = if runtime == "podman" {
         let value: serde_json::Value =
@@ -282,7 +286,9 @@ async fn require_rootless(runtime: &str) -> Result<()> {
         options.iter().any(|option| option.contains("rootless"))
     };
     if !rootless {
-        bail!("local sandbox requires a rootless Podman or Docker daemon");
+        bail!(
+            "local sandbox requires a rootless Podman or Docker daemon; configure rootless mode and restart {runtime}, or run `reporch verify` for official Studio verification"
+        );
     }
     Ok(())
 }
