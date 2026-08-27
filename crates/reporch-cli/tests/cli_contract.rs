@@ -82,10 +82,46 @@ fn help_is_successful_and_never_emits_an_error_envelope() {
 }
 
 #[test]
+fn top_level_help_exposes_a_copyable_quick_start_and_new_command() {
+    let output = reporch().arg("--help").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "new",
+        "Quick start:",
+        "reporch new --title \"A + B\" --directory a-b",
+        "reporch auth login",
+        "reporch project push",
+        "reporch verify",
+    ] {
+        assert!(help.contains(expected), "missing {expected:?}:\n{help}");
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    let created = reporch()
+        .args([
+            "--format",
+            "json",
+            "new",
+            "--title",
+            "Top-level starter",
+            "--directory",
+            project.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    let envelope: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(envelope["command"], "new");
+    assert!(project.path().join("reporch.yaml").is_file());
+}
+
+#[test]
 fn the_documented_1_x_command_surface_cannot_be_removed_accidentally() {
     assert_help_commands(
         &[],
         &[
+            "new",
             "migrate",
             "check",
             "statement",

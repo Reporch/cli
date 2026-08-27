@@ -754,19 +754,54 @@ pub fn parse_versioned_authoring_spec(
 ) -> Result<VersionedAuthoringSpec, AuthoringSpecError> {
     let text = checked_yaml_text(bytes)?;
     let header: AuthoringSchemaHeader = serde_yaml_ng::from_str(text)?;
+    let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(text)?;
+    let fields = document.as_mapping().ok_or_else(|| {
+        AuthoringSpecError::YamlShape("the document root must be a mapping".into())
+    })?;
     match header.schema.as_str() {
         AUTHORING_SPEC_SCHEMA_V1 => {
+            reject_schema_fields(
+                fields,
+                AUTHORING_SPEC_SCHEMA_V1,
+                AUTHORING_SPEC_SCHEMA_V2,
+                &["tutorials", "testing", "execution"],
+            )?;
             let spec: AuthoringSpecV1 = serde_yaml_ng::from_str(text)?;
             spec.validate_references()?;
             Ok(VersionedAuthoringSpec::V1(Box::new(spec)))
         }
         AUTHORING_SPEC_SCHEMA_V2 => {
+            reject_schema_fields(
+                fields,
+                AUTHORING_SPEC_SCHEMA_V2,
+                AUTHORING_SPEC_SCHEMA_V1,
+                &["judging", "solutions"],
+            )?;
             let spec: AuthoringSpecV2 = serde_yaml_ng::from_str(text)?;
             spec.validate_references()?;
             Ok(VersionedAuthoringSpec::V2(Box::new(spec)))
         }
         _ => Err(AuthoringSpecError::UnsupportedSchema(header.schema)),
     }
+}
+
+fn reject_schema_fields(
+    fields: &serde_yaml_ng::Mapping,
+    declared_schema: &str,
+    other_schema: &str,
+    other_fields: &[&str],
+) -> Result<(), AuthoringSpecError> {
+    if let Some(field) = other_fields
+        .iter()
+        .find(|field| fields.contains_key(serde_yaml_ng::Value::String((**field).to_owned())))
+    {
+        return Err(AuthoringSpecError::SchemaFieldMismatch {
+            declared_schema: declared_schema.into(),
+            field: (*field).into(),
+            expected_schema: other_schema.into(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1034,8 +1069,18 @@ pub enum AuthoringSpecError {
     MultipleDocuments,
     #[error("authoring spec is empty")]
     EmptyDocument,
+    #[error("invalid YAML shape: {0}")]
+    YamlShape(String),
     #[error("unsupported authoring schema: {0}")]
     UnsupportedSchema(String),
+    #[error(
+        "field {field:?} does not belong to declared schema {declared_schema}; use schema {expected_schema} or remove fields from the other schema"
+    )]
+    SchemaFieldMismatch {
+        declared_schema: String,
+        field: String,
+        expected_schema: String,
+    },
     #[error("duplicate or Unicode-colliding path: {0}")]
     DuplicatePath(String),
     #[error("materialized file inventory does not match reporch.yaml")]
@@ -1177,6 +1222,32 @@ mod tests {
             parse_versioned_authoring_spec(&bytes).unwrap(),
             VersionedAuthoringSpec::V1(_)
         ));
+    }
+
+    #[test]
+    fn versioned_parser_reports_schema_field_mismatches_before_generic_unknown_fields() {
+        let bytes = to_authoring_yaml_v2(&minimal_spec_v2()).unwrap();
+        let text = String::from_utf8(bytes).unwrap().replacen(
+            AUTHORING_SPEC_SCHEMA_V2,
+            AUTHORING_SPEC_SCHEMA_V1,
+            1,
+        );
+        let error = parse_versioned_authoring_spec(text.as_bytes()).unwrap_err();
+        assert!(matches!(
+            &error,
+            AuthoringSpecError::SchemaFieldMismatch {
+                declared_schema,
+                field,
+                expected_schema,
+            } if declared_schema == AUTHORING_SPEC_SCHEMA_V1
+                && field == "tutorials"
+                && expected_schema == AUTHORING_SPEC_SCHEMA_V2
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to declared schema")
+        );
     }
 
     #[test]

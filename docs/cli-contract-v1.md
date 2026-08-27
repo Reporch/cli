@@ -33,7 +33,7 @@ connection metadata and never tokens.
 
 The 1.x command families are:
 
-- `migrate`, `check`, `doctor`, `completion`, `verify`, `submit`, and the
+- `new`, `migrate`, `check`, `doctor`, `completion`, `verify`, `submit`, and the
   `publish` shorthand;
 - `auth login|status|logout`;
 - `project init|create|link|list|show|status|diff|pull|push|open|validate|package`;
@@ -56,6 +56,19 @@ human output.
 
 `manifest validate`, `manifest digest`, and `manifest compatibility` default to
 the current project's `reporch.yaml`; an explicit path remains supported.
+`manifest compatibility` and `package export` default to the manifest's
+`package_profile`; export defaults its source root to the manifest directory.
+`--require-exportable` (with `--strict` retained as an alias) exits 1 for a
+blocked projection, while inspection without it remains a successful query.
+Hyphenated package-profile names are canonical CLI spelling and underscore
+spellings are accepted aliases. `test case add --input` and `--answer` always
+mean files; `--input-text` and `--answer-text` create collision-resistant files
+inside the project and roll them back if the manifest edit fails. Validator
+unit inputs use the same `--input INPUT_FILE` or `--input-text TEXT` contract.
+`test group add` names its positional value `NAME`; generated UUIDs remain an
+internal V2 identity. Supplying `--minimum-score` and `--maximum-score` to
+`solution update` updates an existing partial verdict range even when
+`--expected partial` is omitted.
 Interactive and grader runtime commands accept a solution name, UUID, or source
 path and a test name, UUID, or input path. These readable selectors are aliases
 for the same stable project entities and do not change JSON result fields.
@@ -81,12 +94,15 @@ JSON errors are written to stderr and stdout remains empty:
   "error_code": "working_copy.revision_conflict",
   "message": "...",
   "retryable": false,
-  "trace_id": "019..."
+  "trace_id": "019...",
+  "details": {}
 }
 ```
 
 Consumers must ignore unknown object fields. Existing fields retain their type
-and meaning in 1.x. Unbounded event streams require `--format jsonl`; every line
+and meaning in 1.x. `details` is optional and contains a command-specific,
+schema-tagged object when machine-readable recovery or evidence is available;
+`message` remains human-readable. Unbounded event streams require `--format jsonl`; every line
 is one complete `reporch.cli-result.v1` envelope. `--format json` is accepted
 only when a command has a finite response or an explicit finite event bound.
 
