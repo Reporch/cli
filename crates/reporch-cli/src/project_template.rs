@@ -1688,11 +1688,14 @@ fn rollback_template_transaction(
 fn sync_capability_directory(root: &cap_std::fs::Dir, parent: Option<&Path>) -> Result<()> {
     #[cfg(unix)]
     {
-        let directory = match parent {
-            Some(parent) => root.open_dir(parent)?,
-            None => root.try_clone()?,
-        };
-        directory.into_std_file().sync_all()?;
+        // `cap_std::fs::Dir` may hold an `O_PATH` descriptor on Linux. Such a
+        // descriptor is capability-safe but `fsync` returns EBADF, so reopen
+        // the already-bounded directory read-only before asking the kernel to
+        // persist its entries.
+        let path = parent.unwrap_or_else(|| Path::new("."));
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        root.open_with(path, &options)?.sync_all()?;
     }
     #[cfg(not(unix))]
     let _ = (root, parent);
