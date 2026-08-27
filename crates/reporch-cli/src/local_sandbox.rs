@@ -281,9 +281,7 @@ async fn require_rootless(runtime: &str) -> Result<()> {
             .and_then(serde_json::Value::as_bool)
             == Some(true)
     } else {
-        let options: Vec<String> =
-            serde_json::from_slice(&output.stdout).context("parse Docker security options")?;
-        options.iter().any(|option| option.contains("rootless"))
+        docker_security_options_are_rootless(&output.stdout)?
     };
     if !rootless {
         bail!(
@@ -291,6 +289,18 @@ async fn require_rootless(runtime: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn docker_security_options_are_rootless(bytes: &[u8]) -> Result<bool> {
+    // Docker Desktop can report JSON `null` while its daemon is unavailable.
+    // Treat that as an inspected-but-not-rootless runtime so callers receive
+    // the actionable rootless guidance instead of an incidental parse error.
+    let options: Option<Vec<String>> =
+        serde_json::from_slice(bytes).context("parse Docker security options")?;
+    Ok(options
+        .unwrap_or_default()
+        .iter()
+        .any(|option| option.contains("rootless")))
 }
 
 pub(crate) async fn read_bounded(
@@ -349,6 +359,13 @@ mod tests {
         ] {
             assert!(validate_image(image).is_err(), "accepted {image}");
         }
+    }
+
+    #[test]
+    fn docker_security_options_treat_null_as_not_rootless() {
+        assert!(!docker_security_options_are_rootless(b"null").unwrap());
+        assert!(docker_security_options_are_rootless(br#"["name=rootless"]"#).unwrap());
+        assert!(docker_security_options_are_rootless(br#"{}"#).is_err());
     }
 
     #[test]
