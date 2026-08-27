@@ -1262,11 +1262,52 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
 fn emit_solutions(command: &'static str, output: &CliOutput) -> Result<()> {
     let root = reporch_cli::local_project::discover_project(Path::new("."))?;
     let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
-    output.emit(
-        command,
-        &spec.testing.solutions,
-        &format!("{} solution expectation(s)", spec.testing.solutions.len()),
-    )
+    let human = if command == "solution matrix" {
+        solution_matrix_human(&spec.testing.solutions)
+    } else {
+        format!("{} solution expectation(s)", spec.testing.solutions.len())
+    };
+    output.emit(command, &spec.testing.solutions, &human)
+}
+
+fn solution_matrix_human(solutions: &[SolutionSpecV2]) -> String {
+    let mut lines = vec![format!("{} solution expectation(s):", solutions.len())];
+    lines.extend(solutions.iter().map(|solution| {
+        let score = solution
+            .expected_score
+            .as_ref()
+            .map(|range| format!(" · score {}..{}", range.minimum, range.maximum))
+            .unwrap_or_default();
+        let groups = if solution.group_expectations.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · {} group expectation(s)",
+                solution.group_expectations.len()
+            )
+        };
+        format!(
+            "- {} · role {} · {}{}{} · {}",
+            human_safe(&solution.program.name),
+            solution_role_name(solution.role),
+            verdict_name(solution.expected_verdict),
+            score,
+            groups,
+            human_safe(&solution.program.source_path)
+        )
+    }));
+    lines.push("This lists expectations only; run `reporch verify` for execution evidence.".into());
+    lines.join("\n")
+}
+
+fn solution_role_name(role: SolutionRoleV2) -> &'static str {
+    match role {
+        SolutionRoleV2::Reference => "reference",
+        SolutionRoleV2::Alternative => "alternative",
+        SolutionRoleV2::Oracle => "oracle",
+        SolutionRoleV2::Brute => "brute",
+        SolutionRoleV2::KnownWrong => "known-wrong",
+    }
 }
 
 fn validate_solution_role(
@@ -1951,13 +1992,8 @@ async fn run_interactor(
         .interactive
         .as_ref()
         .context("no interactor is configured")?;
-    let solution = find_solution(&spec, &options.solution)?;
-    let test = spec
-        .testing
-        .tests
-        .iter()
-        .find(|test| test.id == options.test)
-        .with_context(|| format!("test case was not found: {}", options.test))?;
+    let solution = find_runtime_solution(&spec, &options.solution)?;
+    let test = find_test(&spec, &options.test)?;
     let run_options = options.runtime.into_run_options();
     let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
         run_options.toolchain_id.as_deref(),
@@ -2284,7 +2320,7 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         .harness
         .as_ref()
         .context("no grader is configured")?;
-    let solution = find_solution(&spec, &options.solution)?;
+    let solution = find_runtime_solution(&spec, &options.solution)?;
     let profile = harness
         .profiles
         .get(&solution.program.language)
@@ -2296,12 +2332,7 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
                 .language,
         "local grader linking requires the solution and grader to use the same C or C++ toolchain"
     );
-    let test = spec
-        .testing
-        .tests
-        .iter()
-        .find(|test| test.id == options.test)
-        .with_context(|| format!("test case was not found: {}", options.test))?;
+    let test = find_test(&spec, &options.test)?;
     let answer_path = test
         .answer_file
         .as_deref()
@@ -2433,9 +2464,16 @@ pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput
             )
         }
         OutputCommand::Remove { name } => {
+            let mut pruned = 0_usize;
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
+                    let removed_paths = spec
+                        .output_submissions
+                        .iter()
+                        .filter(|submission| submission.name == name)
+                        .flat_map(|submission| submission.outputs.values().cloned())
+                        .collect::<Vec<_>>();
                     let before = spec.output_submissions.len();
                     spec.output_submissions
                         .retain(|submission| submission.name != name);
@@ -2443,13 +2481,16 @@ pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput
                         before != spec.output_submissions.len(),
                         "output submission was not found"
                     );
+                    pruned = prune_output_file_declarations(spec, &removed_paths);
                     Ok(())
                 },
             )?;
             output.emit(
                 "output remove",
                 &spec.output_submissions,
-                &format!("Removed output submission {name}"),
+                &format!(
+                    "Removed output submission {name}. Pruned {pruned} unused file declaration(s); files remain on disk."
+                ),
             )
         }
         OutputCommand::Test { name, runtime } => {
@@ -2661,10 +2702,91 @@ fn find_solution<'a>(
     spec: &'a reporch_format::AuthoringSpecV2,
     value: &str,
 ) -> Result<&'a SolutionSpecV2> {
+    find_solution_with_mode(spec, value, false)
+}
+
+fn find_runtime_solution<'a>(
+    spec: &'a reporch_format::AuthoringSpecV2,
+    value: &str,
+) -> Result<&'a SolutionSpecV2> {
+    find_solution_with_mode(spec, value, true)
+}
+
+fn find_solution_with_mode<'a>(
+    spec: &'a reporch_format::AuthoringSpecV2,
+    value: &str,
+    include_source_path: bool,
+) -> Result<&'a SolutionSpecV2> {
     let parsed = Uuid::parse_str(value).ok();
-    spec.testing
+    let matches = spec
+        .testing
         .solutions
         .iter()
-        .find(|solution| solution.program.name == value || parsed == Some(solution.program.id))
-        .with_context(|| format!("solution was not found: {value}"))
+        .filter(|solution| {
+            solution.program.name == value
+                || (include_source_path && solution.program.source_path == value)
+                || parsed == Some(solution.program.id)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() <= 1,
+        "ambiguous solution selector {value:?}; use the exact UUID from `reporch solution list`"
+    );
+    matches.into_iter().next().with_context(|| {
+        if include_source_path {
+            format!(
+                "solution was not found: {value}; use a solution name, UUID, or source path from `reporch solution list`"
+            )
+        } else {
+            format!(
+                "solution was not found: {value}; use a solution name or UUID from `reporch solution list`"
+            )
+        }
+    })
+}
+
+fn find_test<'a>(
+    spec: &'a reporch_format::AuthoringSpecV2,
+    value: &str,
+) -> Result<&'a TestCaseSpecV2> {
+    let parsed = Uuid::parse_str(value).ok();
+    let matches = spec
+        .testing
+        .tests
+        .iter()
+        .filter(|test| parsed == Some(test.id) || test.name == value || test.input_file == value)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() <= 1,
+        "ambiguous test selector {value:?}; use the exact UUID from `reporch test case list`"
+    );
+    matches.into_iter().next().with_context(|| {
+            format!(
+                "test case was not found: {value}; use a test name, UUID, or input path from `reporch test case list`"
+            )
+        })
+}
+
+fn prune_output_file_declarations(
+    spec: &mut reporch_format::AuthoringSpecV2,
+    removed_paths: &[String],
+) -> usize {
+    let mut pruned = 0;
+    for path in removed_paths {
+        if spec
+            .output_submissions
+            .iter()
+            .any(|submission| submission.outputs.values().any(|value| value == path))
+        {
+            continue;
+        }
+        let mut candidate = spec.clone();
+        let before = candidate.files.len();
+        candidate.files.retain(|file| file.path != *path);
+        if before != candidate.files.len() && candidate.validate_references().is_ok() {
+            *spec = candidate;
+            pruned += 1;
+        }
+    }
+    pruned
 }

@@ -54,6 +54,12 @@ The regression suite asserts that these commands remain reachable. Deprecated
 pre-1.0 aliases remain supported throughout 1.x and may print a warning only in
 human output.
 
+`manifest validate`, `manifest digest`, and `manifest compatibility` default to
+the current project's `reporch.yaml`; an explicit path remains supported.
+Interactive and grader runtime commands accept a solution name, UUID, or source
+path and a test name, UUID, or input path. These readable selectors are aliases
+for the same stable project entities and do not change JSON result fields.
+
 ## JSON success and error envelopes
 
 One-shot JSON success is written to stdout:
@@ -106,4 +112,15 @@ Server `error_code` and `trace_id` values are preserved when available.
 tokens, is replaceable from server state, and is written with private
 permissions. OAuth refresh credentials are stored only in the operating system
 credential store. Downloads and revision restores never overwrite existing
-files. Local execution is opt-in and cannot create official release evidence.
+files. `project init --allow-non-empty` is an explicit opt-in that preflights
+every generated path, rejects stale local project state, and refuses collisions
+or symlinked parents before a capability-scoped, rollback-safe write transaction.
+The transaction journal and every staged file are durable before generated files
+are published. A later `project init` removes only reserved staging paths if
+commit never began; once any final path was published, it completes the commit
+only after bounded digest and V1/V2 semantic validation. It never deletes a
+user-visible final path during crash recovery, and changed files fail closed.
+Removing an output submission may prune declarations that are no longer
+referenced, but never deletes the corresponding local files. Local author-code
+execution is opt-in, requires a rootless OCI runtime, never falls back to direct
+host execution, and cannot create official release evidence.

@@ -1,6 +1,6 @@
 [package]
 name = "reporch-cli"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+cap-std.workspace = true
+cap-primitives.workspace = true
 chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
@@ -28,6 +30,7 @@ quick-xml.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 reporch-format = { path = "../reporch-format" }
+rustix.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 serde_yaml_ng.workspace = true

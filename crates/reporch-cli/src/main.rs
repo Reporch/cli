@@ -343,6 +343,9 @@ enum ProjectCommand {
         title: String,
         #[arg(long, default_value = ".")]
         directory: PathBuf,
+        /// Initialize alongside unrelated existing files after checking every generated path for collisions.
+        #[arg(long)]
+        allow_non_empty: bool,
         #[arg(long, value_enum, default_value_t = studio_remote::RemoteProblemType::Standard)]
         problem_type: studio_remote::RemoteProblemType,
         /// Bind the local manifest to an existing private Studio project.
@@ -481,13 +484,19 @@ enum RevisionCommand {
 #[derive(Debug, Subcommand)]
 enum ManifestCommand {
     Validate {
-        path: PathBuf,
+        /// Immutable manifest or authoring YAML. When omitted, discovers the current project's reporch.yaml.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
     },
     Digest {
-        path: PathBuf,
+        /// Immutable manifest or authoring YAML. When omitted, discovers the current project's reporch.yaml.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
     },
     Compatibility {
-        path: PathBuf,
+        /// Immutable manifest or authoring YAML. When omitted, discovers the current project's reporch.yaml.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
         #[arg(long)]
         strict: bool,
     },
@@ -672,23 +681,29 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             ProjectCommand::Init {
                 title,
                 directory,
+                allow_non_empty,
                 problem_type,
                 project_id,
             } => {
-                let project_id = project_id.unwrap_or_else(Uuid::now_v7);
-                reporch_cli::init_project_template(
+                reporch_cli::init_project_template_with_optional_id(
                     &directory,
                     &title,
                     project_id,
                     problem_type.into(),
+                    allow_non_empty,
                 )?;
                 let status = local_project_status(&directory)?;
+                let existing_directory_note = if allow_non_empty {
+                    "\nExisting unrelated files were preserved; every generated path was collision-checked before writing."
+                } else {
+                    ""
+                };
                 output.emit(
                     "project init",
                     &status,
                     &format!(
-                        "Initialized {}\nStarter includes: a statement, sample tests, and problem-type examples (accepted/reference and known-wrong when applicable).\nEdit the existing starter files before adding replacements.\nNext: run `reporch check`, then `reporch verify` for official execution evidence.",
-                        status.root.display()
+                        "Initialized {}{existing_directory_note}\nStarter includes: a statement, sample tests, and problem-type examples (accepted/reference and known-wrong when applicable).\nEdit the existing starter files before adding replacements.\nNext: run `reporch check`, then `reporch verify` for official execution evidence.",
+                        status.root.display(),
                     ),
                 )
             }
@@ -1183,10 +1198,14 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
         },
         Command::Manifest { command } => match command {
-            ManifestCommand::Validate { path } => validate(&path, false, output),
-            ManifestCommand::Digest { path } => validate(&path, true, output),
+            ManifestCommand::Validate { path } => {
+                validate(&resolve_manifest_path(path)?, false, output)
+            }
+            ManifestCommand::Digest { path } => {
+                validate(&resolve_manifest_path(path)?, true, output)
+            }
             ManifestCommand::Compatibility { path, strict } => compatibility(
-                &path,
+                &resolve_manifest_path(path)?,
                 required_package_profile(package_profile)?,
                 strict,
                 output,
@@ -2095,6 +2114,16 @@ fn read_versioned_manifest(path: &Path) -> Result<VersionedReleaseManifest> {
 fn read_manifest(path: &Path) -> Result<ReleaseManifestV1> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+fn resolve_manifest_path(path: Option<PathBuf>) -> Result<PathBuf> {
+    match path {
+        Some(path) => Ok(path),
+        None => Ok(
+            reporch_cli::local_project::discover_project(Path::new("."))?
+                .join(reporch_cli::local_project::AUTHORING_FILE_NAME),
+        ),
+    }
 }
 
 fn validate(path: &Path, print_digest: bool, output: &CliOutput) -> Result<()> {

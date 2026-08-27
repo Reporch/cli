@@ -231,7 +231,7 @@ async fn resolve_runtime(runtime: OciRuntime) -> Result<String> {
         }
     }
     .context(
-        "no requested OCI runtime is available; install and start rootless Podman (recommended) or rootless Docker, or run `reporch verify` for official Studio verification",
+        "no requested OCI runtime is available; install and start rootless Podman (recommended; on macOS run `podman machine init` then `podman machine start`) or rootless Docker. Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification",
     )
 }
 
@@ -270,7 +270,7 @@ async fn require_rootless(runtime: &str) -> Result<()> {
     };
     if !output.status.success() {
         bail!(
-            "OCI runtime security inspection failed; start the rootless {runtime} daemon and retry, or run `reporch verify` for official Studio verification"
+            "OCI runtime security inspection failed; start the rootless {runtime} daemon and retry. Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification"
         );
     }
     let rootless = if runtime == "podman" {
@@ -281,16 +281,26 @@ async fn require_rootless(runtime: &str) -> Result<()> {
             .and_then(serde_json::Value::as_bool)
             == Some(true)
     } else {
-        let options: Vec<String> =
-            serde_json::from_slice(&output.stdout).context("parse Docker security options")?;
-        options.iter().any(|option| option.contains("rootless"))
+        docker_security_options_are_rootless(&output.stdout)?
     };
     if !rootless {
         bail!(
-            "local sandbox requires a rootless Podman or Docker daemon; configure rootless mode and restart {runtime}, or run `reporch verify` for official Studio verification"
+            "local sandbox requires a rootless Podman or Docker daemon; configure rootless mode and restart {runtime} (on macOS, rootless Podman is recommended: run `podman machine init` then `podman machine start`). Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification"
         );
     }
     Ok(())
+}
+
+fn docker_security_options_are_rootless(bytes: &[u8]) -> Result<bool> {
+    // Docker Desktop can report JSON `null` while its daemon is unavailable.
+    // Treat that as an inspected-but-not-rootless runtime so callers receive
+    // the actionable rootless guidance instead of an incidental parse error.
+    let options: Option<Vec<String>> =
+        serde_json::from_slice(bytes).context("parse Docker security options")?;
+    Ok(options
+        .unwrap_or_default()
+        .iter()
+        .any(|option| option.contains("rootless")))
 }
 
 pub(crate) async fn read_bounded(
@@ -349,6 +359,13 @@ mod tests {
         ] {
             assert!(validate_image(image).is_err(), "accepted {image}");
         }
+    }
+
+    #[test]
+    fn docker_security_options_treat_null_as_not_rootless() {
+        assert!(!docker_security_options_are_rootless(b"null").unwrap());
+        assert!(docker_security_options_are_rootless(br#"["name=rootless"]"#).unwrap());
+        assert!(docker_security_options_are_rootless(br#"{}"#).is_err());
     }
 
     #[test]

@@ -112,12 +112,35 @@ reporch project init \
   --directory ./my-problem
 ```
 
+The target directory is empty by default. To initialize inside an existing
+checkout, opt in with `--allow-non-empty`; Reporch checks every generated path
+before writing, refuses collisions or stale `.reporch/state.json`, and writes
+through a capability-scoped transaction. Before commit begins, a failure removes
+only Reporch's reserved staging paths. After any generated file is published, a
+durable journal preserves the transaction so the next identical `project init`
+can validate and finish it. Unrelated files and pre-existing directories are
+preserved, and a generated file changed after an interruption is never deleted
+automatically.
+
 The available problem types are `standard`, `scored`, `interactive`,
 `output-only`, `library`, and `grader`. Authoring commands cover statements,
 manual tests and groups, deterministic generators, validator/checker unit
 cases, expected solution verdicts and score ranges, interactors, graders, and
 output-only mappings. Every edit validates and atomically replaces
 `reporch.yaml`.
+
+Runtime commands accept readable selectors. For example, both of these avoid
+copying internal UUIDs:
+
+```bash
+reporch interactor run --solution accepted --test sample-1
+reporch grader run --solution solutions/accepted.cpp --test tests/1.in
+```
+
+`solution matrix` prints roles, expected verdicts, score ranges, and source
+paths. It is an expectation summary, not execution evidence. `output remove`
+prunes declarations used only by the removed mapping but deliberately leaves
+the files on disk so cleanup remains recoverable.
 
 ## Migrate an existing checkout
 
@@ -133,8 +156,7 @@ meaning and file hashes. The backup is never overwritten.
 ## Package compatibility
 
 ```bash
-reporch manifest compatibility reporch.yaml \
-  --profile icpc202509 --strict
+reporch manifest compatibility --profile icpc202509 --strict
 
 reporch package export reporch.yaml problem.zip \
   --profile domjudge-zip
@@ -252,10 +274,25 @@ profiles never contain tokens.
 
 ## Local sandbox
 
-User code is never executed by the CLI unless you explicitly invoke
-`reporch sandbox run`. Local execution requires rootless Podman or rootless
-Docker, a digest-pinned image, disabled networking, a read-only project mount,
-and explicit resource limits.
+Commands that compile or execute author code, including `answer generate`,
+`generator run`, `validator run`, `interactor run`, and `grader run`, always use
+the same isolated local sandbox. They never fall back to direct host execution.
+Local execution requires rootless Podman or rootless Docker, a digest-pinned
+image, disabled networking, a read-only project mount, and explicit resource
+limits. Standard checker and output-only comparisons do not execute author
+code and can run without an OCI daemon.
+
+On macOS, the recommended setup is rootless Podman:
+
+```bash
+brew install podman
+podman machine init
+podman machine start
+reporch toolchain list
+```
+
+Toolchain installation remains explicit. If local isolation is unavailable,
+use `reporch verify` for official Studio execution evidence.
 
 ## Build from source
 
@@ -278,6 +315,13 @@ npm test
 `npm test` also verifies the checksum and required review-pool surface of the
 pinned Studio OpenAPI artifact. Contract drift therefore fails before a CLI
 release can be packaged.
+
+## Further documentation
+
+- [CLI 1.x automation contract](docs/cli-contract-v1.md)
+- [CLI 1.0 beta and stability gate](docs/1.0-beta.md)
+- [Toolchain index signing and key rotation](docs/toolchain-index.md)
+- [Security policy and private reporting](SECURITY.md)
 
 ## Release integrity
 
