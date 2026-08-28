@@ -2324,6 +2324,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "reporch-runtime-install-tree-builder"
+version = "1.0.0-rc.8"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "minisign-verify",
+ "reporch-runtime-core",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "reporch-runtime-protocol"
 version = "1.0.0-rc.8"
 dependencies = [

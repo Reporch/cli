@@ -100,6 +100,26 @@ async fn execute_request(request: &RuntimeServiceRequestV1) -> Result<RuntimeSer
         RuntimeServiceCommandV1::Ping => Ok(RuntimeServiceResultV1::Pong {
             service_version: env!("CARGO_PKG_VERSION").into(),
         }),
+        RuntimeServiceCommandV1::UpdateRuntime { force } => {
+            ensure_system_runtime_root()?;
+            let updated = reporch_runtime_host::update_direct_for_service(*force).await?;
+            Ok(RuntimeServiceResultV1::RuntimeUpdated {
+                previous_version: updated.previous_version,
+                installed_version: updated.installed_version,
+                sequence: updated.sequence,
+                target: reporch_runtime_host::target_name(updated.target).into(),
+                repaired: updated.repaired,
+            })
+        }
+        RuntimeServiceCommandV1::InstallToolchain { id } => {
+            ensure_system_runtime_root()?;
+            let installed = reporch_runtime_host::install_toolchain_direct(id).await?;
+            Ok(RuntimeServiceResultV1::ToolchainInstalled {
+                id: installed.installation.id,
+                index_sequence: installed.installation.index_sequence,
+                bundle_sha256: installed.installation.bundle_sha256,
+            })
+        }
         RuntimeServiceCommandV1::ValidateSpool { objects } => {
             let spool = reporch_runtime_host::service_spool_root()?;
             let objects = objects.clone();
@@ -115,6 +135,7 @@ async fn execute_request(request: &RuntimeServiceRequestV1) -> Result<RuntimeSer
             runtime_sequence,
             runtime_bundle_digest,
         } => {
+            ensure_system_runtime_root()?;
             let bundle = reporch_runtime_host::verified_bundle().await?;
             ensure!(
                 bundle.installation.sequence == *runtime_sequence
@@ -145,6 +166,16 @@ async fn execute_request(request: &RuntimeServiceRequestV1) -> Result<RuntimeSer
             })
         }
     }
+}
+
+fn ensure_system_runtime_root() -> Result<()> {
+    let program_data = std::env::var_os("PROGRAMDATA").context("PROGRAMDATA is required")?;
+    let expected = PathBuf::from(program_data).join("Reporch").join("Runtime");
+    ensure!(
+        reporch_runtime_host::runtime_root()? == expected,
+        "the privileged runtime broker must use the system-owned runtime root"
+    );
+    Ok(())
 }
 
 fn execute_hcs_job(

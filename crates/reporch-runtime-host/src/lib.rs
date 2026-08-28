@@ -34,6 +34,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
+#[cfg(any(target_os = "linux", windows))]
+use reporch_runtime_protocol::RuntimeServiceResponseV1;
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -51,6 +54,20 @@ pub fn runtime_root() -> Result<PathBuf> {
         let path = PathBuf::from(override_path);
         anyhow::ensure!(path.is_absolute(), "REPORCH_RUNTIME_HOME must be absolute");
         return Ok(path);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let system = PathBuf::from("/var/lib/reporch-runtime/runtime");
+        if system.join("current.json").is_file() {
+            return Ok(system);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(program_data) = std::env::var_os("PROGRAMDATA") {
+        let system = PathBuf::from(program_data).join("Reporch").join("Runtime");
+        if system.join("current.json").is_file() {
+            return Ok(system);
+        }
     }
     let path = if cfg!(target_os = "windows") {
         PathBuf::from(required_env("LOCALAPPDATA")?)
@@ -271,6 +288,16 @@ struct ToolchainIndexStateV2 {
 }
 
 pub async fn install_toolchain(id: &str) -> Result<VerifiedToolchainBundleV2> {
+    validate_toolchain_id(id)?;
+    #[cfg(any(target_os = "linux", windows))]
+    if probe_runtime_service().await {
+        request_service_toolchain_install(id).await?;
+        return verified_toolchain(id).await;
+    }
+    install_toolchain_direct(id).await
+}
+
+pub async fn install_toolchain_direct(id: &str) -> Result<VerifiedToolchainBundleV2> {
     validate_toolchain_id(id)?;
     let target = HostTarget::current()
         .ok_or_else(|| RuntimeError::VirtualizationUnavailable("unsupported host target".into()))?;
@@ -514,6 +541,116 @@ pub struct RuntimeSpoolReceiptV1 {
     pub reused_objects: u32,
 }
 
+#[cfg(any(target_os = "linux", windows))]
+async fn request_service_runtime_update(force: bool) -> Result<RuntimeUpdateV1> {
+    let request = RuntimeServiceRequestV1 {
+        schema: SERVICE_REQUEST_SCHEMA.into(),
+        protocol_version: PROTOCOL_VERSION,
+        id: Uuid::now_v7(),
+        command: RuntimeServiceCommandV1::UpdateRuntime { force },
+    };
+    let response = call_runtime_service(&request, DOWNLOAD_TOTAL_TIMEOUT).await?;
+    match response.result {
+        RuntimeServiceResultV1::RuntimeUpdated {
+            previous_version,
+            installed_version,
+            sequence,
+            target,
+            repaired,
+        } => {
+            let host_target = HostTarget::current().ok_or_else(|| {
+                RuntimeError::VirtualizationUnavailable("unsupported host target".into())
+            })?;
+            anyhow::ensure!(
+                target == target_name(host_target),
+                "runtime broker returned a different host target"
+            );
+            Ok(RuntimeUpdateV1 {
+                schema: "reporch.runtime-update.v1".into(),
+                previous_version,
+                installed_version,
+                sequence,
+                target: host_target,
+                repaired,
+            })
+        }
+        RuntimeServiceResultV1::Error(error) => Err(RuntimeError::AssetVerificationFailed(
+            format!("{}: {}", error.error_code, error.message),
+        )
+        .into()),
+        _ => Err(RuntimeError::ProtocolIncompatible.into()),
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+async fn request_service_toolchain_install(id: &str) -> Result<()> {
+    let request = RuntimeServiceRequestV1 {
+        schema: SERVICE_REQUEST_SCHEMA.into(),
+        protocol_version: PROTOCOL_VERSION,
+        id: Uuid::now_v7(),
+        command: RuntimeServiceCommandV1::InstallToolchain { id: id.into() },
+    };
+    let response = call_runtime_service(&request, DOWNLOAD_TOTAL_TIMEOUT).await?;
+    match response.result {
+        RuntimeServiceResultV1::ToolchainInstalled {
+            id: installed_id,
+            index_sequence,
+            bundle_sha256,
+        } => {
+            anyhow::ensure!(
+                installed_id == id && index_sequence > 0 && bundle_sha256.starts_with("sha256:"),
+                "runtime broker returned a different toolchain identity"
+            );
+            Ok(())
+        }
+        RuntimeServiceResultV1::Error(error) => Err(RuntimeError::AssetVerificationFailed(
+            format!("{}: {}", error.error_code, error.message),
+        )
+        .into()),
+        _ => Err(RuntimeError::ProtocolIncompatible.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn call_runtime_service(
+    request: &RuntimeServiceRequestV1,
+    timeout: Duration,
+) -> Result<RuntimeServiceResponseV1> {
+    request.validate()?;
+    let mut stream = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        tokio::net::UnixStream::connect(service_socket_path()?),
+    )
+    .await
+    .map_err(|_| RuntimeError::ServiceUnavailable("connection timed out".into()))?
+    .map_err(|error| RuntimeError::ServiceUnavailable(error.to_string()))?;
+    tokio::time::timeout(PROBE_TIMEOUT, write_service_request(&mut stream, request))
+        .await
+        .map_err(|_| RuntimeError::ServiceUnavailable("request timed out".into()))??;
+    let response = tokio::time::timeout(timeout, read_service_response(&mut stream))
+        .await
+        .map_err(|_| RuntimeError::ServiceUnavailable("response timed out".into()))??;
+    response.validate_for(request)?;
+    Ok(response)
+}
+
+#[cfg(windows)]
+async fn call_runtime_service(
+    request: &RuntimeServiceRequestV1,
+    timeout: Duration,
+) -> Result<RuntimeServiceResponseV1> {
+    request.validate()?;
+    let mut stream = connect_windows_service().await?;
+    tokio::time::timeout(PROBE_TIMEOUT, write_service_request(&mut stream, request))
+        .await
+        .map_err(|_| RuntimeError::ServiceUnavailable("request timed out".into()))??;
+    let response = tokio::time::timeout(timeout, read_service_response(&mut stream))
+        .await
+        .map_err(|_| RuntimeError::ServiceUnavailable("response timed out".into()))??;
+    response.validate_for(request)?;
+    Ok(response)
+}
+
 pub fn stage_job_inputs(project_root: &Path, job: &GuestJobV1) -> Result<RuntimeSpoolReceiptV1> {
     stage_job_inputs_at(project_root, job, &service_spool_root()?)
 }
@@ -651,7 +788,10 @@ pub async fn validate_spool_with_service(job: &GuestJobV1) -> Result<()> {
             format!("{}: {}", error.error_code, error.message),
         )
         .into()),
-        RuntimeServiceResultV1::Pong { .. } | RuntimeServiceResultV1::JobCompleted { .. } => {
+        RuntimeServiceResultV1::Pong { .. }
+        | RuntimeServiceResultV1::RuntimeUpdated { .. }
+        | RuntimeServiceResultV1::ToolchainInstalled { .. }
+        | RuntimeServiceResultV1::JobCompleted { .. } => {
             Err(RuntimeError::ProtocolIncompatible.into())
         }
     }
@@ -682,7 +822,10 @@ pub async fn validate_spool_with_service(job: &GuestJobV1) -> Result<()> {
             format!("{}: {}", error.error_code, error.message),
         )
         .into()),
-        RuntimeServiceResultV1::Pong { .. } | RuntimeServiceResultV1::JobCompleted { .. } => {
+        RuntimeServiceResultV1::Pong { .. }
+        | RuntimeServiceResultV1::RuntimeUpdated { .. }
+        | RuntimeServiceResultV1::ToolchainInstalled { .. }
+        | RuntimeServiceResultV1::JobCompleted { .. } => {
             Err(RuntimeError::ProtocolIncompatible.into())
         }
     }
@@ -726,7 +869,10 @@ pub async fn execute_via_service(project_root: &Path, job: &GuestJobV1) -> Resul
             error.error_code, error.message
         ))
         .into()),
-        RuntimeServiceResultV1::Pong { .. } | RuntimeServiceResultV1::SpoolValid { .. } => {
+        RuntimeServiceResultV1::Pong { .. }
+        | RuntimeServiceResultV1::RuntimeUpdated { .. }
+        | RuntimeServiceResultV1::ToolchainInstalled { .. }
+        | RuntimeServiceResultV1::SpoolValid { .. } => {
             Err(RuntimeError::ProtocolIncompatible.into())
         }
     }
@@ -764,7 +910,10 @@ pub async fn execute_via_service(project_root: &Path, job: &GuestJobV1) -> Resul
             error.error_code, error.message
         ))
         .into()),
-        RuntimeServiceResultV1::Pong { .. } | RuntimeServiceResultV1::SpoolValid { .. } => {
+        RuntimeServiceResultV1::Pong { .. }
+        | RuntimeServiceResultV1::RuntimeUpdated { .. }
+        | RuntimeServiceResultV1::ToolchainInstalled { .. }
+        | RuntimeServiceResultV1::SpoolValid { .. } => {
             Err(RuntimeError::ProtocolIncompatible.into())
         }
     }
@@ -1074,11 +1223,23 @@ fn open_project_input(root: &Path, relative: &str) -> Result<fs::File> {
 }
 
 pub async fn update() -> Result<RuntimeUpdateV1> {
-    install_latest(false, None).await
+    update_or_repair(false).await
 }
 
 pub async fn repair() -> Result<RuntimeUpdateV1> {
-    install_latest(true, None).await
+    update_or_repair(true).await
+}
+
+async fn update_or_repair(force: bool) -> Result<RuntimeUpdateV1> {
+    #[cfg(any(target_os = "linux", windows))]
+    if probe_runtime_service().await {
+        return request_service_runtime_update(force).await;
+    }
+    install_latest(force, None).await
+}
+
+pub async fn update_direct_for_service(force: bool) -> Result<RuntimeUpdateV1> {
+    install_latest(force, None).await
 }
 
 pub async fn reset() -> Result<RuntimeUpdateV1> {
@@ -2332,7 +2493,7 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
     result
 }
 
-const fn target_name(target: HostTarget) -> &'static str {
+pub const fn target_name(target: HostTarget) -> &'static str {
     match target {
         HostTarget::DarwinArm64 => "darwin-arm64",
         HostTarget::DarwinX64 => "darwin-x64",

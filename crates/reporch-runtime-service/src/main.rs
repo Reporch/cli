@@ -126,6 +126,26 @@ mod unix_service {
             RuntimeServiceCommandV1::Ping => Ok(RuntimeServiceResultV1::Pong {
                 service_version: env!("CARGO_PKG_VERSION").into(),
             }),
+            RuntimeServiceCommandV1::UpdateRuntime { force } => {
+                ensure_system_runtime_root()?;
+                let updated = reporch_runtime_host::update_direct_for_service(*force).await?;
+                Ok(RuntimeServiceResultV1::RuntimeUpdated {
+                    previous_version: updated.previous_version,
+                    installed_version: updated.installed_version,
+                    sequence: updated.sequence,
+                    target: reporch_runtime_host::target_name(updated.target).into(),
+                    repaired: updated.repaired,
+                })
+            }
+            RuntimeServiceCommandV1::InstallToolchain { id } => {
+                ensure_system_runtime_root()?;
+                let installed = reporch_runtime_host::install_toolchain_direct(id).await?;
+                Ok(RuntimeServiceResultV1::ToolchainInstalled {
+                    id: installed.installation.id,
+                    index_sequence: installed.installation.index_sequence,
+                    bundle_sha256: installed.installation.bundle_sha256,
+                })
+            }
             RuntimeServiceCommandV1::ValidateSpool { objects } => {
                 validate_peer_spool_directory(spool, peer_uid)?;
                 let objects = objects.clone();
@@ -150,6 +170,7 @@ mod unix_service {
                 validate_peer_spool_directory(spool, peer_uid)?;
                 #[cfg(target_os = "linux")]
                 {
+                    ensure_system_runtime_root()?;
                     ensure!(
                         rustix::process::getuid().is_root(),
                         "local Firecracker execution requires the installed root broker"
@@ -280,6 +301,21 @@ mod unix_service {
                 PathBuf::from("/run/user").join(rustix::process::getuid().as_raw().to_string())
             });
         Ok(root.join("reporch-runtime").join("service-v1.sock"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_system_runtime_root() -> Result<()> {
+        let expected = Path::new("/var/lib/reporch-runtime/runtime");
+        ensure!(
+            reporch_runtime_host::runtime_root()? == expected,
+            "the privileged runtime broker must use the system-owned runtime root"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn ensure_system_runtime_root() -> Result<()> {
+        anyhow::bail!("privileged runtime management is available only on Linux")
     }
 
     fn spool_root_override() -> Result<Option<PathBuf>> {

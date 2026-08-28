@@ -1,0 +1,23 @@
+[package]
+name = "reporch-runtime-install-tree-builder"
+version = "1.0.0-rc.8"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+minisign-verify.workspace = true
+reporch-runtime-core = { path = "../../crates/reporch-runtime-core" }
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

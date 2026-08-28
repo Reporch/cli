@@ -71,6 +71,8 @@ impl RuntimeServiceRequestV1 {
         }
         match &self.command {
             RuntimeServiceCommandV1::Ping => {}
+            RuntimeServiceCommandV1::UpdateRuntime { .. } => {}
+            RuntimeServiceCommandV1::InstallToolchain { id } => validate_toolchain_id(id)?,
             RuntimeServiceCommandV1::ValidateSpool { objects } => validate_objects(objects)?,
             RuntimeServiceCommandV1::RunJob {
                 job,
@@ -114,6 +116,12 @@ fn validate_objects(objects: &[ContentObjectV1]) -> Result<(), ProtocolError> {
 #[serde(tag = "command", content = "payload", rename_all = "snake_case")]
 pub enum RuntimeServiceCommandV1 {
     Ping,
+    UpdateRuntime {
+        force: bool,
+    },
+    InstallToolchain {
+        id: String,
+    },
     ValidateSpool {
         objects: Vec<ContentObjectV1>,
     },
@@ -152,6 +160,49 @@ impl RuntimeServiceResponseV1 {
             )
             | (RuntimeServiceResultV1::Error(_), _) => Ok(()),
             (
+                RuntimeServiceResultV1::RuntimeUpdated {
+                    installed_version,
+                    sequence,
+                    target,
+                    ..
+                },
+                RuntimeServiceCommandV1::UpdateRuntime { .. },
+            ) => {
+                if *sequence == 0
+                    || installed_version.is_empty()
+                    || installed_version.len() > 128
+                    || !installed_version.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    })
+                    || !matches!(
+                        target.as_str(),
+                        "darwin-arm64"
+                            | "darwin-x64"
+                            | "linux-arm64-gnu"
+                            | "linux-x64-gnu"
+                            | "windows-x64-msvc"
+                    )
+                {
+                    return Err(ProtocolError::InvalidField("runtime_update"));
+                }
+                Ok(())
+            }
+            (
+                RuntimeServiceResultV1::ToolchainInstalled {
+                    id,
+                    index_sequence,
+                    bundle_sha256,
+                },
+                RuntimeServiceCommandV1::InstallToolchain { id: requested },
+            ) => {
+                validate_toolchain_id(id)?;
+                validate_digest(bundle_sha256)?;
+                if *index_sequence == 0 || id != requested {
+                    return Err(ProtocolError::JobMismatch);
+                }
+                Ok(())
+            }
+            (
                 RuntimeServiceResultV1::JobCompleted { result },
                 RuntimeServiceCommandV1::RunJob { job, .. },
             ) => result.validate_for(job),
@@ -163,10 +214,41 @@ impl RuntimeServiceResponseV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", content = "payload", rename_all = "snake_case")]
 pub enum RuntimeServiceResultV1 {
-    Pong { service_version: String },
-    SpoolValid { object_count: u32, total_bytes: u64 },
-    JobCompleted { result: Box<GuestResultV1> },
+    Pong {
+        service_version: String,
+    },
+    RuntimeUpdated {
+        previous_version: Option<String>,
+        installed_version: String,
+        sequence: u64,
+        target: String,
+        repaired: bool,
+    },
+    ToolchainInstalled {
+        id: String,
+        index_sequence: u64,
+        bundle_sha256: String,
+    },
+    SpoolValid {
+        object_count: u32,
+        total_bytes: u64,
+    },
+    JobCompleted {
+        result: Box<GuestResultV1>,
+    },
     Error(ProtocolFailureV1),
+}
+
+fn validate_toolchain_id(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+    {
+        return Err(ProtocolError::InvalidField("toolchain_id"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -886,5 +968,36 @@ mod tests {
             },
         };
         response.validate_for(&request).unwrap();
+
+        let install = RuntimeServiceRequestV1 {
+            schema: SERVICE_REQUEST_SCHEMA.into(),
+            protocol_version: PROTOCOL_VERSION,
+            id: Uuid::now_v7(),
+            command: RuntimeServiceCommandV1::InstallToolchain {
+                id: "python-3.14".into(),
+            },
+        };
+        install.validate().unwrap();
+        let installed = RuntimeServiceResponseV1 {
+            schema: SERVICE_RESPONSE_SCHEMA.into(),
+            protocol_version: PROTOCOL_VERSION,
+            request_id: install.id,
+            result: RuntimeServiceResultV1::ToolchainInstalled {
+                id: "python-3.14".into(),
+                index_sequence: 1,
+                bundle_sha256: format!("sha256:{}", "a".repeat(64)),
+            },
+        };
+        installed.validate_for(&install).unwrap();
+        assert_eq!(
+            installed.validate_for(&request),
+            Err(ProtocolError::JobMismatch)
+        );
+
+        let mut invalid = install;
+        invalid.command = RuntimeServiceCommandV1::InstallToolchain {
+            id: "../host".into(),
+        };
+        assert!(invalid.validate().is_err());
     }
 }
