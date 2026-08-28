@@ -12,11 +12,14 @@ mod windows_backend;
 pub use windows_backend::{HcsVirtualMachine, HvSocketStream};
 
 pub const HYPERV_VSOCK_PORT: u32 = 7_000;
+const HCS_SCSI_CONTROLLER_0: &str = "df6d0690-79e5-55b6-a5ec-c1e2f77f580a";
+const HCS_KERNEL_COMMAND_LINE: &str = "8250_core.nr_uarts=0 panic=-1 quiet pci=off rdinit=/sbin/reporch-guestd reporch.host_challenge=1 reporch.transport=vsock initcall_blacklist=virtio_vsock_init";
 
 #[derive(Clone, Debug)]
 pub struct HcsVmConfigV1 {
     pub id: Uuid,
-    pub rootfs_vhdx: PathBuf,
+    pub kernel: PathBuf,
+    pub initrd: PathBuf,
     pub toolchain_vhdx: Option<PathBuf>,
     pub memory_mib: u64,
     pub processor_count: u32,
@@ -29,13 +32,14 @@ impl HcsVmConfigV1 {
             self.id.get_version_num() == 7,
             "HCS VM identifier must be UUIDv7"
         );
-        validate_vhdx_path(&self.rootfs_vhdx)?;
+        validate_boot_file_path(&self.kernel, "HCS kernel")?;
+        validate_boot_file_path(&self.initrd, "HCS initrd")?;
+        ensure!(
+            self.kernel != self.initrd,
+            "HCS kernel and initrd must be distinct"
+        );
         if let Some(toolchain) = &self.toolchain_vhdx {
             validate_vhdx_path(toolchain)?;
-            ensure!(
-                toolchain != &self.rootfs_vhdx,
-                "rootfs and toolchain VHDX must be distinct"
-            );
         }
         ensure!(
             (128..=8_192).contains(&self.memory_mib),
@@ -54,30 +58,27 @@ impl HcsVmConfigV1 {
 
     pub fn configuration_json(&self) -> Result<String> {
         self.validate()?;
-        let mut attachments = serde_json::Map::new();
-        attachments.insert(
-            "0".into(),
-            serde_json::to_value(ReadOnlyDiskV1::new(&self.rootfs_vhdx))?,
-        );
-        if let Some(toolchain) = &self.toolchain_vhdx {
-            attachments.insert(
-                "1".into(),
-                serde_json::to_value(ReadOnlyDiskV1::new(toolchain))?,
-            );
-        }
+        let scsi = self.toolchain_vhdx.as_ref().map(|toolchain| {
+            serde_json::json!({
+                (HCS_SCSI_CONTROLLER_0): {
+                    "Attachments": {
+                        "0": ReadOnlyDiskV1::new(toolchain)
+                    }
+                }
+            })
+        });
         let service_id = hyperv_vsock_service_id(self.vsock_port);
-        let configuration = serde_json::json!({
+        let mut configuration = serde_json::json!({
             "SchemaVersion": { "Major": 2, "Minor": 1 },
             "Owner": "Reporch Runtime",
             "ShouldTerminateOnLastHandleClosed": true,
             "VirtualMachine": {
+                "StopOnReset": true,
                 "Chipset": {
-                    "Uefi": {
-                        "BootThis": {
-                            "DevicePath": "Primary disk",
-                            "DiskNumber": 0,
-                            "DeviceType": "ScsiDrive"
-                        }
+                    "LinuxKernelDirect": {
+                        "KernelFilePath": self.kernel.to_string_lossy(),
+                        "InitRdPath": self.initrd.to_string_lossy(),
+                        "KernelCmdLine": HCS_KERNEL_COMMAND_LINE
                     }
                 },
                 "ComputeTopology": {
@@ -88,9 +89,6 @@ impl HcsVmConfigV1 {
                     "Processor": { "Count": self.processor_count }
                 },
                 "Devices": {
-                    "Scsi": {
-                        "Primary disk": { "Attachments": attachments }
-                    },
                     "HvSocket": {
                         "HvSocketConfig": {
                             "DefaultBindSecurityDescriptor": "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
@@ -103,6 +101,9 @@ impl HcsVmConfigV1 {
                 }
             }
         });
+        if let Some(scsi) = scsi {
+            configuration["VirtualMachine"]["Devices"]["Scsi"] = scsi;
+        }
         Ok(serde_json::to_string(&configuration)?)
     }
 }
@@ -127,19 +128,24 @@ impl ReadOnlyDiskV1 {
 }
 
 fn validate_vhdx_path(path: &Path) -> Result<()> {
-    ensure!(path.is_absolute(), "HCS VHDX path must be absolute");
+    validate_boot_file_path(path, "HCS VHDX")?;
     ensure!(
         path.extension()
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case("vhdx")),
         "HCS disk image must use the VHDX format"
     );
+    Ok(())
+}
+
+fn validate_boot_file_path(path: &Path, label: &str) -> Result<()> {
+    ensure!(path.is_absolute(), "{label} path must be absolute");
     ensure!(
         !path
             .as_os_str()
             .to_string_lossy()
             .contains(['\0', '\r', '\n']),
-        "HCS VHDX path contains invalid characters"
+        "{label} path contains invalid characters"
     );
     Ok(())
 }
@@ -154,16 +160,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configuration_has_no_network_and_only_read_only_disks() {
-        let root = if cfg!(windows) {
-            PathBuf::from(r"C:\ProgramData\Reporch\rootfs.vhdx")
+    fn configuration_uses_direct_kernel_no_network_and_read_only_toolchain() {
+        let kernel = if cfg!(windows) {
+            PathBuf::from(r"C:\ProgramData\Reporch\kernel")
         } else {
-            PathBuf::from("/var/lib/reporch/rootfs.vhdx")
+            PathBuf::from("/var/lib/reporch/kernel")
         };
-        let toolchain = root.with_file_name("toolchain.vhdx");
+        let initrd = kernel.with_file_name("rootfs.cpio");
+        let toolchain = kernel.with_file_name("toolchain.vhdx");
         let config = HcsVmConfigV1 {
             id: Uuid::now_v7(),
-            rootfs_vhdx: root,
+            kernel: kernel.clone(),
+            initrd: initrd.clone(),
             toolchain_vhdx: Some(toolchain),
             memory_mib: 512,
             processor_count: 1,
@@ -174,13 +182,22 @@ mod tests {
         let devices = &value["VirtualMachine"]["Devices"];
         assert!(devices.get("NetworkAdapters").is_none());
         assert_eq!(
-            devices["Scsi"]["Primary disk"]["Attachments"]["0"]["ReadOnly"],
+            devices["Scsi"][HCS_SCSI_CONTROLLER_0]["Attachments"]["0"]["ReadOnly"],
             true
         );
         assert_eq!(
-            devices["Scsi"]["Primary disk"]["Attachments"]["1"]["ReadOnly"],
-            true
+            value["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelFilePath"],
+            kernel.to_string_lossy().as_ref()
         );
+        assert_eq!(
+            value["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["InitRdPath"],
+            initrd.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            value["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"],
+            HCS_KERNEL_COMMAND_LINE
+        );
+        assert_eq!(value["VirtualMachine"]["StopOnReset"], true);
         assert!(
             devices["HvSocket"]["HvSocketConfig"]["ServiceTable"]
                 .get(hyperv_vsock_service_id(HYPERV_VSOCK_PORT))
@@ -192,19 +209,44 @@ mod tests {
     fn configuration_rejects_host_path_and_resource_ambiguity() {
         let mut config = HcsVmConfigV1 {
             id: Uuid::now_v7(),
-            rootfs_vhdx: PathBuf::from("relative.vhdx"),
+            kernel: PathBuf::from("relative-vmlinux"),
+            initrd: PathBuf::from("relative-rootfs.cpio"),
             toolchain_vhdx: None,
             memory_mib: 512,
             processor_count: 1,
             vsock_port: HYPERV_VSOCK_PORT,
         };
         assert!(config.validate().is_err());
-        config.rootfs_vhdx = if cfg!(windows) {
-            PathBuf::from(r"C:\rootfs.vhdx")
+        config.kernel = if cfg!(windows) {
+            PathBuf::from(r"C:\kernel")
         } else {
-            PathBuf::from("/rootfs.vhdx")
+            PathBuf::from("/kernel")
         };
-        config.toolchain_vhdx = Some(config.rootfs_vhdx.clone());
+        config.initrd = config.kernel.clone();
         assert!(config.validate().is_err());
+        config.initrd = config.kernel.with_file_name("rootfs.cpio");
+        config.toolchain_vhdx = Some(config.kernel.with_file_name("toolchain.img"));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn configuration_omits_scsi_without_a_toolchain() {
+        let root = if cfg!(windows) {
+            "C:\\Runtime"
+        } else {
+            "/runtime"
+        };
+        let config = HcsVmConfigV1 {
+            id: Uuid::now_v7(),
+            kernel: PathBuf::from(root).join("kernel"),
+            initrd: PathBuf::from(root).join("rootfs.cpio"),
+            toolchain_vhdx: None,
+            memory_mib: 512,
+            processor_count: 1,
+            vsock_port: HYPERV_VSOCK_PORT,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&config.configuration_json().unwrap()).unwrap();
+        assert!(value["VirtualMachine"]["Devices"].get("Scsi").is_none());
     }
 }

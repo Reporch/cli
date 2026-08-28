@@ -187,10 +187,12 @@ fn execute_hcs_job(
     let spool = reporch_runtime_host::service_spool_root()?;
     let input_view = prepare_input_view(&spool, job)?;
     let _cleanup = JobDirectoryCleanup(input_view.clone());
-    let rootfs = bundle.artifact_path(RuntimeArtifactKindV1::Rootfs)?;
+    let kernel = bundle.artifact_path(RuntimeArtifactKindV1::Kernel)?;
+    let initrd = bundle.artifact_path(RuntimeArtifactKindV1::Rootfs)?;
     let config = HcsVmConfigV1 {
         id: job.id,
-        rootfs_vhdx: rootfs,
+        kernel,
+        initrd,
         toolchain_vhdx: toolchain.map(|toolchain| toolchain.path.clone()),
         memory_mib: job.limits.memory_mib.saturating_add(128).min(8_192),
         processor_count: job.limits.cpu_millis.div_ceil(1_000).clamp(1, 16),

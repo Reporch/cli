@@ -19,6 +19,7 @@ use uuid::Uuid;
 const LOCK_BYTES: &[u8] = include_bytes!("../../../runtime/sources.lock.json");
 const MAX_KERNEL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_WINDOWS_MSI_BYTES: u64 = 320 * 1024 * 1024;
 const MAX_FIRECRACKER_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FIRECRACKER_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 128;
@@ -44,6 +45,10 @@ impl Target {
         matches!(self, Self::LinuxArm64 | Self::LinuxX64)
     }
 
+    fn uses_windows_kernel(self) -> bool {
+        self == Self::WindowsX64
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::DarwinArm64 => "darwin-arm64",
@@ -61,6 +66,7 @@ struct SourceLock {
     schema: String,
     source_date_epoch: u64,
     guest_kernel: GuestKernel,
+    windows_guest_kernel: WindowsGuestKernel,
     firecracker: Firecracker,
     rust: RustSource,
 }
@@ -78,6 +84,22 @@ struct GuestKernel {
 struct KernelArtifact {
     url: String,
     sha256: String,
+    config_url: String,
+    config_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsGuestKernel {
+    version: String,
+    provenance: String,
+    package_version: String,
+    url: String,
+    sha256: String,
+    size: u64,
+    msi_cabinet_stream: String,
+    cabinet_entry: String,
+    kernel_sha256: String,
     config_url: String,
     config_sha256: String,
 }
@@ -114,6 +136,8 @@ struct MaterializationRecord<'a> {
     kernel_provenance: &'a str,
     firecracker_version: Option<&'a str>,
     firecracker_tag_commit: Option<&'a str>,
+    windows_package_version: Option<&'a str>,
+    windows_package_sha256: Option<String>,
     rust_toolchain: &'a str,
     rust_guest_targets: &'a [String],
     files: BTreeMap<String, String>,
@@ -170,6 +194,27 @@ fn validate_lock(lock: &SourceLock) -> Result<()> {
         !lock.guest_kernel.provenance.trim().is_empty(),
         "kernel provenance is missing"
     );
+    let windows = &lock.windows_guest_kernel;
+    ensure!(
+        !windows.version.trim().is_empty()
+            && !windows.provenance.trim().is_empty()
+            && !windows.package_version.trim().is_empty()
+            && windows.size > 0
+            && windows.size <= MAX_WINDOWS_MSI_BYTES
+            && windows.msi_cabinet_stream == "cab3.cab"
+            && windows.cabinet_entry == "kernel",
+        "Windows guest kernel identity is invalid"
+    );
+    for url in [&windows.url, &windows.config_url] {
+        validate_source_url(url)?;
+    }
+    for digest in [
+        &windows.sha256,
+        &windows.kernel_sha256,
+        &windows.config_sha256,
+    ] {
+        validate_digest(digest)?;
+    }
     ensure!(
         lock.firecracker.tag_commit.len() == 40
             && lock
@@ -220,32 +265,65 @@ async fn materialize(target: Target, output: &Path, lock: &SourceLock) -> Result
             .user_agent("reporch-runtime-source-fetcher/1")
             .build()
             .context("build runtime source HTTP client")?;
-        let architecture = target.architecture();
-        let kernel = &lock.guest_kernel.artifacts[architecture];
         let mut files = BTreeMap::new();
-        fetch_verified(
-            &client,
-            &kernel.url,
-            &kernel.sha256,
-            MAX_KERNEL_BYTES,
-            &staging.join("vmlinux"),
-        )
-        .await?;
-        set_mode(&staging.join("vmlinux"), 0o444)?;
-        files.insert("vmlinux".into(), format!("sha256:{}", kernel.sha256));
-        fetch_verified(
-            &client,
-            &kernel.config_url,
-            &kernel.config_sha256,
-            MAX_CONFIG_BYTES,
-            &staging.join("kernel.config"),
-        )
-        .await?;
-        set_mode(&staging.join("kernel.config"), 0o444)?;
-        files.insert(
-            "kernel.config".into(),
-            format!("sha256:{}", kernel.config_sha256),
-        );
+        if target.uses_windows_kernel() {
+            let kernel = &lock.windows_guest_kernel;
+            let package = staging.join("windows-kernel.msi");
+            fetch_verified(
+                &client,
+                &kernel.url,
+                &kernel.sha256,
+                MAX_WINDOWS_MSI_BYTES,
+                &package,
+            )
+            .await?;
+            ensure!(
+                fs::metadata(&package)?.len() == kernel.size,
+                "Windows kernel MSI size mismatch"
+            );
+            files.extend(extract_windows_kernel(&package, &staging, kernel)?);
+            fs::remove_file(&package).context("remove verified Windows kernel MSI")?;
+            fetch_verified(
+                &client,
+                &kernel.config_url,
+                &kernel.config_sha256,
+                MAX_CONFIG_BYTES,
+                &staging.join("kernel.config"),
+            )
+            .await?;
+            set_mode(&staging.join("kernel.config"), 0o444)?;
+            files.insert(
+                "kernel.config".into(),
+                format!("sha256:{}", kernel.config_sha256),
+            );
+        } else {
+            let architecture = target.architecture();
+            let kernel = &lock.guest_kernel.artifacts[architecture];
+            fetch_verified(
+                &client,
+                &kernel.url,
+                &kernel.sha256,
+                MAX_KERNEL_BYTES,
+                &staging.join("vmlinux"),
+            )
+            .await?;
+            set_mode(&staging.join("vmlinux"), 0o444)?;
+            files.insert("vmlinux".into(), format!("sha256:{}", kernel.sha256));
+            fetch_verified(
+                &client,
+                &kernel.config_url,
+                &kernel.config_sha256,
+                MAX_CONFIG_BYTES,
+                &staging.join("kernel.config"),
+            )
+            .await?;
+            set_mode(&staging.join("kernel.config"), 0o444)?;
+            files.insert(
+                "kernel.config".into(),
+                format!("sha256:{}", kernel.config_sha256),
+            );
+        }
+        let architecture = target.architecture();
         if target.includes_firecracker() {
             let firecracker = &lock.firecracker.artifacts[architecture];
             let archive = staging.join("firecracker.tgz");
@@ -267,14 +345,28 @@ async fn materialize(target: Target, output: &Path, lock: &SourceLock) -> Result
             target: target.name(),
             source_lock_sha256: format!("sha256:{}", hex::encode(Sha256::digest(LOCK_BYTES))),
             source_date_epoch: lock.source_date_epoch,
-            kernel_version: &lock.guest_kernel.version,
-            kernel_provenance: &lock.guest_kernel.provenance,
+            kernel_version: if target.uses_windows_kernel() {
+                &lock.windows_guest_kernel.version
+            } else {
+                &lock.guest_kernel.version
+            },
+            kernel_provenance: if target.uses_windows_kernel() {
+                &lock.windows_guest_kernel.provenance
+            } else {
+                &lock.guest_kernel.provenance
+            },
             firecracker_version: target
                 .includes_firecracker()
                 .then_some(lock.firecracker.version.as_str()),
             firecracker_tag_commit: target
                 .includes_firecracker()
                 .then_some(lock.firecracker.tag_commit.as_str()),
+            windows_package_version: target
+                .uses_windows_kernel()
+                .then_some(lock.windows_guest_kernel.package_version.as_str()),
+            windows_package_sha256: target
+                .uses_windows_kernel()
+                .then(|| format!("sha256:{}", lock.windows_guest_kernel.sha256)),
             rust_toolchain: &lock.rust.toolchain,
             rust_guest_targets: &lock.rust.guest_targets,
             files,
@@ -293,6 +385,67 @@ async fn materialize(target: Target, output: &Path, lock: &SourceLock) -> Result
         let _ = fs::remove_dir_all(&staging);
     }
     result
+}
+
+fn extract_windows_kernel(
+    msi_path: &Path,
+    output: &Path,
+    source: &WindowsGuestKernel,
+) -> Result<BTreeMap<String, String>> {
+    let mut package = msi::open(msi_path).context("open verified Windows kernel MSI")?;
+    let stream = package
+        .read_stream(&source.msi_cabinet_stream)
+        .context("open Windows kernel cabinet stream")?;
+    let mut cabinet = cab::Cabinet::new(stream).context("parse Windows kernel cabinet")?;
+    let entry_size = cabinet
+        .folder_entries()
+        .flat_map(|folder| folder.file_entries())
+        .find(|entry| entry.name() == source.cabinet_entry)
+        .map(|entry| u64::from(entry.uncompressed_size()))
+        .context("Windows kernel cabinet entry is missing")?;
+    ensure!(
+        (1..=MAX_KERNEL_BYTES).contains(&entry_size),
+        "Windows kernel cabinet entry has unsafe size"
+    );
+    let mut reader = cabinet
+        .read_file(&source.cabinet_entry)
+        .context("open Windows kernel cabinet entry")?;
+    let mut bytes = Vec::with_capacity(usize::try_from(entry_size)?);
+    reader
+        .by_ref()
+        .take(MAX_KERNEL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("extract Windows kernel cabinet entry")?;
+    ensure!(
+        bytes.len() as u64 == entry_size,
+        "Windows kernel cabinet entry was truncated or oversized"
+    );
+    validate_x86_64_bzimage(&bytes)?;
+    let digest = hex::encode(Sha256::digest(&bytes));
+    ensure!(
+        digest == source.kernel_sha256,
+        "Windows kernel SHA-256 mismatch"
+    );
+    write_new(&output.join("kernel"), &bytes, 0o444)?;
+    Ok(BTreeMap::from([(
+        "kernel".into(),
+        format!("sha256:{digest}"),
+    )]))
+}
+
+fn validate_x86_64_bzimage(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() >= 0x238
+            && bytes[0x1fe..0x200] == [0x55, 0xaa]
+            && &bytes[0x202..0x206] == b"HdrS",
+        "Windows guest kernel is not a Linux x86 boot image"
+    );
+    let xloadflags = u16::from_le_bytes(bytes[0x236..0x238].try_into()?);
+    ensure!(
+        xloadflags & 1 == 1,
+        "Windows guest kernel is not 64-bit capable"
+    );
+    Ok(())
 }
 
 async fn fetch_verified(
@@ -565,5 +718,16 @@ mod tests {
         elf[18..20].copy_from_slice(&183_u16.to_le_bytes());
         validate_elf(&elf, "aarch64").unwrap();
         assert!(validate_elf(&elf, "x86_64").is_err());
+    }
+
+    #[test]
+    fn windows_kernel_header_validation_is_64_bit_and_fail_closed() {
+        let mut image = vec![0_u8; 0x238];
+        image[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        image[0x202..0x206].copy_from_slice(b"HdrS");
+        image[0x236..0x238].copy_from_slice(&1_u16.to_le_bytes());
+        validate_x86_64_bzimage(&image).unwrap();
+        image[0x236..0x238].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(validate_x86_64_bzimage(&image).is_err());
     }
 }

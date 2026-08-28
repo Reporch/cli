@@ -251,7 +251,7 @@ fn mount_optional_toolchain() -> Result<()> {
     use rustix::mount::{MountFlags, mount, mount_bind};
     use std::os::unix::fs::FileTypeExt as _;
 
-    let device = ["/dev/vda", "/dev/sdb1", "/dev/sdb"]
+    let device = ["/dev/vda", "/dev/sda1", "/dev/sda", "/dev/sdb1", "/dev/sdb"]
         .into_iter()
         .find(|path| {
             std::fs::symlink_metadata(path).is_ok_and(|metadata| {

@@ -35,6 +35,8 @@ struct SourceRecord {
     kernel_provenance: String,
     firecracker_version: Option<String>,
     firecracker_tag_commit: Option<String>,
+    windows_package_version: Option<String>,
+    windows_package_sha256: Option<String>,
     rust_toolchain: String,
     rust_guest_targets: Vec<String>,
     files: BTreeMap<String, String>,
@@ -268,7 +270,13 @@ fn validate_source_record(source: &SourceRecord, target: HostTarget) -> Result<(
             && !source.kernel_provenance.is_empty()
             && source.rust_toolchain == "1.96.0"
             && source.rust_guest_targets.len() == 2
-            && source.files.contains_key("vmlinux"),
+            && source
+                .files
+                .contains_key(if target == HostTarget::WindowsX64Msvc {
+                    "kernel"
+                } else {
+                    "vmlinux"
+                }),
         "invalid source materialization identity"
     );
     let needs_firecracker = matches!(target, HostTarget::LinuxArm64Gnu | HostTarget::LinuxX64Gnu);
@@ -280,19 +288,38 @@ fn validate_source_record(source: &SourceRecord, target: HostTarget) -> Result<(
                 && source.files.contains_key("jailer")),
         "source materialization Firecracker identity does not match target"
     );
+    let needs_windows_package = target == HostTarget::WindowsX64Msvc;
+    ensure!(
+        needs_windows_package
+            == (source.windows_package_version.is_some()
+                && source
+                    .windows_package_sha256
+                    .as_deref()
+                    .is_some_and(valid_prefixed_digest)),
+        "source materialization Windows package identity does not match target"
+    );
     Ok(())
+}
+
+fn valid_prefixed_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn required_artifacts(target: HostTarget) -> Vec<(RuntimeArtifactKindV1, &'static str)> {
     use RuntimeArtifactKindV1 as Kind;
-    let rootfs = if target == HostTarget::WindowsX64Msvc {
-        "rootfs.vhdx"
+    let kernel = if target == HostTarget::WindowsX64Msvc {
+        "kernel"
     } else {
-        "rootfs.cpio"
+        "vmlinux"
     };
     let mut artifacts = vec![
-        (Kind::Kernel, "vmlinux"),
-        (Kind::Rootfs, rootfs),
+        (Kind::Kernel, kernel),
+        (Kind::Rootfs, "rootfs.cpio"),
         (Kind::GuestAgent, "reporch-guestd"),
     ];
     match target {
@@ -309,10 +336,9 @@ fn required_artifacts(target: HostTarget) -> Vec<(RuntimeArtifactKindV1, &'stati
     artifacts
 }
 
-fn artifact_license(kind: RuntimeArtifactKindV1, target: HostTarget) -> &'static str {
+fn artifact_license(kind: RuntimeArtifactKindV1, _target: HostTarget) -> &'static str {
     match kind {
         RuntimeArtifactKindV1::Kernel => "GPL-2.0-only",
-        RuntimeArtifactKindV1::Rootfs if target == HostTarget::WindowsX64Msvc => "NOASSERTION",
         RuntimeArtifactKindV1::Rootfs
         | RuntimeArtifactKindV1::GuestAgent
         | RuntimeArtifactKindV1::HostService
@@ -326,6 +352,29 @@ fn validate_executable_identity(
     kind: RuntimeArtifactKindV1,
     target: HostTarget,
 ) -> Result<()> {
+    if kind == RuntimeArtifactKindV1::Kernel {
+        let bytes = read_prefix(path, 0x238)?;
+        if target == HostTarget::WindowsX64Msvc {
+            ensure!(
+                bytes.len() >= 0x238
+                    && bytes[0x1fe..0x200] == [0x55, 0xaa]
+                    && &bytes[0x202..0x206] == b"HdrS"
+                    && u16::from_le_bytes(bytes[0x236..0x238].try_into()?) & 1 == 1,
+                "Windows runtime kernel is not a 64-bit Linux x86 boot image"
+            );
+        } else {
+            validate_elf_identity(&bytes, target, "runtime kernel")?;
+        }
+        return Ok(());
+    }
+    if kind == RuntimeArtifactKindV1::Rootfs {
+        let bytes = read_prefix(path, 6)?;
+        ensure!(
+            matches!(bytes.as_slice(), b"070701" | b"070702"),
+            "runtime rootfs is not a newc initramfs"
+        );
+        return Ok(());
+    }
     if !matches!(
         kind,
         RuntimeArtifactKindV1::GuestAgent
@@ -338,28 +387,29 @@ fn validate_executable_identity(
     let bytes = read_prefix(path, 64)?;
     if kind == RuntimeArtifactKindV1::HostService && target == HostTarget::WindowsX64Msvc {
         ensure!(
-            &bytes[..2] == b"MZ",
+            bytes.len() >= 2 && &bytes[..2] == b"MZ",
             "Windows runtime service is not PE/COFF"
         );
         return Ok(());
     }
+    validate_elf_identity(&bytes, target, "runtime executable")
+}
+
+fn validate_elf_identity(bytes: &[u8], target: HostTarget, label: &str) -> Result<()> {
     ensure!(
         bytes.len() >= 20 && &bytes[..4] == b"\x7fELF",
-        "runtime executable is not ELF"
+        "{label} is not ELF"
     );
     ensure!(
         bytes[4] == 2 && bytes[5] == 1,
-        "runtime executable must be 64-bit little-endian ELF"
+        "{label} must be 64-bit little-endian ELF"
     );
     let machine = u16::from_le_bytes(bytes[18..20].try_into()?);
     let expected = match target {
         HostTarget::DarwinArm64 | HostTarget::LinuxArm64Gnu => 183,
         HostTarget::DarwinX64 | HostTarget::LinuxX64Gnu | HostTarget::WindowsX64Msvc => 62,
     };
-    ensure!(
-        machine == expected,
-        "runtime executable architecture mismatch"
-    );
+    ensure!(machine == expected, "{label} architecture mismatch");
     Ok(())
 }
 
@@ -541,11 +591,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_kernel_and_initramfs_validation_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = root.path().join("kernel");
+        let mut image = vec![0_u8; 0x238];
+        image[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        image[0x202..0x206].copy_from_slice(b"HdrS");
+        image[0x236..0x238].copy_from_slice(&1_u16.to_le_bytes());
+        fs::write(&kernel, &image).unwrap();
+        validate_executable_identity(
+            &kernel,
+            RuntimeArtifactKindV1::Kernel,
+            HostTarget::WindowsX64Msvc,
+        )
+        .unwrap();
+        image[0x202] = 0;
+        fs::write(&kernel, image).unwrap();
+        assert!(
+            validate_executable_identity(
+                &kernel,
+                RuntimeArtifactKindV1::Kernel,
+                HostTarget::WindowsX64Msvc,
+            )
+            .is_err()
+        );
+
+        let rootfs = root.path().join("rootfs.cpio");
+        fs::write(&rootfs, b"070701fixture").unwrap();
+        validate_executable_identity(
+            &rootfs,
+            RuntimeArtifactKindV1::Rootfs,
+            HostTarget::WindowsX64Msvc,
+        )
+        .unwrap();
+        fs::write(&rootfs, b"not-cpio").unwrap();
+        assert!(
+            validate_executable_identity(
+                &rootfs,
+                RuntimeArtifactKindV1::Rootfs,
+                HostTarget::WindowsX64Msvc,
+            )
+            .is_err()
+        );
+    }
+
     fn evidence_fixture(root: &Path, name: &str) -> Arguments {
         let artifacts = root.join(name);
         fs::create_dir(&artifacts).unwrap();
-        fs::write(artifacts.join("vmlinux"), b"kernel bytes\n").unwrap();
-        fs::write(artifacts.join("rootfs.cpio"), b"rootfs bytes\n").unwrap();
+        let mut kernel = vec![0_u8; 64];
+        kernel[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        kernel[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        fs::write(artifacts.join("vmlinux"), kernel).unwrap();
+        fs::write(artifacts.join("rootfs.cpio"), b"070701rootfs bytes\n").unwrap();
         let mut guestd = vec![0_u8; 64];
         guestd[..6].copy_from_slice(b"\x7fELF\x02\x01");
         guestd[18..20].copy_from_slice(&183_u16.to_le_bytes());

@@ -19,6 +19,19 @@
       }
     }
   },
+  "windows_guest_kernel": {
+    "version": "6.18.33.2",
+    "provenance": "Microsoft WSL 2.7.12 official x64 MSI release asset",
+    "package_version": "2.7.12.0",
+    "url": "https://github.com/microsoft/WSL/releases/download/2.7.12/wsl.2.7.12.0.x64.msi",
+    "sha256": "a460d4560215f2efe003c136244b78ea3415d773824d7a688ea9ded36dbe9145",
+    "size": 258998272,
+    "msi_cabinet_stream": "cab3.cab",
+    "cabinet_entry": "kernel",
+    "kernel_sha256": "d540850bfbf1beba3ded6b2965b9d0249b23fbcb3e90e7dc0845ac7ad86bc861",
+    "config_url": "https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.18.33.2/arch/x86/configs/config-wsl",
+    "config_sha256": "265f4b0906e06d26fb19cec4d03d385295516c3edaf944b63101725ded66fad5"
+  },
   "firecracker": {
     "version": "1.16.1",
     "tag_commit": "2038188f145fb81b8d098147a10e9d9f392fd22f",

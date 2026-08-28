@@ -149,14 +149,14 @@ fn write_manifest(output: &Path, manifest: &RuntimeBundleManifestV1) -> Result<(
 
 fn required_artifacts(target: HostTarget) -> Vec<(RuntimeArtifactKindV1, &'static str)> {
     use RuntimeArtifactKindV1 as Kind;
-    let rootfs = if target == HostTarget::WindowsX64Msvc {
-        "rootfs.vhdx"
+    let kernel = if target == HostTarget::WindowsX64Msvc {
+        "kernel"
     } else {
-        "rootfs.cpio"
+        "vmlinux"
     };
     let mut artifacts = vec![
-        (Kind::Kernel, "vmlinux"),
-        (Kind::Rootfs, rootfs),
+        (Kind::Kernel, kernel),
+        (Kind::Rootfs, "rootfs.cpio"),
         (Kind::GuestAgent, "reporch-guestd"),
     ];
     match target.native_backend() {
