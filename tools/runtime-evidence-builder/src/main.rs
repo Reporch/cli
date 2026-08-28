@@ -362,6 +362,19 @@ fn validate_executable_identity(
                     && u16::from_le_bytes(bytes[0x236..0x238].try_into()?) & 1 == 1,
                 "Windows runtime kernel is not a 64-bit Linux x86 boot image"
             );
+        } else if matches!(target, HostTarget::DarwinArm64 | HostTarget::LinuxArm64Gnu) {
+            ensure!(
+                bytes.len() >= 0x3c && &bytes[0x38..0x3c] == b"ARMd",
+                "ARM64 runtime kernel is not a Linux Image"
+            );
+            if bytes.starts_with(b"MZ") {
+                ensure!(
+                    bytes.len() >= 0x46
+                        && &bytes[0x40..0x44] == b"PE\0\0"
+                        && u16::from_le_bytes(bytes[0x44..0x46].try_into()?) == 0xaa64,
+                    "ARM64 runtime kernel EFI stub architecture mismatch"
+                );
+            }
         } else {
             validate_elf_identity(&bytes, target, "runtime kernel")?;
         }
@@ -636,12 +649,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn arm64_linux_image_validation_accepts_the_native_boot_header_only() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = root.path().join("vmlinux");
+        let mut image = vec![0_u8; 0x48];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x38..0x3c].copy_from_slice(b"ARMd");
+        image[0x40..0x44].copy_from_slice(b"PE\0\0");
+        image[0x44..0x46].copy_from_slice(&0xaa64_u16.to_le_bytes());
+        fs::write(&kernel, &image).unwrap();
+        validate_executable_identity(
+            &kernel,
+            RuntimeArtifactKindV1::Kernel,
+            HostTarget::DarwinArm64,
+        )
+        .unwrap();
+        image[0x38] = 0;
+        fs::write(&kernel, image).unwrap();
+        assert!(
+            validate_executable_identity(
+                &kernel,
+                RuntimeArtifactKindV1::Kernel,
+                HostTarget::LinuxArm64Gnu,
+            )
+            .is_err()
+        );
+    }
+
     fn evidence_fixture(root: &Path, name: &str) -> Arguments {
         let artifacts = root.join(name);
         fs::create_dir(&artifacts).unwrap();
         let mut kernel = vec![0_u8; 64];
-        kernel[..6].copy_from_slice(b"\x7fELF\x02\x01");
-        kernel[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        kernel[0x38..0x3c].copy_from_slice(b"ARMd");
         fs::write(artifacts.join("vmlinux"), kernel).unwrap();
         fs::write(artifacts.join("rootfs.cpio"), b"070701rootfs bytes\n").unwrap();
         let mut guestd = vec![0_u8; 64];
