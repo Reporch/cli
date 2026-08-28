@@ -82,19 +82,20 @@ fn build_manifest(
         for suffix in [".spdx.json", ".intoto.jsonl"] {
             validate_metadata(&directory.join(format!("{file_name}{suffix}")))?;
         }
+        let release_asset = format!("runtime-{}-{file_name}", target_name(arguments.target));
         artifacts.push(RuntimeArtifactV1 {
             kind,
             file_name: file_name.into(),
             sha256,
             size,
-            source_url: arguments.base_url.join(file_name)?.to_string(),
+            source_url: arguments.base_url.join(&release_asset)?.to_string(),
             sbom_url: arguments
                 .base_url
-                .join(&format!("{file_name}.spdx.json"))?
+                .join(&format!("{release_asset}.spdx.json"))?
                 .to_string(),
             provenance_url: arguments
                 .base_url
-                .join(&format!("{file_name}.intoto.jsonl"))?
+                .join(&format!("{release_asset}.intoto.jsonl"))?
                 .to_string(),
         });
     }
@@ -333,6 +334,13 @@ mod tests {
             let second = build_manifest(&arguments, generated).unwrap();
             assert_eq!(first, second);
             first.validate(generated).unwrap();
+            assert!(first.artifacts.iter().all(|artifact| {
+                artifact.source_url.contains(&format!(
+                    "/runtime-{}-{}",
+                    target_name(target),
+                    artifact.file_name
+                ))
+            }));
         }
     }
 
