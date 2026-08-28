@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -38,4 +38,12 @@ test("Linux package scripts parse and the service is KVM-only and networkless", 
   assert.match(unit, /DevicePolicy=closed/);
   assert.match(unit, /DeviceAllow=\/dev\/kvm rw/);
   assert.doesNotMatch(unit, /0\.0\.0\.0|AF_INET/);
+});
+
+test("macOS release entitlement grants virtualization and nothing broader", () => {
+  const path = "installers/macos/reporch.entitlements";
+  const contents = readFileSync(path, "utf8");
+  assert.match(contents, /com\.apple\.security\.virtualization/);
+  assert.doesNotMatch(contents, /allow-jit|disable-library-validation|network\./);
+  if (process.platform === "darwin") execFileSync("plutil", ["-lint", path]);
 });

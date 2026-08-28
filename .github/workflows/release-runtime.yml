@@ -1,0 +1,142 @@
+name: Release Reporch Runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-runtime-v1
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUNTIME_TAG: reporch-runtime-v1
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+          targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu,x86_64-pc-windows-msvc
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+      - name: Verify pinned local cross-build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(zig version)" = 0.16.0
+          cargo install --list | grep -q '^cargo-zigbuild v0.23.0:'
+          cargo install --list | grep -q '^cargo-xwin v0.23.1:'
+          node scripts/check-runtime-sources.mjs
+          node scripts/check-workflows.mjs
+          test -z "$(git status --porcelain)"
+      - name: Build all five immutable runtime candidates locally
+        shell: bash
+        run: scripts/build-runtime-candidates.sh "$RUNNER_TEMP/runtime-candidates"
+      - name: Materialize the isolated runtime signing key
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.REPORCH_RUNTIME_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$SIGNING_KEY"
+          printf '%s' "$SIGNING_KEY" > "$RUNNER_TEMP/runtime-manifest.key"
+      - name: Sign and independently verify every target manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p reporch-cli
+          for target in darwin-arm64 darwin-x64 linux-arm64-gnu linux-x64-gnu windows-x64-msvc; do
+            manifest="$RUNNER_TEMP/runtime-candidates/manifests/runtime-$target-manifest.json"
+            signature="$manifest.minisig"
+            cargo run --locked --manifest-path tools/runtime-manifest-signer/Cargo.toml -- \
+              "$manifest" "$RUNNER_TEMP/runtime-manifest.key" \
+              artifacts/runtime-v1.minisign.pub "$signature"
+            encoded_signature=$(base64 < "$signature" | tr -d '\r\n')
+            encoded_key=$(base64 < artifacts/runtime-v1.minisign.pub | tr -d '\r\n')
+            target/release/reporch artifact verify-minisign \
+              --artifact "$manifest" --signature "$encoded_signature" --public-key "$encoded_key"
+          done
+      - name: Remove runtime signing material
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/runtime-manifest.key"
+      - name: Stage a flat collision-free release and verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/stage-runtime-release.mjs \
+            "$RUNNER_TEMP/runtime-candidates/manifests" \
+            "$RUNNER_TEMP/runtime-candidates/artifacts" \
+            "$RUNNER_TEMP/runtime-release"
+          (cd "$RUNNER_TEMP/runtime-release" && shasum -a 256 --check SHA256SUMS)
+      - name: Attest every immutable runtime asset
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: ${{ runner.temp }}/runtime-release/*
+      - name: Create or replace the draft runtime channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RUNTIME_TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$RUNTIME_TAG" --json isDraft --jq .isDraft)" = true
+            gh release edit "$RUNTIME_TAG" --target "$GITHUB_SHA"
+          else
+            gh release create "$RUNTIME_TAG" --draft --target "$GITHUB_SHA" \
+              --title "Reporch Runtime v1" \
+              --notes "Signed Docker-free Reporch VM runtime channel. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
+          fi
+          gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/runtime-release"/* --clobber
+          mkdir "$RUNNER_TEMP/runtime-release-download"
+          gh release download "$RUNTIME_TAG" --dir "$RUNNER_TEMP/runtime-release-download"
+          cmp "$RUNNER_TEMP/runtime-release/SHA256SUMS" "$RUNNER_TEMP/runtime-release-download/SHA256SUMS"
+          (cd "$RUNNER_TEMP/runtime-release-download" && shasum -a 256 --check SHA256SUMS)
+      - name: Publish and fetch the channel through the public updater contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$RUNTIME_TAG" --draft=false --prerelease
+          failed=0
+          for target in darwin-arm64 darwin-x64 linux-arm64-gnu linux-x64-gnu windows-x64-msvc; do
+            bundle="$RUNNER_TEMP/public-$target"
+            tree="$RUNNER_TEMP/tree-$target"
+            if ! node scripts/fetch-runtime-bundle.mjs "$target" "$bundle"; then
+              failed=1
+              break
+            fi
+            generated_at=$(jq -er '.generated_at | fromdateiso8601' "$bundle/manifest.json")
+            SOURCE_DATE_EPOCH="$generated_at" cargo run --locked -p reporch-runtime-install-tree-builder -- \
+              "$bundle/manifest.json" "$bundle/manifest.json.minisig" \
+              "$bundle/artifacts" "$tree"
+            node --input-type=module -e \
+              'import {assertRuntimeInstallTree} from "./scripts/release-lib.mjs"; assertRuntimeInstallTree(process.argv[1], process.argv[2]);' \
+              "$tree" "$target"
+          done
+          if [ "$failed" -ne 0 ]; then
+            gh release edit "$RUNTIME_TAG" --draft
+            exit 1
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-v1-release-evidence
+          path: |
+            ${{ runner.temp }}/runtime-release
+            ${{ runner.temp }}/runtime-candidates/sources.lock.json
+          if-no-files-found: error
+          retention-days: 90

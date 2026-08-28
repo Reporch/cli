@@ -80,18 +80,23 @@ jobs:
         include:
           - runner: cli-macos-arm64
             target: aarch64-apple-darwin
+            runtime_target: darwin-arm64
             binary: target/aarch64-apple-darwin/release/reporch
           - runner: cli-macos-x64
             target: x86_64-apple-darwin
+            runtime_target: darwin-x64
             binary: target/x86_64-apple-darwin/release/reporch
           - runner: cli-linux-x64
             target: x86_64-unknown-linux-gnu
+            runtime_target: linux-x64-gnu
             binary: target/x86_64-unknown-linux-gnu/release/reporch
           - runner: cli-linux-arm64
             target: aarch64-unknown-linux-gnu
+            runtime_target: linux-arm64-gnu
             binary: target/aarch64-unknown-linux-gnu/release/reporch
           - runner: cli-windows-x64
             target: x86_64-pc-windows-msvc
+            runtime_target: windows-x64-msvc
             binary: target/x86_64-pc-windows-msvc/release/reporch.exe
     runs-on: [self-hosted, "${{ matrix.runner }}", cli-zero-cost]
     steps:
@@ -107,15 +112,74 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test --locked --workspace --all-targets
       - run: cargo build --locked --release -p reporch-cli --target ${{ matrix.target }}
+      - name: Fetch and reconstruct the signed mandatory runtime
+        shell: bash
+        env:
+          RUNTIME_TARGET: ${{ matrix.runtime_target }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/runtime-bundle-$RUNTIME_TARGET"
+          tree="$GITHUB_WORKSPACE/release-output/runtime/$RUNTIME_TARGET"
+          node scripts/fetch-runtime-bundle.mjs "$RUNTIME_TARGET" "$bundle"
+          generated_at=$(node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync(process.argv[1])); process.stdout.write(String(Date.parse(value.generated_at)/1000));' "$bundle/manifest.json")
+          mkdir -p "$(dirname "$tree")"
+          SOURCE_DATE_EPOCH="$generated_at" cargo run --locked -p reporch-runtime-install-tree-builder -- \
+            "$bundle/manifest.json" "$bundle/manifest.json.minisig" \
+            "$bundle/artifacts" "$tree"
+          node --input-type=module -e \
+            'import {assertRuntimeInstallTree} from "./scripts/release-lib.mjs"; assertRuntimeInstallTree(process.argv[1], process.argv[2]);' \
+            "$tree" "$RUNTIME_TARGET"
+      - name: Sign the native CLI executable
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MAC_APPLICATION_IDENTITY: ${{ secrets.REPORCH_MAC_APPLICATION_IDENTITY }}
+          WINDOWS_CERT_SHA1: ${{ secrets.REPORCH_WINDOWS_CERT_SHA1 }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            *-apple-darwin)
+              test -n "$MAC_APPLICATION_IDENTITY"
+              codesign --force --options runtime --timestamp \
+                --entitlements installers/macos/reporch.entitlements \
+                --sign "$MAC_APPLICATION_IDENTITY" "${{ matrix.binary }}"
+              codesign --verify --strict --verbose=2 "${{ matrix.binary }}"
+              ;;
+            *-pc-windows-msvc)
+              test -n "$WINDOWS_CERT_SHA1"
+              signtool sign /sha1 "$WINDOWS_CERT_SHA1" /fd SHA256 \
+                /tr http://timestamp.acs.microsoft.com /td SHA256 "${{ matrix.binary }}"
+              signtool verify /pa /all "${{ matrix.binary }}"
+              ;;
+          esac
       - shell: bash
         env:
           VERSION: ${{ needs.verify-source.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          RUNTIME_TARGET: ${{ matrix.runtime_target }}
+          REPORCH_RELEASE_SIGNING_REQUIRED: "1"
+          REPORCH_MAC_INSTALLER_IDENTITY: ${{ secrets.REPORCH_MAC_INSTALLER_IDENTITY }}
+          REPORCH_WINDOWS_CERT_SHA1: ${{ secrets.REPORCH_WINDOWS_CERT_SHA1 }}
+          REPORCH_MAC_NOTARY_PROFILE: ${{ secrets.REPORCH_MAC_NOTARY_PROFILE }}
         run: |
           set -euo pipefail
           test "$("${{ matrix.binary }}" --version)" = "reporch $VERSION"
           node scripts/test-current-npm-package.mjs "${{ matrix.target }}" "${{ matrix.binary }}"
           mkdir -p "release-output/${{ matrix.target }}"
           cp "${{ matrix.binary }}" "release-output/${{ matrix.target }}/"
+          node scripts/pack-system-installer.mjs \
+            "$TARGET" "${{ matrix.binary }}" "release-output/runtime/$RUNTIME_TARGET" \
+            "release-output/system-installers/$TARGET"
+          case "$TARGET" in
+            *-apple-darwin)
+              test -n "$REPORCH_MAC_NOTARY_PROFILE"
+              package=$(find "release-output/system-installers/$TARGET" -maxdepth 1 -type f -name '*.pkg' -print)
+              test -n "$package"
+              xcrun notarytool submit "$package" --keychain-profile "$REPORCH_MAC_NOTARY_PROFILE" --wait
+              xcrun stapler staple "$package"
+              xcrun stapler validate "$package"
+              ;;
+          esac
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-${{ matrix.target }}
@@ -193,6 +257,10 @@ jobs:
           set -euo pipefail
           mkdir dist/release-assets
           cp dist/tarballs/*.tgz dist/native/*.tar.gz dist/native/*.zip \
+            release-input/system-installers/*/*.pkg \
+            release-input/system-installers/*/*.deb \
+            release-input/system-installers/*/*.rpm \
+            release-input/system-installers/*/*.msi \
             dist/reporch-cli.spdx.json dist/release-manifest.json \
             dist/npm-pack-manifest.json dist/native/native-release-manifest.json \
             dist/release-assets/
