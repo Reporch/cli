@@ -121,6 +121,12 @@ pub enum ToolchainFilesystemV2 {
     Vhdx,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolchainCompressionV2 {
+    Zstd,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolchainBundleV2 {
@@ -129,6 +135,10 @@ pub struct ToolchainBundleV2 {
     pub file_name: String,
     pub sha256: String,
     pub size: u64,
+    pub archive_file_name: String,
+    pub archive_sha256: String,
+    pub archive_size: u64,
+    pub compression: ToolchainCompressionV2,
     pub source_url: String,
     pub sbom_url: String,
     pub provenance_url: String,
@@ -194,12 +204,36 @@ impl ToolchainIndexV2 {
                 )));
             }
             let mut targets = HashSet::new();
-            let mut names = HashSet::new();
-            for bundle in &entry.bundles {
-                if !targets.insert(bundle.target) || !names.insert(bundle.file_name.as_str()) {
+            for (index, bundle) in entry.bundles.iter().enumerate() {
+                if !targets.insert(bundle.target) {
                     return Err(RuntimeError::AssetVerificationFailed(
-                        "duplicate toolchain target or artifact name".into(),
+                        "duplicate toolchain target".into(),
                     ));
+                }
+                for previous in &entry.bundles[..index] {
+                    if previous.file_name == bundle.file_name
+                        && (previous.filesystem != bundle.filesystem
+                            || previous.sha256 != bundle.sha256
+                            || previous.size != bundle.size
+                            || previous.archive_file_name != bundle.archive_file_name
+                            || previous.archive_sha256 != bundle.archive_sha256
+                            || previous.archive_size != bundle.archive_size
+                            || previous.compression != bundle.compression
+                            || previous.source_url != bundle.source_url
+                            || previous.sbom_url != bundle.sbom_url
+                            || previous.provenance_url != bundle.provenance_url)
+                    {
+                        return Err(RuntimeError::AssetVerificationFailed(
+                            "shared toolchain artifact identity changed across targets".into(),
+                        ));
+                    }
+                    if previous.archive_file_name == bundle.archive_file_name
+                        && previous.file_name != bundle.file_name
+                    {
+                        return Err(RuntimeError::AssetVerificationFailed(
+                            "toolchain archive name aliases a different image".into(),
+                        ));
+                    }
                 }
                 let expected_filesystem = if bundle.target == HostTarget::WindowsX64Msvc {
                     ToolchainFilesystemV2::Vhdx
@@ -213,9 +247,19 @@ impl ToolchainIndexV2 {
                 }
                 validate_file_name(&bundle.file_name)?;
                 validate_sha256(&bundle.sha256)?;
+                validate_file_name(&bundle.archive_file_name)?;
+                validate_sha256(&bundle.archive_sha256)?;
                 if bundle.size == 0 || bundle.size > 8 * 1_073_741_824 {
                     return Err(RuntimeError::AssetVerificationFailed(
                         "invalid toolchain bundle size".into(),
+                    ));
+                }
+                if bundle.archive_size == 0
+                    || bundle.archive_size > 2 * 1_073_741_824
+                    || bundle.archive_size >= bundle.size
+                {
+                    return Err(RuntimeError::AssetVerificationFailed(
+                        "invalid toolchain archive size".into(),
                     ));
                 }
                 for url in [&bundle.source_url, &bundle.sbom_url, &bundle.provenance_url] {
@@ -665,8 +709,12 @@ mod tests {
             },
             file_name: format!("python-{suffix}.img"),
             sha256: format!("sha256:{}", "b".repeat(64)),
-            size: 1024,
-            source_url: format!("https://downloads.reporch.com/python-{suffix}.img"),
+            size: 2048,
+            archive_file_name: format!("python-{suffix}.img.zst"),
+            archive_sha256: format!("sha256:{}", "d".repeat(64)),
+            archive_size: 1024,
+            compression: ToolchainCompressionV2::Zstd,
+            source_url: format!("https://downloads.reporch.com/python-{suffix}.img.zst"),
             sbom_url: format!("https://downloads.reporch.com/python-{suffix}.spdx.json"),
             provenance_url: format!("https://downloads.reporch.com/python-{suffix}.intoto.jsonl"),
         };
@@ -694,6 +742,13 @@ mod tests {
             }],
         };
         index.validate(now).unwrap();
+        let mut shared_arm64 = index.entries[0].bundles[0].clone();
+        shared_arm64.target = HostTarget::LinuxArm64Gnu;
+        index.entries[0].bundles[2] = shared_arm64;
+        index.validate(now).unwrap();
+        index.entries[0].bundles[2].source_url.push_str("-changed");
+        assert!(index.validate(now).is_err());
+        index.entries[0].bundles[2].source_url = index.entries[0].bundles[0].source_url.clone();
         index.entries[0].studio_oci_image = "python:latest".into();
         assert!(index.validate(now).is_err());
     }

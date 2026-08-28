@@ -246,6 +246,7 @@ fn prepare_plan(
     peer_spool: &Path,
 ) -> Result<()> {
     ensure_root_owned_directory(&plan.chroot_base)?;
+    ensure_staging_capacity(&plan.chroot_base, bundle, toolchain, job)?;
     ensure!(!plan.jail_root.exists(), "Firecracker jail already exists");
     fs::create_dir_all(plan.jail_root.join("run")).context("create Firecracker jail root")?;
     fs::create_dir(&plan.input_view).context("create Firecracker input view")?;
@@ -306,6 +307,13 @@ fn prepare_plan(
 }
 
 fn materialize_input_view(view: &Path, spool: &Path, job: &GuestJobV1) -> Result<()> {
+    let object_root = view
+        .parent()
+        .context("runtime input view has no parent")?
+        .join("input-objects");
+    fs::create_dir(&object_root).context("create runtime input object cache")?;
+    fs::set_permissions(&object_root, fs::Permissions::from_mode(0o700))?;
+    let mut objects = std::collections::HashMap::new();
     for input in &job.inputs {
         let digest = input
             .sha256
@@ -315,45 +323,118 @@ fn materialize_input_view(view: &Path, spool: &Path, job: &GuestJobV1) -> Result
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).context("create runtime input-view directory")?;
         }
-        let mut source = open_spool_object(spool, digest)?;
-        let source_metadata = source
-            .metadata()
-            .context("inspect opened peer spool object")?;
-        ensure!(
-            source_metadata.is_file() && source_metadata.len() == input.size,
-            "peer spool object size or type changed"
-        );
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination)
-            .context("create root-owned runtime input view")?;
-        let mut hasher = Sha256::new();
-        let mut total = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = source.read(&mut buffer).context("read peer spool object")?;
-            if read == 0 {
-                break;
-            }
-            total = total
-                .checked_add(read as u64)
-                .context("input view size overflow")?;
-            ensure!(total <= input.size, "peer spool object grew");
-            hasher.update(&buffer[..read]);
-            output
-                .write_all(&buffer[..read])
-                .context("write runtime input view")?;
-        }
-        ensure!(total == input.size, "peer spool object is truncated");
-        ensure!(
-            format!("sha256:{}", hex::encode(hasher.finalize())) == input.sha256,
-            "peer spool object digest changed"
-        );
-        output.sync_all().context("sync runtime input view")?;
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o400))?;
+        let object_path = if let Some(path) = objects.get(digest) {
+            path
+        } else {
+            let path = object_root.join(digest);
+            copy_verified_spool_object(spool, digest, input.size, &input.sha256, &path)?;
+            objects.insert(digest, path);
+            objects.get(digest).context("cache runtime input object")?
+        };
+        fs::hard_link(object_path, &destination)
+            .context("link verified runtime input into private view")?;
     }
     Ok(())
+}
+
+fn copy_verified_spool_object(
+    spool: &Path,
+    digest: &str,
+    expected_size: u64,
+    expected_digest: &str,
+    destination: &Path,
+) -> Result<()> {
+    let mut source = open_spool_object(spool, digest)?;
+    let source_metadata = source
+        .metadata()
+        .context("inspect opened peer spool object")?;
+    ensure!(
+        source_metadata.is_file() && source_metadata.len() == expected_size,
+        "peer spool object size or type changed"
+    );
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .context("create root-owned runtime input object")?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).context("read peer spool object")?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .context("input object size overflow")?;
+        ensure!(total <= expected_size, "peer spool object grew");
+        hasher.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .context("write runtime input object")?;
+    }
+    ensure!(total == expected_size, "peer spool object is truncated");
+    ensure!(
+        format!("sha256:{}", hex::encode(hasher.finalize())) == expected_digest,
+        "peer spool object digest changed"
+    );
+    output.sync_all().context("sync runtime input object")?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o400))?;
+    Ok(())
+}
+
+fn ensure_staging_capacity(
+    root: &Path,
+    bundle: &VerifiedRuntimeBundleV1,
+    toolchain: Option<&VerifiedToolchainBundleV2>,
+    job: &GuestJobV1,
+) -> Result<()> {
+    const RESERVED_BYTES: u64 = 512 * 1_048_576;
+
+    let required = required_staging_bytes(bundle, toolchain, job)?
+        .checked_add(RESERVED_BYTES)
+        .context("runtime staging reserve overflow")?;
+    let status = rustix::fs::statvfs(root).context("inspect runtime staging filesystem")?;
+    let available = status
+        .f_bavail
+        .checked_mul(status.f_frsize)
+        .context("runtime available-space overflow")?;
+    ensure!(
+        available >= required,
+        "runtime staging needs {required} bytes but only {available} bytes are available"
+    );
+    Ok(())
+}
+
+fn required_staging_bytes(
+    bundle: &VerifiedRuntimeBundleV1,
+    toolchain: Option<&VerifiedToolchainBundleV2>,
+    job: &GuestJobV1,
+) -> Result<u64> {
+    let mut required = bundle
+        .manifest
+        .artifacts
+        .iter()
+        .try_fold(0_u64, |total, artifact| {
+            total
+                .checked_add(artifact.size)
+                .context("runtime staging size overflow")
+        })?;
+    if let Some(toolchain) = toolchain {
+        required = required
+            .checked_add(toolchain.bundle.size)
+            .context("runtime staging size overflow")?;
+    }
+    let mut digests = std::collections::HashSet::new();
+    for input in &job.inputs {
+        if digests.insert(input.sha256.as_str()) {
+            required = required
+                .checked_add(input.size)
+                .context("runtime staging size overflow")?;
+        }
+    }
+    Ok(required)
 }
 
 fn open_spool_object(spool: &Path, digest: &str) -> Result<fs::File> {

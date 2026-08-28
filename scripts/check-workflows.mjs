@@ -128,10 +128,22 @@ assert.doesNotMatch(
 );
 const publishedE2e = readFileSync(".github/workflows/published-artifact-e2e.yml", "utf8");
 const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
+const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml", "utf8");
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates"/);
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
+assert.match(toolchainRelease, /materialize-toolchain-sources\.sh/);
+assert.match(toolchainRelease, /syft[\s\S]*1\.51\.0/i);
+assert.match(toolchainRelease, /normalize-toolchain-sbom\.mjs|build-toolchain-candidates\.sh/);
+assert.match(toolchainRelease, /build-toolchain-candidates\.sh/);
+assert.match(toolchainRelease, /qualify-toolchain-reproducibility\.sh/);
+assert.match(toolchainRelease, /REPORCH_RUNTIME_SIGNING_KEY/);
+assert.match(toolchainRelease, /artifacts\/runtime-v1\.minisign\.pub/);
+assert.match(toolchainRelease, /toolchain prefetch bash-5\.3/);
+assert.match(toolchainRelease, /unset DOCKER_HOST CONTAINER_HOST/);
+assert.match(toolchainRelease, /TOOLCHAIN-SHA256SUMS/);
+assert.match(toolchainRelease, /subject-path: \$\{\{ runner\.temp \}\}\/toolchain-release\/\*/);
 for (const target of [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",

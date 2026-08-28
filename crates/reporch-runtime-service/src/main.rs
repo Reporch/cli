@@ -28,6 +28,7 @@ mod unix_service {
     const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
     const SPOOL_VERIFY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
     const MAX_CONNECTIONS: usize = 16;
+    const MAX_RUNNING_JOBS: usize = 1;
 
     pub async fn run() -> Result<()> {
         #[cfg(target_os = "linux")]
@@ -53,6 +54,7 @@ mod unix_service {
         );
         let cleanup = SocketCleanup(socket.clone());
         let semaphore = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let job_semaphore = std::sync::Arc::new(Semaphore::new(MAX_RUNNING_JOBS));
         loop {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => {
@@ -64,9 +66,10 @@ mod unix_service {
                     let permit = semaphore.clone().acquire_owned().await
                         .context("runtime service connection limiter closed")?;
                     let spool_override = spool_override.clone();
+                    let job_semaphore = job_semaphore.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _ = handle_connection(stream, spool_override.as_deref()).await;
+                        let _ = handle_connection(stream, spool_override.as_deref(), &job_semaphore).await;
                     });
                 }
             }
@@ -78,6 +81,7 @@ mod unix_service {
     async fn handle_connection(
         mut stream: UnixStream,
         spool_override: Option<&Path>,
+        job_semaphore: &std::sync::Arc<Semaphore>,
     ) -> Result<()> {
         let credential = stream
             .peer_cred()
@@ -97,7 +101,7 @@ mod unix_service {
             .await
             .context("runtime service request timed out")??;
         let result = match request.validate() {
-            Ok(()) => execute_request(&request, &spool, peer_uid)
+            Ok(()) => execute_request(&request, &spool, peer_uid, job_semaphore)
                 .await
                 .unwrap_or_else(|error| {
                     RuntimeServiceResultV1::Error(ProtocolFailureV1::bounded(
@@ -129,6 +133,7 @@ mod unix_service {
         request: &RuntimeServiceRequestV1,
         spool: &Path,
         peer_uid: u32,
+        job_semaphore: &std::sync::Arc<Semaphore>,
     ) -> Result<RuntimeServiceResultV1> {
         match &request.command {
             RuntimeServiceCommandV1::Ping => Ok(RuntimeServiceResultV1::Pong {
@@ -175,6 +180,11 @@ mod unix_service {
                 runtime_sequence,
                 runtime_bundle_digest,
             } => {
+                let _job_permit = job_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("runtime service job limiter closed")?;
                 validate_peer_spool_directory(spool, peer_uid)?;
                 #[cfg(target_os = "linux")]
                 {
@@ -226,6 +236,7 @@ mod unix_service {
         objects: &[reporch_runtime_protocol::ContentObjectV1],
     ) -> Result<(u32, u64)> {
         let mut total = 0_u64;
+        let mut verified = std::collections::HashSet::new();
         for object in objects {
             let digest = object
                 .sha256
@@ -238,28 +249,20 @@ mod unix_service {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
                 "spool object digest is invalid"
             );
-            let path = spool.join(&digest[..2]).join(digest);
-            ensure!(
-                path.starts_with(spool),
-                "spool object path escaped its root"
-            );
-            let metadata = fs::symlink_metadata(&path)
+            total = total
+                .checked_add(object.size)
+                .context("spool total size overflow")?;
+            if !verified.insert(digest) {
+                continue;
+            }
+            let file = open_spool_object(spool, digest)
+                .with_context(|| format!("open runtime spool object {digest}"))?;
+            let metadata = file
+                .metadata()
                 .with_context(|| format!("inspect runtime spool object {digest}"))?;
             ensure!(
-                metadata.is_file()
-                    && !metadata.file_type().is_symlink()
-                    && metadata.len() == object.size,
+                metadata.is_file() && metadata.len() == object.size,
                 "runtime spool object size or type changed"
-            );
-            let file = fs::File::open(&path).context("open runtime spool object")?;
-            let after = file
-                .metadata()
-                .context("inspect opened runtime spool object")?;
-            ensure!(
-                after.dev() == metadata.dev()
-                    && after.ino() == metadata.ino()
-                    && after.len() == metadata.len(),
-                "runtime spool object changed while being opened"
             );
             let mut reader = BufReader::with_capacity(64 * 1024, file);
             let mut hasher = Sha256::new();
@@ -283,11 +286,35 @@ mod unix_service {
                 hex::encode(hasher.finalize()) == digest,
                 "runtime spool object digest changed"
             );
-            total = total
-                .checked_add(size)
-                .context("spool total size overflow")?;
         }
         Ok((u32::try_from(objects.len())?, total))
+    }
+
+    fn open_spool_object(spool: &Path, digest: &str) -> Result<fs::File> {
+        use rustix::fs::{Mode, OFlags, open, openat};
+
+        ensure!(spool.is_absolute(), "runtime spool path must be absolute");
+        let directory = open(
+            spool,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .context("open runtime spool directory without following its final symlink")?;
+        let prefix = openat(
+            &directory,
+            &digest[..2],
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .context("open runtime spool prefix without following symlinks")?;
+        let file = openat(
+            &prefix,
+            digest,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .context("open runtime spool object without following symlinks")?;
+        Ok(file.into())
     }
 
     fn service_socket_path() -> Result<PathBuf> {
@@ -488,7 +515,7 @@ mod unix_service {
 }
 
 #[cfg(unix)]
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     if let Err(error) = unix_service::run().await {
         eprintln!("reporch-runtime-service: {error:#}");

@@ -274,7 +274,7 @@ function windowsDirectoryXml(root, path, componentIds) {
       const extra = child === join("bin", "reporch.exe")
         ? '<Environment Id="ReporchPath" Name="PATH" Value="[BINDIR]" Action="set" Part="last" System="yes" />'
         : child === join("bin", "reporch-runtime-service.exe")
-          ? '<ServiceInstall Id="RuntimeServiceInstall" Name="ReporchRuntime" DisplayName="Reporch Runtime" Description="Isolated Reporch VM execution broker" Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" /><ServiceControl Id="RuntimeServiceControl" Name="ReporchRuntime" Start="install" Stop="both" Remove="uninstall" Wait="yes" />'
+          ? '<Environment Id="RuntimeAllowedSid" Name="REPORCH_RUNTIME_ALLOWED_SID" Value="[UserSID]" Action="set" Part="all" System="yes" Permanent="no" /><ServiceInstall Id="RuntimeServiceInstall" Name="ReporchRuntime" DisplayName="Reporch Runtime" Description="Isolated Reporch VM execution broker" Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" /><ServiceControl Id="RuntimeServiceControl" Name="ReporchRuntime" Start="install" Stop="both" Remove="uninstall" Wait="yes" />'
           : "";
       return `<Component Id="${id}" Guid="*"><File Source="${xml(resolve(source))}" KeyPath="yes" />${extra}</Component>`;
     })

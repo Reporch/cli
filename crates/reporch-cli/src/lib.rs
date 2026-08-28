@@ -8,6 +8,7 @@ mod project_template;
 pub mod remote_consent;
 pub mod studio_remote;
 pub mod toolchain;
+pub mod verified_file;
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;

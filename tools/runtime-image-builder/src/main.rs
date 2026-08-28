@@ -75,6 +75,8 @@ fn build(
             ("sys", 0o040555),
             ("tmp", 0o041777),
             ("toolchain", 0o040555),
+            ("toolchain-overlay", 0o040700),
+            ("toolchain-ro", 0o040555),
             ("workspace", 0o040755),
         ];
         if !modules.is_empty() {

@@ -1,0 +1,22 @@
+[package]
+name = "arcbox-ext4"
+version = "0.1.2"
+edition = "2024"
+rust-version = "1.85"
+description = "Pure-Rust ext4 filesystem formatter and reader for container images"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arcboxlabs/ext4-rs"
+homepage = "https://github.com/arcboxlabs/ext4-rs"
+documentation = "https://docs.rs/arcbox-ext4"
+readme = "README.md"
+keywords = ["ext4", "filesystem", "container", "oci", "mkfs"]
+categories = ["filesystem", "os"]
+exclude = ["/tests", "/.github"]
+
+[dependencies]
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+tar = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

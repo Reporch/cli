@@ -393,23 +393,17 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use reporch_runtime_core::{
         HostTarget, INSTALLATION_SCHEMA, RuntimeArtifactKindV1, RuntimeArtifactV1, RuntimeBackend,
-        RuntimeBundleManifestV1, RuntimeInstallationV1,
+        RuntimeBundleManifestV1, RuntimeInstallationV1, TOOLCHAIN_INSTALLATION_SCHEMA,
+        ToolchainBundleV2, ToolchainEntryV2, ToolchainFilesystemV2, ToolchainInstallationV2,
     };
     use reporch_runtime_protocol::{
-        GuestOperationV1, JOB_SCHEMA, PROTOCOL_VERSION, ResourceLimitsV1,
+        ContentObjectV1, GuestOperationV1, JOB_SCHEMA, PROTOCOL_VERSION, ResourceLimitsV1,
     };
+    use sha2::{Digest as _, Sha256};
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
-    #[test]
-    #[ignore = "requires signed macOS test binary plus real arm64/x64 kernel and initramfs"]
-    fn real_apple_vm_boots_handshakes_executes_and_stops() {
-        let iterations = std::env::var("REPORCH_TEST_ITERATIONS")
-            .ok()
-            .map(|value| value.parse::<u16>().unwrap())
-            .unwrap_or(1);
-        assert!((1..=1_000).contains(&iterations));
-        let descriptors_before = std::fs::read_dir("/dev/fd").unwrap().count();
+    fn real_test_runtime_bundle() -> VerifiedRuntimeBundleV1 {
         let kernel = Path::new(&std::env::var("REPORCH_TEST_KERNEL").unwrap()).to_owned();
         let rootfs = Path::new(&std::env::var("REPORCH_TEST_INITRAMFS").unwrap()).to_owned();
         assert_eq!(kernel.parent(), rootfs.parent());
@@ -429,7 +423,7 @@ mod tests {
             provenance_url: "https://example.invalid/runtime.provenance".into(),
         };
         let digest = format!("sha256:{}", "1".repeat(64));
-        let bundle = VerifiedRuntimeBundleV1 {
+        VerifiedRuntimeBundleV1 {
             installation: RuntimeInstallationV1 {
                 schema: INSTALLATION_SCHEMA.into(),
                 sequence: 1,
@@ -456,7 +450,19 @@ mod tests {
                 ],
             },
             directory,
-        };
+        }
+    }
+
+    #[test]
+    #[ignore = "requires signed macOS test binary plus real arm64/x64 kernel and initramfs"]
+    fn real_apple_vm_boots_handshakes_executes_and_stops() {
+        let iterations = std::env::var("REPORCH_TEST_ITERATIONS")
+            .ok()
+            .map(|value| value.parse::<u16>().unwrap())
+            .unwrap_or(1);
+        assert!((1..=1_000).contains(&iterations));
+        let descriptors_before = std::fs::read_dir("/dev/fd").unwrap().count();
+        let bundle = real_test_runtime_bundle();
         let job = GuestJobV1 {
             schema: JOB_SCHEMA.into(),
             protocol_version: PROTOCOL_VERSION,
@@ -510,5 +516,92 @@ mod tests {
             descriptors_after <= descriptors_before + 4,
             "Apple VM qualification leaked file descriptors: {descriptors_before} -> {descriptors_after}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a real kernel, initramfs, and deterministic ext4 toolchain image"]
+    fn real_apple_vm_mounts_and_executes_toolchain_image() {
+        let bundle = real_test_runtime_bundle();
+        let target = HostTarget::current().unwrap();
+        let toolchain_path =
+            Path::new(&std::env::var("REPORCH_TEST_TOOLCHAIN").unwrap()).to_owned();
+        let toolchain_bytes = std::fs::read(&toolchain_path).unwrap();
+        let bundle_sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&toolchain_bytes)));
+        let lock_sha256 = format!("sha256:{}", "2".repeat(64));
+        let toolchain_bundle = ToolchainBundleV2 {
+            target,
+            filesystem: ToolchainFilesystemV2::Ext4,
+            file_name: toolchain_path.file_name().unwrap().to_str().unwrap().into(),
+            sha256: bundle_sha256.clone(),
+            size: toolchain_bytes.len() as u64,
+            archive_file_name: "bash-arm64.ext4.zst".into(),
+            archive_sha256: format!("sha256:{}", "4".repeat(64)),
+            archive_size: toolchain_bytes.len() as u64 / 2,
+            compression: reporch_runtime_core::ToolchainCompressionV2::Zstd,
+            source_url: "https://example.invalid/toolchain".into(),
+            sbom_url: "https://example.invalid/toolchain.sbom".into(),
+            provenance_url: "https://example.invalid/toolchain.provenance".into(),
+        };
+        let toolchain = VerifiedToolchainBundleV2 {
+            installation: ToolchainInstallationV2 {
+                schema: TOOLCHAIN_INSTALLATION_SCHEMA.into(),
+                index_sequence: 1,
+                id: "bash-5.3".into(),
+                target,
+                toolchain_lock_sha256: lock_sha256.clone(),
+                bundle_sha256: bundle_sha256.clone(),
+                file_name: toolchain_bundle.file_name.clone(),
+                installed_at: Utc::now(),
+            },
+            entry: ToolchainEntryV2 {
+                id: "bash-5.3".into(),
+                language: "bash".into(),
+                toolchain_lock_sha256: lock_sha256.clone(),
+                studio_oci_image: format!("example.invalid/bash@sha256:{}", "3".repeat(64)),
+                bundles: vec![toolchain_bundle.clone()],
+            },
+            bundle: toolchain_bundle,
+            path: toolchain_path,
+        };
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("src")).unwrap();
+        let source = b"printf 'toolchain-ok\\n'\n";
+        std::fs::write(project.path().join("src/main.sh"), source).unwrap();
+        let job_id = Uuid::now_v7();
+        let job = GuestJobV1 {
+            schema: JOB_SCHEMA.into(),
+            protocol_version: PROTOCOL_VERSION,
+            id: job_id,
+            nonce: format!("{}-{}", job_id.simple(), Uuid::now_v7().simple()),
+            operation: GuestOperationV1::Program,
+            toolchain_id: "bash-5.3".into(),
+            toolchain_index_sequence: Some(1),
+            toolchain_bundle_sha256: Some(bundle_sha256),
+            toolchain_lock_sha256: Some(lock_sha256),
+            command: vec!["bash".into(), "src/main.sh".into()],
+            environment: BTreeMap::new(),
+            inputs: vec![ContentObjectV1 {
+                path: "src/main.sh".into(),
+                sha256: format!("sha256:{}", hex::encode(Sha256::digest(source))),
+                size: source.len() as u64,
+            }],
+            limits: ResourceLimitsV1 {
+                timeout_ms: 5_000,
+                memory_mib: 256,
+                cpu_millis: 1_000,
+                pids: 16,
+                stdout_bytes: 4_096,
+                stderr_bytes: 4_096,
+                artifact_bytes: 4_096,
+            },
+        };
+        let result = execute(&bundle, Some(&toolchain), project.path(), &job).unwrap();
+        assert_eq!(
+            result.exit_code, 0,
+            "stdout={} stderr={}",
+            result.stdout.data, result.stderr.data
+        );
+        assert_eq!(result.stdout.data, "toolchain-ok\n");
+        assert!(result.stderr.data.is_empty(), "{}", result.stderr.data);
     }
 }

@@ -1,12 +1,17 @@
 use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::fs::File;
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::io::Read;
+use std::io::Write;
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
 use quick_xml::escape::escape;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use studio_core::{
     CheckerSpec, ExpectedVerdict, IssueSeverity, PackageProfile, ReleaseManifestV1, Sha256Digest,
     compatibility_report, validate_manifest,
@@ -30,7 +35,7 @@ pub struct PolygonSidecarV1 {
 enum EntrySource {
     Bytes(Vec<u8>),
     ManifestFile {
-        source: PathBuf,
+        source: String,
         expected_digest: String,
         expected_size: u64,
     },
@@ -145,26 +150,33 @@ pub fn export_polygon_package(
     }
 
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    for entry in &entries {
-        verify_entry(entry)?;
-    }
+    let source_root = reporch_cli::verified_file::open_root(source_root)?;
     let output_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(output)
         .with_context(|| format!("create new export archive {}", output.display()))?;
+    let mut incomplete = IncompleteArchive::new(output);
     let mut archive = ZipWriter::new(output_file);
     for entry in entries {
         archive.start_file(&entry.path, zip_options(entry.executable))?;
         match entry.source {
             EntrySource::Bytes(bytes) => archive.write_all(&bytes)?,
-            EntrySource::ManifestFile { source, .. } => {
-                let mut source = File::open(source)?;
-                std::io::copy(&mut source, &mut archive)?;
-            }
+            EntrySource::ManifestFile {
+                source,
+                expected_digest,
+                expected_size,
+            } => reporch_cli::verified_file::copy_verified(
+                &source_root,
+                &source,
+                expected_size,
+                &expected_digest,
+                &mut archive,
+            )?,
         }
     }
     archive.finish()?.sync_all()?;
+    incomplete.commit();
     Ok(())
 }
 
@@ -360,7 +372,7 @@ fn push_bytes(
 
 fn push_manifest(
     manifest: &ReleaseManifestV1,
-    source_root: &Path,
+    _source_root: &Path,
     source_path: &str,
     target_path: String,
     executable: bool,
@@ -380,7 +392,7 @@ fn push_manifest(
         path: target_path,
         executable,
         source: EntrySource::ManifestFile {
-            source: source_root.join(source_path),
+            source: source_path.into(),
             expected_digest: file.sha256.as_str().into(),
             expected_size: file.size_bytes,
         },
@@ -388,40 +400,30 @@ fn push_manifest(
     Ok(())
 }
 
-fn verify_entry(entry: &ExportEntry) -> Result<()> {
-    let EntrySource::ManifestFile {
-        source,
-        expected_digest,
-        expected_size,
-    } = &entry.source
-    else {
-        return Ok(());
-    };
-    let mut file = File::open(source).with_context(|| format!("read {}", source.display()))?;
-    let mut digest = Sha256::new();
-    let mut size = 0_u64;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+struct IncompleteArchive<'a> {
+    path: &'a Path,
+    committed: bool,
+}
+
+impl<'a> IncompleteArchive<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            committed: false,
         }
-        size = size
-            .checked_add(read as u64)
-            .context("file size overflow")?;
-        digest.update(&buffer[..read]);
     }
-    ensure!(
-        size == *expected_size,
-        "source file size changed: {}",
-        source.display()
-    );
-    ensure!(
-        hex::encode(digest.finalize()) == *expected_digest,
-        "source file digest changed: {}",
-        source.display()
-    );
-    Ok(())
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for IncompleteArchive<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
 }
 
 fn attr(value: &str) -> String {

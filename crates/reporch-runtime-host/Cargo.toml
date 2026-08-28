@@ -21,6 +21,7 @@ minisign-verify.workspace = true
 reporch-runtime-core = { path = "../reporch-runtime-core" }
 reporch-runtime-protocol = { path = "../reporch-runtime-protocol" }
 rustix.workspace = true
+ruzstd.workspace = true
 serde.workspace = true
 serde_bytes = "0.11"
 serde_json.workspace = true
@@ -64,6 +65,16 @@ reqwest = { workspace = true, features = ["rustls"] }
 [target.'cfg(windows)'.dependencies]
 reporch-runtime-hcs = { path = "../reporch-runtime-hcs" }
 reqwest = { workspace = true, features = ["native-tls"] }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_SystemInformation",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Wdk_System_SystemServices",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true
+zstd.workspace = true

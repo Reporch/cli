@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,8 @@ pub const SERVICE_REQUEST_SCHEMA: &str = "reporch.runtime-service-request.v1";
 pub const SERVICE_RESPONSE_SCHEMA: &str = "reporch.runtime-service-response.v1";
 pub const MAX_WIRE_FRAME_BYTES: usize = 12 * 1024 * 1024;
 pub const MAX_CONTENT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_INPUT_OBJECTS: usize = 10_000;
+pub const MAX_INPUT_BYTES: u64 = 1_073_741_824;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
@@ -91,22 +93,29 @@ impl RuntimeServiceRequestV1 {
 }
 
 fn validate_objects(objects: &[ContentObjectV1]) -> Result<(), ProtocolError> {
-    if objects.len() > 100_000 {
+    if objects.len() > MAX_INPUT_OBJECTS {
         return Err(ProtocolError::InvalidField("objects"));
     }
     let mut total = 0_u64;
     let mut paths = HashSet::new();
+    let mut digest_sizes = HashMap::new();
     for object in objects {
         validate_digest(&object.sha256)?;
         validate_relative_path(&object.path)?;
         if !paths.insert(portable_path_key(&object.path)?) {
             return Err(ProtocolError::InvalidField("objects"));
         }
+        if digest_sizes
+            .insert(object.sha256.as_str(), object.size)
+            .is_some_and(|size| size != object.size)
+        {
+            return Err(ProtocolError::InvalidField("objects"));
+        }
         total = total
             .checked_add(object.size)
             .ok_or(ProtocolError::InvalidField("objects"))?;
     }
-    if total > 20 * 1_073_741_824 {
+    if total > MAX_INPUT_BYTES {
         return Err(ProtocolError::InvalidField("objects"));
     }
     Ok(())
@@ -578,22 +587,35 @@ impl GuestJobV1 {
         {
             return Err(ProtocolError::InvalidField("environment"));
         }
-        if self.inputs.len() > 100_000 {
+        if self.inputs.len() > MAX_INPUT_OBJECTS {
             return Err(ProtocolError::InvalidField("inputs"));
         }
         let mut total = 0_u64;
         let mut paths = HashSet::new();
+        let mut digest_sizes = HashMap::new();
         for input in &self.inputs {
             validate_relative_path(&input.path)?;
             validate_digest(&input.sha256)?;
             if !paths.insert(portable_path_key(&input.path)?) {
                 return Err(ProtocolError::InvalidField("inputs"));
             }
+            if digest_sizes
+                .insert(input.sha256.as_str(), input.size)
+                .is_some_and(|size| size != input.size)
+            {
+                return Err(ProtocolError::InvalidField("inputs"));
+            }
             total = total
                 .checked_add(input.size)
                 .ok_or(ProtocolError::InvalidField("inputs"))?;
         }
-        if total > 20 * 1_073_741_824 {
+        let memory_bound = self
+            .limits
+            .memory_mib
+            .checked_mul(1_048_576)
+            .and_then(|bytes| bytes.checked_div(4))
+            .ok_or(ProtocolError::InvalidField("inputs"))?;
+        if total > MAX_INPUT_BYTES.min(memory_bound) {
             return Err(ProtocolError::InvalidField("inputs"));
         }
         self.limits.validate()
@@ -875,6 +897,26 @@ mod tests {
         let mut non_nfc = job();
         non_nfc.inputs[0].path = "statements/e\u{301}.md".into();
         assert!(non_nfc.validate().is_err());
+    }
+
+    #[test]
+    fn input_staging_is_memory_bounded_and_digest_sizes_are_consistent() {
+        let mut oversized = job();
+        oversized.inputs[0].size = oversized.limits.memory_mib * 1_048_576 / 4 + 1;
+        assert_eq!(
+            oversized.validate(),
+            Err(ProtocolError::InvalidField("inputs"))
+        );
+
+        let mut inconsistent = job();
+        let mut alias = inconsistent.inputs[0].clone();
+        alias.path = "alias.py".into();
+        alias.size += 1;
+        inconsistent.inputs.push(alias);
+        assert_eq!(
+            inconsistent.validate(),
+            Err(ProtocolError::InvalidField("inputs"))
+        );
     }
 
     #[test]

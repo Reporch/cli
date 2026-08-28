@@ -249,7 +249,9 @@ fn initialize_linux_guest() -> Result<GuestBootV1> {
 #[cfg(target_os = "linux")]
 fn mount_optional_toolchain() -> Result<()> {
     use rustix::mount::{MountFlags, mount, mount_bind};
+    use std::ffi::CString;
     use std::os::unix::fs::FileTypeExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
     let device = ["/dev/vda", "/dev/sda1", "/dev/sda", "/dev/sdb1", "/dev/sdb"]
         .into_iter()
@@ -263,12 +265,50 @@ fn mount_optional_toolchain() -> Result<()> {
     };
     mount(
         device,
-        "/toolchain",
+        "/toolchain-ro",
         "ext4",
         MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOATIME,
         c"noload",
     )
     .context("mount read-only toolchain image")?;
+    mount(
+        "tmpfs",
+        "/toolchain-overlay",
+        "tmpfs",
+        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+        c"mode=0700,size=134217728",
+    )
+    .context("mount disposable toolchain overlay")?;
+    for path in [
+        "/toolchain-overlay/upper",
+        "/toolchain-overlay/upper/dev",
+        "/toolchain-overlay/upper/proc",
+        "/toolchain-overlay/upper/run",
+        "/toolchain-overlay/upper/run/reporch",
+        "/toolchain-overlay/upper/run/reporch/tmp",
+        "/toolchain-overlay/upper/tmp",
+        "/toolchain-overlay/upper/workspace",
+        "/toolchain-overlay/work",
+    ] {
+        std::fs::create_dir(path)
+            .with_context(|| format!("create disposable toolchain overlay path {path}"))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::set_permissions(
+        "/toolchain-overlay/upper/tmp",
+        std::fs::Permissions::from_mode(0o1777),
+    )?;
+    let options = CString::new(
+        "lowerdir=/toolchain-ro,upperdir=/toolchain-overlay/upper,workdir=/toolchain-overlay/work",
+    )?;
+    mount(
+        "overlay",
+        "/toolchain",
+        "overlay",
+        MountFlags::NOSUID | MountFlags::NODEV,
+        Some(options.as_c_str()),
+    )
+    .context("mount toolchain copy-on-write view")?;
     for (source, target) in [
         ("/workspace", "/toolchain/workspace"),
         ("/run/reporch", "/toolchain/run/reporch"),

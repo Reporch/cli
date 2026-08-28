@@ -1236,14 +1236,16 @@ impl StudioApiClient {
         .await
     }
 
-    async fn upload_file(&self, source: &Path, upload: &BeginFileUploadResponse) -> Result<()> {
+    async fn upload_file(
+        &self,
+        source: std::fs::File,
+        upload: &BeginFileUploadResponse,
+    ) -> Result<()> {
         let signed_url =
             validate_signed_object_url(&upload.upload_url, self.allow_insecure_loopback)?;
         match upload.strategy {
             FileUploadStrategyV1::SinglePut => {
-                let file = tokio::fs::File::open(source)
-                    .await
-                    .with_context(|| format!("open {}", source.display()))?;
+                let file = tokio::fs::File::from_std(source);
                 let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
                 let mut request = self
                     .http
@@ -1275,7 +1277,7 @@ impl StudioApiClient {
 
     async fn upload_azure_blocks(
         &self,
-        source: &Path,
+        source: std::fs::File,
         signed_url: Url,
         upload: &BeginFileUploadResponse,
     ) -> Result<()> {
@@ -1291,19 +1293,15 @@ impl StudioApiClient {
             part_size > 0 && part_size <= MAX_BLOCK_BYTES,
             "invalid block part size"
         );
-        let metadata = tokio::fs::symlink_metadata(source)
-            .await
-            .with_context(|| format!("inspect {}", source.display()))?;
+        let metadata = source
+            .metadata()
+            .context("inspect verified upload snapshot")?;
         ensure!(
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.len() == upload.upload.size_bytes,
+            metadata.is_file() && metadata.len() == upload.upload.size_bytes,
             "upload source changed or is not a regular file"
         );
         validate_multipart_contract(metadata.len(), part_size, part_count)?;
-        let mut file = tokio::fs::File::open(source)
-            .await
-            .with_context(|| format!("open {}", source.display()))?;
+        let mut file = tokio::fs::File::from_std(source);
         let mut block_ids = Vec::new();
         block_ids
             .try_reserve_exact(part_count as usize)
@@ -2534,10 +2532,15 @@ async fn upload_manifest_file_entries(
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect::<HashMap<_, _>>();
+    let source_root = crate::verified_file::open_root(source_root)?;
     let mut uploaded = 0_usize;
     for file in files {
-        let source = source_root.join(&file.path);
-        verify_local_file(&source, file).await?;
+        let source = crate::verified_file::snapshot_verified(
+            &source_root,
+            &file.path,
+            file.size_bytes,
+            file.sha256.as_str(),
+        )?;
         if remote.get(&file.path).is_some_and(|remote| {
             remote.sha256 == file.sha256
                 && remote.size_bytes == file.size_bytes
@@ -2558,7 +2561,7 @@ async fn upload_manifest_file_entries(
                 },
             )
             .await?;
-        client.upload_file(&source, &upload).await?;
+        client.upload_file(source, &upload).await?;
         let status = client.complete_upload(project_id, upload.upload.id).await?;
         wait_for_upload(client, project_id, status, options.timeout_seconds).await?;
         uploaded += 1;
@@ -3635,47 +3638,6 @@ fn read_manifest(path: &Path) -> Result<VersionedReleaseManifest> {
         "manifest must be a file no larger than 32 MiB"
     );
     serde_json::from_slice(&fs::read(path)?).with_context(|| format!("parse {}", path.display()))
-}
-
-async fn verify_local_file(source: &Path, expected: &ManifestFile) -> Result<()> {
-    let metadata =
-        fs::symlink_metadata(source).with_context(|| format!("inspect {}", source.display()))?;
-    ensure!(
-        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-        "manifest source is not a regular file: {}",
-        source.display()
-    );
-    ensure!(
-        metadata.len() == expected.size_bytes,
-        "source size mismatch: {}",
-        expected.path
-    );
-    let mut file = tokio::fs::File::open(source).await?;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    let mut size = 0_u64;
-    let mut digest = Sha256::new();
-    loop {
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        size = size
-            .checked_add(read as u64)
-            .context("source size overflow")?;
-        ensure!(
-            size <= expected.size_bytes,
-            "source grew while hashing: {}",
-            expected.path
-        );
-        digest.update(&buffer[..read]);
-    }
-    let digest: Sha256Digest = hex::encode(digest.finalize()).parse()?;
-    ensure!(
-        size == expected.size_bytes && digest == expected.sha256,
-        "source digest mismatch: {}",
-        expected.path
-    );
-    Ok(())
 }
 
 fn verify_commit_file_descriptor(

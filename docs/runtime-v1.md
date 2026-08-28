@@ -32,7 +32,9 @@ remain immediate. Language toolchains are installed automatically on first use;
 
 - No guest network device.
 - No host project, home-directory, keychain, or credential mount.
-- Read-only base and toolchain block devices.
+- Read-only base and signed ext4/VHDX toolchain block devices. A bounded,
+  disposable overlay supplies only guest mount points and never mutates the
+  signed image.
 - Disposable work storage and one VM per execution.
 - Non-root guest workload identity.
 - Host and guest CPU, memory, PID, wall-clock, output, and artifact limits.

@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use std::fs;
-use std::io::{BufReader, Read as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,31 +17,50 @@ use reporch_runtime_protocol::{
 use sha2::{Digest, Sha256};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
-use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows::core::PWSTR;
+use windows::Win32::Security::{
+    DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES, SetFileSecurityW, TOKEN_QUERY,
+    TOKEN_USER, TokenUser,
+};
+use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+use windows::core::{BOOL, HSTRING, PWSTR};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 16;
+const MAX_RUNNING_JOBS: usize = 1;
 
 pub async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
     let pipe_name = reporch_runtime_host::service_pipe_name()?;
     let allowed_sid = required_allowed_sid()?;
+    prepare_service_spool(&allowed_sid)?;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let job_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_RUNNING_JOBS));
     let mut first = true;
     loop {
-        let server = ServerOptions::new()
-            .first_pipe_instance(first)
-            .reject_remote_clients(true)
-            .access_inbound(true)
-            .access_outbound(true)
-            .create(&pipe_name)
-            .with_context(|| format!("create runtime service pipe {pipe_name}"))?;
+        let descriptor =
+            SecurityDescriptor::from_sddl(&format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{allowed_sid})"))?;
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())?,
+            lpSecurityDescriptor: descriptor.0.0,
+            bInheritHandle: BOOL(0),
+        };
+        let server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first)
+                .reject_remote_clients(true)
+                .access_inbound(true)
+                .access_outbound(true)
+                .create_with_security_attributes_raw(
+                    &pipe_name,
+                    (&mut attributes as *mut SECURITY_ATTRIBUTES).cast(),
+                )
+        }
+        .with_context(|| format!("create runtime service pipe {pipe_name}"))?;
         first = false;
         tokio::select! {
             changed = shutdown.changed() => {
@@ -52,15 +71,20 @@ pub async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()>
         }
         let permit = semaphore.clone().acquire_owned().await?;
         let allowed_sid = allowed_sid.clone();
+        let job_semaphore = job_semaphore.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = handle_connection(server, &allowed_sid).await;
+            let _ = handle_connection(server, &allowed_sid, &job_semaphore).await;
         });
     }
     Ok(())
 }
 
-async fn handle_connection(mut stream: NamedPipeServer, allowed_sid: &str) -> Result<()> {
+async fn handle_connection(
+    mut stream: NamedPipeServer,
+    allowed_sid: &str,
+    job_semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<()> {
     ensure!(
         pipe_client_sid(&stream)? == allowed_sid,
         "runtime service client SID is not authorized"
@@ -69,12 +93,14 @@ async fn handle_connection(mut stream: NamedPipeServer, allowed_sid: &str) -> Re
         .await
         .context("runtime service request timed out")??;
     let result = match request.validate() {
-        Ok(()) => execute_request(&request).await.unwrap_or_else(|error| {
-            RuntimeServiceResultV1::Error(ProtocolFailureV1::bounded(
-                "runtime.guest_boot_failed",
-                format!("{error:#}"),
-            ))
-        }),
+        Ok(()) => execute_request(&request, job_semaphore)
+            .await
+            .unwrap_or_else(|error| {
+                RuntimeServiceResultV1::Error(ProtocolFailureV1::bounded(
+                    "runtime.guest_boot_failed",
+                    format!("{error:#}"),
+                ))
+            }),
         Err(error) => RuntimeServiceResultV1::Error(ProtocolFailureV1::bounded(
             "runtime.protocol_incompatible",
             error.to_string(),
@@ -95,7 +121,10 @@ async fn handle_connection(mut stream: NamedPipeServer, allowed_sid: &str) -> Re
     Ok(())
 }
 
-async fn execute_request(request: &RuntimeServiceRequestV1) -> Result<RuntimeServiceResultV1> {
+async fn execute_request(
+    request: &RuntimeServiceRequestV1,
+    job_semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<RuntimeServiceResultV1> {
     match &request.command {
         RuntimeServiceCommandV1::Ping => Ok(RuntimeServiceResultV1::Pong {
             service_version: env!("CARGO_PKG_VERSION").into(),
@@ -135,6 +164,11 @@ async fn execute_request(request: &RuntimeServiceRequestV1) -> Result<RuntimeSer
             runtime_sequence,
             runtime_bundle_digest,
         } => {
+            let _job_permit = job_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .context("runtime service job limiter closed")?;
             ensure_system_runtime_root()?;
             let bundle = reporch_runtime_host::verified_bundle().await?;
             ensure!(
@@ -218,18 +252,20 @@ fn execute_hcs_job(
 }
 
 fn prepare_input_view(spool: &Path, job: &reporch_runtime_protocol::GuestJobV1) -> Result<PathBuf> {
-    verify_spool(spool, &job.inputs)?;
     let jobs = reporch_runtime_host::runtime_root()?.join("jobs");
     fs::create_dir_all(&jobs).context("create runtime jobs directory")?;
     let root = jobs.join(job.id.simple().to_string());
     ensure!(!root.exists(), "runtime job input view already exists");
     fs::create_dir(&root).context("create runtime job input view")?;
+    let object_root = jobs.join(format!(".objects-{}", job.id.simple()));
+    ensure!(
+        !object_root.exists(),
+        "runtime job object cache already exists"
+    );
+    fs::create_dir(&object_root).context("create runtime job object cache")?;
+    let object_cleanup = JobDirectoryCleanup(object_root.clone());
+    let mut objects = std::collections::HashMap::new();
     for input in &job.inputs {
-        let digest = input
-            .sha256
-            .strip_prefix("sha256:")
-            .context("runtime input digest is invalid")?;
-        let source = spool.join(&digest[..2]).join(digest);
         let destination = root.join(&input.path);
         ensure!(
             destination.starts_with(&root),
@@ -240,11 +276,22 @@ fn prepare_input_view(spool: &Path, job: &reporch_runtime_protocol::GuestJobV1) 
                 .parent()
                 .context("runtime input has no parent")?,
         )?;
-        fs::hard_link(&source, &destination).context("link runtime spool object into job view")?;
-        let mut permissions = fs::metadata(&destination)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&destination, permissions)?;
+        let digest = input
+            .sha256
+            .strip_prefix("sha256:")
+            .context("runtime input digest is invalid")?;
+        let object_path = if let Some(path) = objects.get(digest) {
+            path
+        } else {
+            let path = object_root.join(digest);
+            copy_verified_spool_object(spool, input, &path)?;
+            objects.insert(digest, path);
+            objects.get(digest).context("cache runtime input object")?
+        };
+        fs::hard_link(object_path, &destination)
+            .context("link verified runtime input into private view")?;
     }
+    drop(object_cleanup);
     Ok(root)
 }
 
@@ -258,6 +305,7 @@ fn verify_spool(
         "runtime spool must be a real directory"
     );
     let mut total = 0_u64;
+    let mut verified = std::collections::HashSet::new();
     for object in objects {
         let digest = object
             .sha256
@@ -270,15 +318,18 @@ fn verify_spool(
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
             "runtime spool digest is invalid"
         );
-        let path = spool.join(&digest[..2]).join(digest);
-        let metadata = fs::symlink_metadata(&path).context("inspect runtime spool object")?;
+        total = total
+            .checked_add(object.size)
+            .context("spool total overflow")?;
+        if !verified.insert(digest) {
+            continue;
+        }
+        let file = open_spool_object(spool, digest)?;
+        let metadata = file.metadata().context("inspect runtime spool object")?;
         ensure!(
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.len() == object.size,
+            metadata.is_file() && metadata.len() == object.size,
             "runtime spool object size or type changed"
         );
-        let file = fs::File::open(&path).context("open runtime spool object")?;
         let mut reader = BufReader::new(file);
         let mut hasher = Sha256::new();
         let mut size = 0_u64;
@@ -299,9 +350,96 @@ fn verify_spool(
             hex::encode(hasher.finalize()) == digest,
             "runtime spool object digest changed"
         );
-        total = total.checked_add(size).context("spool total overflow")?;
     }
     Ok((u32::try_from(objects.len())?, total))
+}
+
+fn open_spool_object(spool: &Path, digest: &str) -> Result<fs::File> {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+
+    let directory = Dir::open_ambient_dir(spool, ambient_authority())
+        .context("open capability-scoped runtime spool")?;
+    let file = directory
+        .open(Path::new(&digest[..2]).join(digest))
+        .context("open capability-scoped runtime spool object")?;
+    let metadata = file.metadata().context("inspect runtime spool object")?;
+    ensure!(metadata.is_file(), "runtime spool object is not a file");
+    Ok(file.into_std())
+}
+
+fn copy_verified_spool_object(
+    spool: &Path,
+    object: &reporch_runtime_protocol::ContentObjectV1,
+    destination: &Path,
+) -> Result<()> {
+    let digest = object
+        .sha256
+        .strip_prefix("sha256:")
+        .context("runtime input digest is invalid")?;
+    let mut source = open_spool_object(spool, digest)?;
+    ensure!(
+        source.metadata()?.len() == object.size,
+        "runtime spool object size changed"
+    );
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .context("create private runtime job input")?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .context("read runtime spool object")?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .context("runtime spool size overflow")?;
+        ensure!(total <= object.size, "runtime spool object grew");
+        hasher.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .context("write private runtime job input")?;
+    }
+    ensure!(total == object.size, "runtime spool object was truncated");
+    ensure!(
+        format!("sha256:{}", hex::encode(hasher.finalize())) == object.sha256,
+        "runtime spool object digest changed"
+    );
+    output
+        .sync_all()
+        .context("sync private runtime job input")?;
+    let mut permissions = output.metadata()?.permissions();
+    permissions.set_readonly(true);
+    output.set_permissions(permissions)?;
+    Ok(())
+}
+
+fn prepare_service_spool(allowed_sid: &str) -> Result<()> {
+    let spool = reporch_runtime_host::service_spool_root()?;
+    fs::create_dir_all(&spool).context("create Windows runtime spool")?;
+    let metadata = fs::symlink_metadata(&spool).context("inspect Windows runtime spool")?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "Windows runtime spool must be a real directory"
+    );
+    let descriptor =
+        SecurityDescriptor::from_sddl(&format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{allowed_sid})"))?;
+    unsafe {
+        SetFileSecurityW(
+            &HSTRING::from(spool.as_os_str()),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor.0,
+        )
+    }
+    .ok()
+    .context("restrict Windows runtime spool ACL")?;
+    Ok(())
 }
 
 fn required_allowed_sid() -> Result<String> {
@@ -320,17 +458,11 @@ fn required_allowed_sid() -> Result<String> {
 
 fn pipe_client_sid(stream: &NamedPipeServer) -> Result<String> {
     let handle = HANDLE(stream.as_raw_handle());
-    let mut process_id = 0_u32;
-    unsafe { GetNamedPipeClientProcessId(handle, &mut process_id) }
-        .context("get runtime pipe client process")?;
-    ensure!(process_id != 0, "runtime pipe client process ID is invalid");
-    let process = OwnedHandle(unsafe {
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
-            .context("open runtime pipe client process")?
-    });
+    unsafe { ImpersonateNamedPipeClient(handle) }.context("impersonate runtime pipe client")?;
+    let _revert = ImpersonationGuard;
     let mut token = HANDLE::default();
-    unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }
-        .context("open runtime pipe client token")?;
+    unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token) }
+        .context("open impersonated runtime pipe client token")?;
     let token = OwnedHandle(token);
     let mut required = 0_u32;
     let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut required) };
@@ -356,6 +488,46 @@ fn pipe_client_sid(stream: &NamedPipeServer) -> Result<String> {
         .context("format runtime pipe client SID")?;
     let sid = LocalString(sid);
     Ok(unsafe { sid.0.to_string() }?)
+}
+
+struct ImpersonationGuard;
+
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = RevertToSelf();
+        }
+    }
+}
+
+struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl SecurityDescriptor {
+    fn from_sddl(sddl: &str) -> Result<Self> {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .context("parse runtime security descriptor")?;
+        ensure!(
+            !descriptor.is_invalid(),
+            "runtime security descriptor is invalid"
+        );
+        Ok(Self(descriptor))
+    }
+}
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.0.0)));
+        }
+    }
 }
 
 struct OwnedHandle(HANDLE);

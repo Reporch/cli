@@ -2,11 +2,14 @@
 
 #[cfg(target_os = "macos")]
 mod apple_backend;
+mod host_version;
+#[cfg(windows)]
+mod windows_identity;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -19,8 +22,8 @@ use reporch_runtime_core::{
     DOCTOR_SCHEMA, HostTarget, INSTALLATION_SCHEMA, RuntimeArtifactKindV1, RuntimeAvailability,
     RuntimeBackend, RuntimeBundleManifestV1, RuntimeDoctorCheckV1, RuntimeDoctorV1, RuntimeError,
     RuntimeInstallationV1, RuntimeStatusV1, RuntimeUpdateV1, STATUS_SCHEMA,
-    TOOLCHAIN_INSTALLATION_SCHEMA, ToolchainBundleV2, ToolchainEntryV2, ToolchainIndexV2,
-    ToolchainInstallationV2,
+    TOOLCHAIN_INSTALLATION_SCHEMA, ToolchainBundleV2, ToolchainCompressionV2, ToolchainEntryV2,
+    ToolchainIndexV2, ToolchainInstallationV2,
 };
 use reporch_runtime_protocol::{
     GuestJobV1, GuestResultV1, HostChallengeV1, InputChunkV1, MAX_CONTENT_CHUNK_BYTES,
@@ -394,16 +397,25 @@ pub async fn install_toolchain_direct(id: &str) -> Result<VerifiedToolchainBundl
         let staging = root.join(format!(".toolchain-install-{}", Uuid::now_v7()));
         create_private_directory(&staging)?;
         let install = async {
+            let archive = staging.join(&bundle.archive_file_name);
             let artifact = staging.join(&bundle.file_name);
             download_cached_verified(
                 &client,
                 &bundle.source_url,
                 &root,
-                &artifact,
-                bundle.size,
-                &bundle.sha256,
+                &archive,
+                bundle.archive_size,
+                &bundle.archive_sha256,
             )
             .await?;
+            expand_toolchain_archive(
+                &archive,
+                &artifact,
+                bundle.compression,
+                bundle.size,
+                &bundle.sha256,
+            )?;
+            fs::remove_file(&archive).context("remove expanded toolchain archive link")?;
             set_private_read_only(&artifact)?;
             fs::write(staging.join("index.json"), &index_bytes)
                 .context("write installed toolchain index")?;
@@ -444,6 +456,99 @@ pub async fn install_toolchain_direct(id: &str) -> Result<VerifiedToolchainBundl
         },
     )?;
     verified_toolchain_at(&root, id, target)
+}
+
+fn expand_toolchain_archive(
+    archive: &Path,
+    output: &Path,
+    compression: ToolchainCompressionV2,
+    expected_size: u64,
+    expected_digest: &str,
+) -> Result<()> {
+    anyhow::ensure!(!output.exists(), "toolchain image output already exists");
+    let archive_metadata = fs::symlink_metadata(archive).context("inspect toolchain archive")?;
+    anyhow::ensure!(
+        archive_metadata.is_file() && !archive_metadata.file_type().is_symlink(),
+        "toolchain archive must be a regular non-symlink file"
+    );
+    let result = (|| -> Result<()> {
+        let archive = fs::File::open(archive).context("open toolchain archive")?;
+        let reader = BufReader::new(archive);
+        let mut decoder = match compression {
+            ToolchainCompressionV2::Zstd => ruzstd::decoding::StreamingDecoder::new(reader)
+                .context("initialize toolchain zstd decoder")?,
+        };
+        let mut output_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)
+            .context("create expanded toolchain image")?;
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let read = decoder
+                .read(&mut buffer)
+                .context("decompress toolchain image")?;
+            if read == 0 {
+                break;
+            }
+            size = size
+                .checked_add(read as u64)
+                .context("toolchain image size overflow")?;
+            anyhow::ensure!(
+                size <= expected_size,
+                "toolchain archive exceeded its signed expanded size"
+            );
+            hasher.update(&buffer[..read]);
+            write_sparse(&mut output_file, &buffer[..read])?;
+        }
+        anyhow::ensure!(size == expected_size, "toolchain image size mismatch");
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+        anyhow::ensure!(digest == expected_digest, "toolchain image digest mismatch");
+        output_file
+            .sync_data()
+            .context("sync sparse toolchain image extents")?;
+        drop(output_file);
+        let output_file = fs::OpenOptions::new()
+            .write(true)
+            .open(output)
+            .context("reopen sparse toolchain image")?;
+        set_sparse_len(&output_file, expected_size)?;
+        output_file
+            .sync_all()
+            .context("sync expanded toolchain image")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(output);
+    }
+    result
+}
+
+fn write_sparse(output: &mut fs::File, bytes: &[u8]) -> Result<()> {
+    for block in bytes.chunks(64 * 1024) {
+        if block.iter().all(|byte| *byte == 0) {
+            output
+                .seek(SeekFrom::Current(i64::try_from(block.len())?))
+                .context("create sparse toolchain image extent")?;
+        } else {
+            output
+                .write_all(block)
+                .context("write expanded toolchain image")?;
+        }
+    }
+    Ok(())
+}
+
+fn set_sparse_len(output: &fs::File, length: u64) -> Result<()> {
+    #[cfg(unix)]
+    rustix::fs::ftruncate(output, length).context("finalize sparse toolchain image size")?;
+    #[cfg(not(unix))]
+    output
+        .set_len(length)
+        .context("finalize sparse toolchain image size")?;
+    Ok(())
 }
 
 pub async fn verified_toolchain(id: &str) -> Result<VerifiedToolchainBundleV2> {
@@ -496,9 +601,7 @@ fn verified_toolchain_at(
     verify_signature(&index_bytes, &signature_bytes)?;
     let index: ToolchainIndexV2 =
         serde_json::from_slice(&index_bytes).context("parse installed toolchain index")?;
-    index
-        .validate(installation.installed_at)
-        .map_err(anyhow::Error::from)?;
+    index.validate(Utc::now()).map_err(anyhow::Error::from)?;
     anyhow::ensure!(
         index.sequence == installation.index_sequence,
         "installed toolchain index sequence changed"
@@ -1508,7 +1611,10 @@ async fn connect_windows_service() -> Result<tokio::net::windows::named_pipe::Na
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
     loop {
         match ClientOptions::new().open(&pipe) {
-            Ok(client) => return Ok(client),
+            Ok(client) => {
+                windows_identity::authenticate_runtime_pipe_server(&client)?;
+                return Ok(client);
+            }
             Err(error) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 if error.kind() != std::io::ErrorKind::NotFound
@@ -1594,6 +1700,7 @@ async fn install_latest_locked(
         manifest.target == target,
         "runtime manifest target does not match this host"
     );
+    host_version::ensure_runtime_supported(&manifest)?;
     if let Some(minimum_sequence) = minimum_sequence {
         anyhow::ensure!(
             manifest.sequence >= minimum_sequence,
@@ -2222,9 +2329,8 @@ fn verify_runtime_bundle_at(
     );
     let manifest: RuntimeBundleManifestV1 =
         serde_json::from_slice(&manifest_bytes).context("parse installed runtime manifest")?;
-    manifest
-        .validate(installation.installed_at)
-        .map_err(anyhow::Error::from)?;
+    manifest.validate(Utc::now()).map_err(anyhow::Error::from)?;
+    host_version::ensure_runtime_supported(&manifest)?;
     anyhow::ensure!(
         manifest.sequence == installation.sequence
             && manifest.version == installation.version
@@ -2738,6 +2844,94 @@ mod tests {
         let mut changed = SIGNED_FIXTURE.to_vec();
         changed[0] ^= 1;
         assert!(verify_signature(&changed, SIGNED_FIXTURE_SIGNATURE).is_err());
+    }
+
+    #[test]
+    fn toolchain_archive_expansion_is_bounded_and_digest_verified() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("toolchain.ext4.zst");
+        let mut payload = vec![0_u8; 4 * 1024 * 1024];
+        payload[..16].copy_from_slice(b"reporch-fixture!");
+        assert_eq!(
+            payload
+                .chunks(64 * 1024)
+                .filter(|block| block.iter().all(|byte| *byte == 0))
+                .count(),
+            63
+        );
+        let output = root.path().join("toolchain.ext4");
+        let mut encoder =
+            zstd::stream::write::Encoder::new(fs::File::create(&archive).unwrap(), 9).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&payload).unwrap();
+        encoder.finish().unwrap().sync_all().unwrap();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&payload)));
+        expand_toolchain_archive(
+            &archive,
+            &output,
+            ToolchainCompressionV2::Zstd,
+            payload.len() as u64,
+            &digest,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), payload);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = fs::metadata(&output).unwrap();
+            assert!(
+                metadata.blocks() * 512 < metadata.len() / 2,
+                "sparse image allocated {} of {} bytes",
+                metadata.blocks() * 512,
+                metadata.len()
+            );
+        }
+
+        let rejected = root.path().join("rejected.ext4");
+        assert!(
+            expand_toolchain_archive(
+                &archive,
+                &rejected,
+                ToolchainCompressionV2::Zstd,
+                1024,
+                &digest,
+            )
+            .is_err()
+        );
+        assert!(!rejected.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_writer_never_allocates_zero_extents() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sparse.img");
+        let mut file = fs::File::create(&path).unwrap();
+        let mut payload = vec![0_u8; 4 * 1024 * 1024];
+        payload[..16].copy_from_slice(b"reporch-fixture!");
+        write_sparse(&mut file, &payload).unwrap();
+        let before = file.metadata().unwrap();
+        assert_eq!(before.len(), 64 * 1024);
+        assert!(
+            before.blocks() * 512 < 1024 * 1024,
+            "sparse writer preallocated {} bytes before truncate",
+            before.blocks() * 512
+        );
+        file.sync_data().unwrap();
+        drop(file);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        set_sparse_len(&file, payload.len() as u64).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let metadata = fs::metadata(path).unwrap();
+        assert!(
+            metadata.blocks() * 512 < metadata.len() / 2,
+            "direct sparse writer allocated {} of {} bytes",
+            metadata.blocks() * 512,
+            metadata.len()
+        );
     }
 
     #[test]

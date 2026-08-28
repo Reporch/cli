@@ -20,6 +20,7 @@ test("Windows installer XML binds the CLI, service, and runtime without a networ
     assert.match(first, /Version="1\.0\.8"/);
     assert.match(first, /Directory Id="BINDIR" Name="bin"/);
     assert.match(first, /ServiceInstall[^>]+Name="ReporchRuntime"/);
+    assert.match(first, /Name="REPORCH_RUNTIME_ALLOWED_SID" Value="\[UserSID\]"/);
     assert.match(first, /Environment[^>]+Name="PATH"[^>]+\[BINDIR\]/);
     assert.doesNotMatch(first, /CustomAction/);
   } finally {
@@ -27,17 +28,22 @@ test("Windows installer XML binds the CLI, service, and runtime without a networ
   }
 });
 
-test("Linux package scripts parse and the service is KVM-only and networkless", () => {
+test("Linux package scripts define the dedicated VM identity and constrained broker", () => {
   execFileSync("sh", ["-n", "installers/linux/postinstall.sh"]);
   execFileSync("sh", ["-n", "installers/linux/preremove.sh"]);
   const unit = execFileSync("sed", ["-n", "1,200p", "installers/linux/reporch-runtime.service"], {
     encoding: "utf8"
   });
   assert.match(unit, /Group=reporch-runtime/);
-  assert.match(unit, /PrivateNetwork=yes/);
+  assert.match(unit, /EnvironmentFile=\/etc\/reporch\/runtime\.env/);
+  assert.match(unit, /RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6/);
+  assert.doesNotMatch(unit, /PrivateNetwork=yes/);
   assert.match(unit, /DevicePolicy=closed/);
   assert.match(unit, /DeviceAllow=\/dev\/kvm rw/);
-  assert.doesNotMatch(unit, /0\.0\.0\.0|AF_INET/);
+  const postinstall = readFileSync("installers/linux/postinstall.sh", "utf8");
+  assert.match(postinstall, /runtime_vm_user=reporch-runtime-vm/);
+  assert.match(postinstall, /REPORCH_RUNTIME_VM_UID/);
+  assert.match(postinstall, /REPORCH_RUNTIME_VM_GID/);
 });
 
 test("macOS release entitlement grants virtualization and nothing broader", () => {
