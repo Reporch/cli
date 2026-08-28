@@ -45,9 +45,16 @@ jobs:
           node scripts/check-runtime-sources.mjs
           node scripts/check-workflows.mjs
           test -z "$(git status --porcelain)"
-      - name: Build all five immutable runtime candidates locally
+      - name: Build all five immutable runtime candidates twice locally
         shell: bash
-        run: scripts/build-runtime-candidates.sh "$RUNNER_TEMP/runtime-candidates"
+        run: |
+          set -euo pipefail
+          scripts/build-runtime-candidates.sh "$RUNNER_TEMP/runtime-candidates"
+          scripts/build-runtime-candidates.sh "$RUNNER_TEMP/runtime-candidates-rebuild"
+          node scripts/compare-runtime-candidates.mjs \
+            "$RUNNER_TEMP/runtime-candidates" \
+            "$RUNNER_TEMP/runtime-candidates-rebuild" \
+            > "$RUNNER_TEMP/runtime-reproducibility.json"
       - name: Materialize the isolated runtime signing key
         shell: bash
         env:
@@ -138,5 +145,6 @@ jobs:
           path: |
             ${{ runner.temp }}/runtime-release
             ${{ runner.temp }}/runtime-candidates/sources.lock.json
+            ${{ runner.temp }}/runtime-reproducibility.json
           if-no-files-found: error
           retention-days: 90

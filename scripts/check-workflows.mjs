@@ -127,6 +127,11 @@ assert.doesNotMatch(
   "the npm dogfood process must not inherit an issue-write token"
 );
 const publishedE2e = readFileSync(".github/workflows/published-artifact-e2e.yml", "utf8");
+const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
+assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates"/);
+assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
+assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
+assert.match(runtimeRelease, /runtime-reproducibility\.json/);
 for (const target of [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
