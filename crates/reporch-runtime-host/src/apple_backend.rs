@@ -404,6 +404,12 @@ mod tests {
     #[test]
     #[ignore = "requires signed macOS test binary plus real arm64/x64 kernel and initramfs"]
     fn real_apple_vm_boots_handshakes_executes_and_stops() {
+        let iterations = std::env::var("REPORCH_TEST_ITERATIONS")
+            .ok()
+            .map(|value| value.parse::<u16>().unwrap())
+            .unwrap_or(1);
+        assert!((1..=1_000).contains(&iterations));
+        let descriptors_before = std::fs::read_dir("/dev/fd").unwrap().count();
         let kernel = Path::new(&std::env::var("REPORCH_TEST_KERNEL").unwrap()).to_owned();
         let rootfs = Path::new(&std::env::var("REPORCH_TEST_INITRAMFS").unwrap()).to_owned();
         assert_eq!(kernel.parent(), rootfs.parent());
@@ -475,8 +481,34 @@ mod tests {
             },
         };
         let project = tempfile::tempdir().unwrap();
-        let result = execute(&bundle, None, project.path(), &job).unwrap();
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout.data, "reporch-runtime-self-test-ok\n");
+        let mut durations = Vec::with_capacity(iterations as usize);
+        for _ in 0..iterations {
+            let started = std::time::Instant::now();
+            let result = execute(&bundle, None, project.path(), &job).unwrap();
+            durations.push(started.elapsed());
+            assert_eq!(result.exit_code, 0);
+            assert_eq!(result.stdout.data, "reporch-runtime-self-test-ok\n");
+        }
+        durations.sort_unstable();
+        let percentile = |percent: usize| {
+            let index = (durations.len() * percent).div_ceil(100).saturating_sub(1);
+            durations[index]
+        };
+        let p95 = percentile(95);
+        eprintln!(
+            "Apple VM lifecycle: iterations={iterations} p50={:?} p95={p95:?} p99={:?} max={:?}",
+            percentile(50),
+            percentile(99),
+            durations.last().unwrap()
+        );
+        assert!(
+            p95 <= Duration::from_secs(2),
+            "Apple VM lifecycle p95 exceeded 2 seconds: {p95:?}"
+        );
+        let descriptors_after = std::fs::read_dir("/dev/fd").unwrap().count();
+        assert!(
+            descriptors_after <= descriptors_before + 4,
+            "Apple VM qualification leaked file descriptors: {descriptors_before} -> {descriptors_after}"
+        );
     }
 }

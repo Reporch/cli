@@ -251,8 +251,32 @@ fn prepare_plan(
     fs::create_dir(&plan.input_view).context("create Firecracker input view")?;
     let kernel = bundle.artifact_path(RuntimeArtifactKindV1::Kernel)?;
     let rootfs = bundle.artifact_path(RuntimeArtifactKindV1::Rootfs)?;
-    link_read_only_asset(&kernel, &plan.jail_root.join("vmlinux"), plan.vm_gid)?;
-    link_read_only_asset(&rootfs, &plan.jail_root.join("rootfs.cpio"), plan.vm_gid)?;
+    let kernel_identity = bundle
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == RuntimeArtifactKindV1::Kernel)
+        .context("verified runtime manifest has no kernel identity")?;
+    let rootfs_identity = bundle
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == RuntimeArtifactKindV1::Rootfs)
+        .context("verified runtime manifest has no rootfs identity")?;
+    copy_verified_read_only_asset(
+        &kernel,
+        &plan.jail_root.join("vmlinux"),
+        kernel_identity.size,
+        &kernel_identity.sha256,
+        plan.vm_gid,
+    )?;
+    copy_verified_read_only_asset(
+        &rootfs,
+        &plan.jail_root.join("rootfs.cpio"),
+        rootfs_identity.size,
+        &rootfs_identity.sha256,
+        plan.vm_gid,
+    )?;
     if let Some(toolchain) = toolchain {
         copy_verified_read_only_asset(
             &toolchain.path,
@@ -370,17 +394,6 @@ fn open_spool_object(spool: &Path, digest: &str) -> Result<fs::File> {
     )
     .context("open peer spool object without following symlinks")?;
     Ok(file.into())
-}
-
-fn link_read_only_asset(source: &Path, destination: &Path, vm_gid: u32) -> Result<()> {
-    let metadata = fs::symlink_metadata(source).context("inspect verified VM asset")?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "VM asset is invalid"
-    );
-    fs::hard_link(source, destination).context("link verified VM asset into jail")?;
-    fs::set_permissions(destination, fs::Permissions::from_mode(0o440))?;
-    chown(destination, 0, vm_gid)
 }
 
 fn copy_verified_read_only_asset(
