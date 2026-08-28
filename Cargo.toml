@@ -13,6 +13,7 @@ members = [
   "crates/reporch-cli",
   "tools/runtime-image-builder",
   "tools/runtime-bundle-builder",
+  "tools/runtime-evidence-builder",
   "tools/runtime-install-tree-builder",
   "tools/runtime-source-fetcher",
   "tools/toolchain-bundle-builder",

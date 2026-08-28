@@ -2281,6 +2281,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "reporch-runtime-evidence-builder"
+version = "1.0.0-rc.8"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "reporch-runtime-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "reporch-runtime-hcs"
 version = "1.0.0-rc.8"
 dependencies = [
