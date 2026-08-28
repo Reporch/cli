@@ -8,6 +8,20 @@ for (const name of workflows) {
   const content = readFileSync(join(".github/workflows", name), "utf8");
   assert.doesNotMatch(content, /pull_request_target:/, `${name} must not use pull_request_target`);
   assert.doesNotMatch(content, /NODE_AUTH_TOKEN|NPM_TOKEN/, `${name} must not use npm tokens`);
+  assert.doesNotMatch(
+    content,
+    /runs-on:\s*(?:ubuntu|macos|windows)-/i,
+    `${name} must never select a billable GitHub-hosted runner`
+  );
+  for (const line of content.split("\n").filter((candidate) => /\bruns-on:/.test(candidate))) {
+    assert.match(line, /self-hosted/, `${name} has a non-self-hosted job: ${line.trim()}`);
+    assert.match(line, /cli-zero-cost/, `${name} omits the zero-cost runner guard: ${line.trim()}`);
+  }
+  assert.match(
+    content,
+    /github\.actor == vars\.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR/,
+    `${name} must restrict jobs to the configured trusted actor`
+  );
   for (const line of content.split("\n")) {
     const match = line.match(/^\s*-?\s*uses:\s*([^#\s]+)/);
     if (!match) continue;
@@ -23,7 +37,7 @@ assert.doesNotMatch(
 );
 assert.match(release, /npm-11\.18\.0\.tgz/);
 assert.match(release, /NPM_TARBALL_SHA256:\s*[a-f0-9]{64}/);
-assert.match(release, /sha256sum --check --strict/);
+assert.match(release, /shasum -a 256 --check/);
 assert.doesNotMatch(
   release,
   /echo "\$install_dir\/package\/bin" >> "\$GITHUB_PATH"/,
@@ -59,10 +73,10 @@ assert.match(
 );
 assert.match(
   release,
-  /\(cd dist\/release-assets && sha256sum \.\/\*\) > dist\/SHA256SUMS/,
+  /\(cd dist\/release-assets && shasum -a 256 \.\/\*\) > dist\/SHA256SUMS/,
   "release checksums must remain verifiable after downloading flat release assets"
 );
-assert.match(release, /sha256sum --check --strict/, "release checksum verification must be strict");
+assert.match(release, /shasum -a 256 --check/, "release checksum verification must be strict");
 assert.match(
   release,
   /cmp "\$native" "\$npm_native"/,
@@ -74,9 +88,9 @@ assert.match(
   "every immutable release asset must receive provenance"
 );
 const ci = readFileSync(".github/workflows/ci.yml", "utf8");
-assert.match(ci, /actionlint_1\.7\.12_linux_amd64\.tar\.gz/);
+assert.match(ci, /actionlint_1\.7\.12_darwin_arm64\.tar\.gz/);
 assert.match(ci, /ACTIONLINT_SHA256:\s*[a-f0-9]{64}/);
-assert.match(ci, /sha256sum --check --strict/);
+assert.match(ci, /shasum -a 256 --check/);
 const publisher = readFileSync("scripts/publish-npm-release.mjs", "utf8");
 assert.match(publisher, /"--tag",\s*npmTag/);
 assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prerelease/);

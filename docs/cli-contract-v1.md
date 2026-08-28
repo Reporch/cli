@@ -47,7 +47,8 @@ The 1.x command families are:
 - `publication publish|status` and `quota show`;
 - `revision list|show|diff|restore`;
 - `manifest validate|digest|compatibility` and `package import|export`;
-- `toolchain list|inspect|install` and `sandbox plan|run`;
+- `runtime status|doctor|update|repair|reset`;
+- `toolchain list|inspect|install|prefetch` and `sandbox plan|run`;
 - `artifact verify-minisign` and `desktop verify-updater-artifact`.
 
 The regression suite asserts that these commands remain reachable. Deprecated

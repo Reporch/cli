@@ -22,7 +22,8 @@ concurrency:
 
 jobs:
   fuzz:
-    runs-on: ubuntu-24.04
+    if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
     timeout-minutes: 15
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-11

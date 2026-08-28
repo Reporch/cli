@@ -25,10 +25,11 @@ use studio_contracts::{
     ProjectMembershipPage, ProjectMembershipResponse, ProjectPage, ProjectResponse,
     PublicationResponse, PublicationStatus, QuotaStatusV1, ReleaseDownloadResponse, ReleasePage,
     ReleaseResponse, ReleaseStatus, ReviewPage, ReviewPoolPageV1, ReviewPoolRequestResponseV1,
-    ReviewResponse, RevokeWaiverRequest, StudioCapabilitiesV1, SubmitReviewRequest,
-    UpdateWorkingCopyRequestV1, UpsertProjectMembershipRequest, ValidationRunDetailResponse,
-    ValidationRunPage, ValidationRunResponse, ValidationRunStatus, WaiverPage, WaiverResponse,
-    WorkingCopyReadinessV1, WorkingCopyV1,
+    ReviewResponse, RevokeWaiverRequest, RuntimePreviewOperationV1, RuntimePreviewRequestV1,
+    RuntimePreviewResultV1, RuntimePreviewStatusV1, StudioCapabilitiesV1, SubmitReviewRequest,
+    ToolExecutionLimitsV1, UpdateWorkingCopyRequestV1, UpsertProjectMembershipRequest,
+    ValidationRunDetailResponse, ValidationRunPage, ValidationRunResponse, ValidationRunStatus,
+    WaiverPage, WaiverResponse, WorkingCopyReadinessV1, WorkingCopyV1,
 };
 use studio_core::{
     ManifestFile, ProblemType, ProjectRole, ReviewDecisionKindV1, Sha256Digest, SubjectRef,
@@ -146,6 +147,18 @@ pub struct RemoteConnectionOptions {
     /// Development-only identity header for a loopback Studio API.
     #[arg(long, env = "REPORCH_STUDIO_DEV_SUBJECT", hide = true)]
     pub dev_subject: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimePreviewExecutionOptions {
+    pub project_directory: PathBuf,
+    pub operation: RuntimePreviewOperationV1,
+    pub toolchain_id: String,
+    pub language: String,
+    pub source_path: String,
+    pub stdin_path: Option<String>,
+    pub limits: ToolExecutionLimitsV1,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -804,6 +817,28 @@ impl StudioApiClient {
 
     async fn quota(&self) -> Result<QuotaStatusV1> {
         self.json(self.http.get(self.endpoint("quota")?)).await
+    }
+
+    async fn create_runtime_preview(
+        &self,
+        request: &RuntimePreviewRequestV1,
+        idempotency_key: &str,
+    ) -> Result<RuntimePreviewResultV1> {
+        self.json(
+            self.http
+                .post(self.endpoint("runtime-previews")?)
+                .header("idempotency-key", idempotency_key)
+                .json(request),
+        )
+        .await
+    }
+
+    async fn get_runtime_preview(&self, preview_id: Uuid) -> Result<RuntimePreviewResultV1> {
+        self.json(
+            self.http
+                .get(self.endpoint(&format!("runtime-previews/{preview_id}"))?),
+        )
+        .await
     }
 
     async fn events_response(&self, cursor: Option<u64>) -> Result<Response> {
@@ -1551,6 +1586,98 @@ pub async fn capabilities_operation(
 
 pub async fn quota_operation(connection: &RemoteConnectionOptions) -> Result<QuotaStatusV1> {
     StudioApiClient::connect(connection).await?.quota().await
+}
+
+pub async fn runtime_preview_operation(
+    options: &RuntimePreviewExecutionOptions,
+) -> Result<RuntimePreviewResultV1> {
+    validate_wait_timeout(options.timeout_seconds)?;
+    let root = crate::local_project::discover_project(&options.project_directory)?;
+    let spec = read_versioned_authoring_spec(&root)?;
+    let state = crate::local_project::read_local_state(&root)?;
+    let remote = state
+        .remote
+        .context("project is not linked; run `reporch project link` before remote fallback")?;
+    ensure!(
+        remote.project_id == spec.project_id(),
+        "local link and reporch.yaml project IDs differ"
+    );
+    let connection = RemoteConnectionOptions {
+        api_url: remote.api_url,
+        auth: NativeAuthOptions {
+            issuer: std::env::var("REPORCH_STUDIO_OIDC_ISSUER")
+                .unwrap_or_else(|_| DEFAULT_OIDC_ISSUER.into()),
+            client_id: std::env::var("REPORCH_STUDIO_CLI_CLIENT_ID")
+                .unwrap_or_else(|_| "reporch-studio-cli".into()),
+            allow_insecure_http: std::env::var("REPORCH_STUDIO_ALLOW_INSECURE_HTTP")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
+        },
+        dev_subject: std::env::var("REPORCH_STUDIO_DEV_SUBJECT").ok(),
+    };
+    let client = StudioApiClient::connect(&connection).await?;
+    let capabilities = client.capabilities().await?;
+    ensure_cli_compatible(&capabilities)?;
+    ensure!(
+        capabilities
+            .authoring_spec_versions
+            .iter()
+            .any(|schema| schema == spec.schema()),
+        "Studio does not support {}",
+        spec.schema()
+    );
+
+    let manifest = compile_versioned_authoring_spec(&root, &spec, Uuid::nil())?;
+    let upload_options = PushOptions {
+        connection,
+        manifest: None,
+        source_root: Some(root.clone()),
+        message: "Runtime preview upload".into(),
+        timeout_seconds: options.timeout_seconds.min(600),
+    };
+    upload_manifest_files(&client, &upload_options, &manifest, &root).await?;
+    let remote_copy = client.get_working_copy(spec.project_id()).await?;
+    if remote_copy.spec != spec {
+        client
+            .update_working_copy(
+                spec.project_id(),
+                remote_copy.revision,
+                &UpdateWorkingCopyRequestV1 { spec: spec.clone() },
+            )
+            .await?;
+    }
+    let request = RuntimePreviewRequestV1 {
+        schema: studio_contracts::RUNTIME_PREVIEW_REQUEST_SCHEMA_V1.into(),
+        project_id: spec.project_id(),
+        snapshot: spec,
+        operation: options.operation,
+        toolchain_id: options.toolchain_id.clone(),
+        language: options.language.clone(),
+        source_path: options.source_path.clone(),
+        stdin_path: options.stdin_path.clone(),
+        limits: options.limits.clone(),
+    };
+    let key = operation_key("runtime-preview", None)?;
+    let mut result = client.create_runtime_preview(&request, &key).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(options.timeout_seconds);
+    loop {
+        if matches!(
+            result.status,
+            RuntimePreviewStatusV1::Succeeded
+                | RuntimePreviewStatusV1::Failed
+                | RuntimePreviewStatusV1::Cancelled
+                | RuntimePreviewStatusV1::Expired
+        ) {
+            return Ok(result);
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Studio runtime preview exceeded {} seconds",
+            options.timeout_seconds
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        result = client.get_runtime_preview(result.id).await?;
+    }
 }
 
 pub async fn watch_events_operation<F>(

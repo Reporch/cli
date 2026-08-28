@@ -206,6 +206,24 @@ fn classify_error(error: &Error) -> ClassifiedError {
             trace_id: None,
         };
     }
+    if let Some(runtime) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reporch_runtime_core::RuntimeError>())
+    {
+        return ClassifiedError {
+            exit_code: if matches!(
+                runtime,
+                reporch_runtime_core::RuntimeError::RemoteQuotaExceeded
+            ) {
+                ExitCode::PermissionDenied
+            } else {
+                ExitCode::InfrastructureFailure
+            },
+            error_code: runtime.code().into(),
+            retryable: runtime.retryable(),
+            trace_id: None,
+        };
+    }
     let message = format!("{error:#}").to_ascii_lowercase();
     if message.contains("cancelled") || message.contains("canceled") {
         return ClassifiedError {
@@ -350,6 +368,17 @@ mod tests {
         assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
         assert_eq!(classified.error_code, "infrastructure.unavailable");
         assert!(classified.retryable);
+    }
+
+    #[test]
+    fn runtime_errors_keep_their_stable_error_codes() {
+        let error = anyhow::Error::new(
+            reporch_runtime_core::RuntimeError::VirtualizationUnavailable("KVM missing".into()),
+        );
+        let classified = classify_error(&error);
+        assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
+        assert_eq!(classified.error_code, "runtime.virtualization_unavailable");
+        assert!(!classified.retryable);
     }
 
     #[test]

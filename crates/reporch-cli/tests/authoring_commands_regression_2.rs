@@ -9,7 +9,9 @@ use serde_json::Value;
 use studio_core::CheckerSpec;
 
 fn reporch() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_reporch"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_reporch"));
+    command.env("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP", "1");
+    command
 }
 
 fn init(directory: &std::path::Path, problem_type: Option<&str>) {

@@ -4,7 +4,9 @@ use std::process::{Command, Output};
 use serde_json::Value;
 
 fn reporch() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_reporch"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_reporch"));
+    command.env("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP", "1");
+    command
 }
 
 fn init(directory: &std::path::Path, problem_type: &str) -> Output {
@@ -931,7 +933,16 @@ fn interactive_and_grader_runs_accept_names_uuids_and_paths_without_parser_error
         ] {
             let valid_selectors = run_with_path(
                 project.path(),
-                &[command, "run", "--solution", solution, "--test", test],
+                &[
+                    command,
+                    "run",
+                    "--solution",
+                    solution,
+                    "--test",
+                    test,
+                    "--runtime",
+                    "podman",
+                ],
                 no_runtime.path(),
             );
             assert_eq!(
@@ -1170,6 +1181,8 @@ fn legacy_1x_aliases_keep_readable_matrix_selectors_and_safe_output_pruning() {
                 "solutions/accepted.cpp",
                 "--test",
                 test,
+                "--runtime",
+                "podman",
             ],
             no_runtime.path(),
         );

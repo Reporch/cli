@@ -9,6 +9,7 @@ use serde_json::Value;
 
 fn reporch() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_reporch"));
+    command.env("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP", "1");
     command.env_remove("REPORCH_PROFILE");
     command
 }

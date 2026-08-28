@@ -1,0 +1,106 @@
+name: Sign runtime manifest
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Same-repository branch containing one unsigned runtime manifest
+        required: true
+        type: string
+      target:
+        description: Runtime target whose manifest should be signed
+        required: true
+        type: choice
+        options:
+          - darwin-arm64
+          - darwin-x64
+          - linux-arm64-gnu
+          - linux-x64-gnu
+          - windows-x64-msvc
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
+    steps:
+      - name: Check out trusted signer from main
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: trusted
+          ref: main
+          persist-credentials: false
+
+      - name: Check out candidate branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: candidate
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Restrict the unsigned change surface
+        env:
+          TARGET: ${{ inputs.target }}
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          git fetch origin main --depth=1
+          changed="$(git diff --name-only origin/main...HEAD)"
+          test "$changed" = "runtime/manifests/runtime-$TARGET-manifest.json"
+          test ! -e "runtime/manifests/runtime-$TARGET-manifest.json.minisig"
+          cmp artifacts/runtime-v1.minisign.pub ../trusted/artifacts/runtime-v1.minisign.pub
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+
+      - name: Materialize runtime signing key
+        env:
+          SIGNING_KEY: ${{ secrets.REPORCH_RUNTIME_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$SIGNING_KEY"
+          printf '%s' "$SIGNING_KEY" > "$RUNNER_TEMP/runtime-manifest.key"
+
+      - name: Sign with trusted code only
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          cargo run --locked --manifest-path trusted/tools/runtime-manifest-signer/Cargo.toml -- \
+            "candidate/runtime/manifests/runtime-$TARGET-manifest.json" \
+            "$RUNNER_TEMP/runtime-manifest.key" \
+            trusted/artifacts/runtime-v1.minisign.pub \
+            "candidate/runtime/manifests/runtime-$TARGET-manifest.json.minisig"
+          rm "$RUNNER_TEMP/runtime-manifest.key"
+
+      - name: Verify signature without signing material
+        env:
+          TARGET: ${{ inputs.target }}
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          signature="$(base64 < "runtime/manifests/runtime-$TARGET-manifest.json.minisig" | tr -d '\r\n')"
+          public_key="$(base64 < artifacts/runtime-v1.minisign.pub | tr -d '\r\n')"
+          cargo run --quiet --locked -p reporch-cli -- artifact verify-minisign \
+            --artifact "runtime/manifests/runtime-$TARGET-manifest.json" \
+            --signature "$signature" \
+            --public-key "$public_key"
+
+      - name: Commit signature to candidate branch
+        env:
+          BRANCH: ${{ inputs.branch }}
+          TARGET: ${{ inputs.target }}
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          git config user.name reporch-release-bot
+          git config user.email release-bot@users.noreply.github.com
+          git add "runtime/manifests/runtime-$TARGET-manifest.json.minisig"
+          git diff --cached --check
+          git commit -m "chore(runtime): sign $TARGET manifest"
+          git push origin "HEAD:$BRANCH"

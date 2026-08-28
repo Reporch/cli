@@ -1,0 +1,8 @@
+self-hosted-runner:
+  labels:
+    - cli-zero-cost
+    - cli-macos-arm64
+    - cli-macos-x64
+    - cli-linux-arm64
+    - cli-linux-x64
+    - cli-windows-x64

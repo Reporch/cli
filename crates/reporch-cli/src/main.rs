@@ -64,6 +64,9 @@ struct Args {
     /// Never prompt for missing input.
     #[arg(long, global = true)]
     no_input: bool,
+    /// Permit an isolated Studio preview when this host cannot run the Reporch VM.
+    #[arg(long, global = true, env = "REPORCH_ALLOW_REMOTE_FALLBACK")]
+    allow_remote_fallback: bool,
     /// Confirm safe interactive operations.
     #[arg(long, global = true)]
     yes: bool,
@@ -129,6 +132,11 @@ enum Command {
     },
     /// Inspect Studio API compatibility and the active account's quota.
     Doctor(studio_remote::RemoteConnectionOptions),
+    /// Inspect and maintain the mandatory Reporch virtual-machine runtime.
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
     /// Generate a shell completion script on stdout.
     Completion {
         #[arg(value_enum)]
@@ -257,6 +265,34 @@ enum ToolchainCommand {
         id: String,
         #[arg(long, value_enum, default_value_t = SandboxRuntime::Auto)]
         runtime: SandboxRuntime,
+    },
+    /// Install signed toolchains ahead of time for offline use.
+    Prefetch {
+        /// Toolchain IDs. When omitted, prefetches the complete signed catalog.
+        ids: Vec<String>,
+        #[arg(long, value_enum, default_value_t = SandboxRuntime::Auto)]
+        runtime: SandboxRuntime,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+    /// Report installation, backend, protocol, and virtualization capability.
+    Status,
+    /// Diagnose runtime installation and host virtualization support.
+    Doctor {
+        /// Apply only repairs that do not require implicit privilege elevation.
+        #[arg(long)]
+        fix: bool,
+    },
+    /// Atomically install the newest compatible signed runtime bundle.
+    Update,
+    /// Reinstall and verify the currently selected runtime bundle.
+    Repair,
+    /// Replace runtime assets while preserving projects and authentication.
+    Reset {
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -630,6 +666,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         cwd,
         profile,
         no_input,
+        allow_remote_fallback,
         yes,
         verbose,
         command,
@@ -638,7 +675,13 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
     let cwd = fs::canonicalize(&cwd).with_context(|| format!("resolve --cwd {}", cwd.display()))?;
     std::env::set_current_dir(&cwd)
         .with_context(|| format!("change working directory to {}", cwd.display()))?;
-    let _configuration = (profile, no_input, verbose, output.colors_enabled());
+    reporch_cli::local_sandbox::configure_remote_fallback(
+        allow_remote_fallback,
+        no_input,
+        profile.as_deref(),
+    );
+    ensure_mandatory_runtime(&command).await?;
+    let _configuration = (profile.clone(), no_input, verbose, output.colors_enabled());
     let package_profile = profile_config::package_profile_argument()
         .map(|value| {
             CompatibilityProfile::from_str(&value, true).map_err(|_| {
@@ -691,7 +734,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Auth { command } => match command {
             AuthCommand::Login(options) => auth_login(&options, output).await,
             AuthCommand::Status(options) => auth_status(&options, output).await,
-            AuthCommand::Logout(options) => auth_logout(&options, output).await,
+            AuthCommand::Logout(options) => auth_logout(&options, profile.as_deref(), output).await,
         },
         Command::Project { command } => match command {
             ProjectCommand::Init(options) => execute_project_init(options, "project init", output),
@@ -903,6 +946,63 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 "Authentication, API compatibility, and quota are healthy",
             )
         }
+        Command::Runtime { command } => match command {
+            RuntimeCommand::Status => {
+                let status = reporch_runtime_host::status().await?;
+                let human = format!(
+                    "Reporch Runtime: {:?} · {:?}",
+                    status.availability, status.backend
+                );
+                output.emit("runtime status", &status, &human)
+            }
+            RuntimeCommand::Doctor { fix } => {
+                let mut report = reporch_runtime_host::doctor().await?;
+                if fix
+                    && report
+                        .checks
+                        .iter()
+                        .any(|check| !check.passed && check.repairable)
+                {
+                    if report.status.installed_version.is_some() {
+                        reporch_runtime_host::repair().await?;
+                    } else {
+                        reporch_runtime_host::update().await?;
+                    }
+                    report = reporch_runtime_host::doctor().await?;
+                }
+                let passed = report.checks.iter().filter(|check| check.passed).count();
+                output.emit(
+                    "runtime doctor",
+                    &report,
+                    &format!("{passed}/{} runtime checks passed", report.checks.len()),
+                )
+            }
+            RuntimeCommand::Update => {
+                let result = reporch_runtime_host::update().await?;
+                output.emit(
+                    "runtime update",
+                    &result,
+                    &format!("Installed Reporch Runtime {}", result.installed_version),
+                )
+            }
+            RuntimeCommand::Repair => {
+                let result = reporch_runtime_host::repair().await?;
+                output.emit(
+                    "runtime repair",
+                    &result,
+                    &format!("Repaired Reporch Runtime {}", result.installed_version),
+                )
+            }
+            RuntimeCommand::Reset { yes } => {
+                ensure!(yes, "runtime reset requires --yes");
+                let result = reporch_runtime_host::reset().await?;
+                output.emit(
+                    "runtime reset",
+                    &result,
+                    &format!("Reset Reporch Runtime to {}", result.installed_version),
+                )
+            }
+        },
         Command::Completion { shell } => generate_completion(shell, output),
         Command::Quota { command } => match command {
             QuotaCommand::Show(connection) => {
@@ -1262,6 +1362,26 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     &format!("Installed {}", installed.entry.id),
                 )
             }
+            ToolchainCommand::Prefetch { ids, runtime } => {
+                let ids = if ids.is_empty() {
+                    reporch_cli::toolchain::list()?
+                        .entries
+                        .into_iter()
+                        .map(|entry| entry.id)
+                        .collect::<Vec<_>>()
+                } else {
+                    ids
+                };
+                let mut installed = Vec::with_capacity(ids.len());
+                for id in ids {
+                    installed.push(reporch_cli::toolchain::install(&id, runtime.into_oci()).await?);
+                }
+                output.emit(
+                    "toolchain prefetch",
+                    &installed,
+                    &format!("Prefetched {} signed toolchain(s)", installed.len()),
+                )
+            }
         },
         Command::Desktop { command } => match command {
             DesktopCommand::VerifyUpdaterArtifact(options) => desktop_artifact::verify(&options),
@@ -1273,6 +1393,42 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         },
         Command::QualificationSelfTest => qualification_self_test().await,
     }
+}
+
+async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
+    if matches!(command, Command::Completion { .. })
+        || matches!(
+            command,
+            Command::Runtime {
+                command: RuntimeCommand::Update
+                    | RuntimeCommand::Repair
+                    | RuntimeCommand::Reset { .. }
+            }
+        )
+    {
+        return Ok(());
+    }
+    if cfg!(debug_assertions)
+        && std::env::var("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP")
+            .ok()
+            .is_some_and(|value| value == "1")
+    {
+        return Ok(());
+    }
+
+    let status = reporch_runtime_host::status().await?;
+    if status.installed_version.is_none() {
+        reporch_runtime_host::update()
+            .await
+            .context("complete mandatory Reporch Runtime bootstrap")?;
+        return Ok(());
+    }
+    if reporch_runtime_host::verify_installed().await.is_err() {
+        reporch_runtime_host::repair()
+            .await
+            .context("repair mandatory Reporch Runtime assets")?;
+    }
+    Ok(())
 }
 
 fn required_package_profile(profile: Option<CompatibilityProfile>) -> Result<PackageProfile> {
@@ -1626,6 +1782,13 @@ fn command_name(command: &Command) -> &'static str {
             MemberCommand::Remove(_) => "member remove",
         },
         Command::Doctor(_) => "doctor",
+        Command::Runtime { command } => match command {
+            RuntimeCommand::Status => "runtime status",
+            RuntimeCommand::Doctor { .. } => "runtime doctor",
+            RuntimeCommand::Update => "runtime update",
+            RuntimeCommand::Repair => "runtime repair",
+            RuntimeCommand::Reset { .. } => "runtime reset",
+        },
         Command::Completion { .. } => "completion",
         Command::Quota { .. } => "quota show",
         Command::Release { command } => match command {
@@ -1676,6 +1839,7 @@ fn command_name(command: &Command) -> &'static str {
             ToolchainCommand::List => "toolchain list",
             ToolchainCommand::Inspect { .. } => "toolchain inspect",
             ToolchainCommand::Install { .. } => "toolchain install",
+            ToolchainCommand::Prefetch { .. } => "toolchain prefetch",
         },
         Command::Desktop { .. } => "desktop",
         Command::Artifact { .. } => "artifact",
@@ -1889,7 +2053,16 @@ async fn auth_status(options: &NativeAuthOptions, output: &CliOutput) -> Result<
     output.emit("auth status", &status, human)
 }
 
-async fn auth_logout(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
+async fn auth_logout(
+    options: &NativeAuthOptions,
+    profile: Option<&str>,
+    output: &CliOutput,
+) -> Result<()> {
+    if let Err(error) =
+        reporch_cli::remote_consent::clear_for_auth(&options.issuer, &options.client_id, profile)
+    {
+        eprintln!("Could not clear stored remote fallback consent: {error}");
+    }
     let config = device_auth_config(options)?;
     let remote_result = match NativeAuthClient::discover(config.clone()).await {
         Ok(client) => client.logout(&KeyringTokenStore).await,

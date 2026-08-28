@@ -1,0 +1,37 @@
+[package]
+name = "reporch-runtime-service"
+version = "1.0.0-rc.8"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+reporch-runtime-protocol = { path = "../reporch-runtime-protocol" }
+reporch-runtime-host = { path = "../reporch-runtime-host" }
+reporch-runtime-core = { path = "../reporch-runtime-core" }
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+reporch-runtime-hcs = { path = "../reporch-runtime-hcs" }
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }
+windows-service.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

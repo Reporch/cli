@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-use crate::local_sandbox::{OciRuntime, read_bounded, resolve_secure_runtime, validate_image};
+use crate::local_sandbox::{
+    OciRuntime, configure_process_group, kill_process_tree, read_bounded, resolve_secure_runtime,
+    validate_image,
+};
 
 const INDEX_SCHEMA: &str = "reporch.toolchain-index.v1";
 const LIST_SCHEMA: &str = "reporch.toolchain-list.v1";
@@ -53,6 +56,7 @@ pub struct ToolchainInspectionV1 {
     pub entry: ToolchainEntryV1,
     pub installed: bool,
     pub installed_repo_digests: Vec<String>,
+    pub installed_bundle_sha256: Option<String>,
 }
 
 pub fn list() -> Result<ToolchainListV1> {
@@ -68,30 +72,64 @@ pub fn list() -> Result<ToolchainListV1> {
 
 pub async fn inspect(id: &str, runtime: OciRuntime) -> Result<ToolchainInspectionV1> {
     let entry = find_entry(id)?;
+    if runtime == OciRuntime::Auto {
+        return match reporch_runtime_host::verified_toolchain(id).await {
+            Ok(installed) => Ok(ToolchainInspectionV1 {
+                schema: INSPECTION_SCHEMA,
+                runtime: "reporch_vm".into(),
+                entry,
+                installed: true,
+                installed_repo_digests: Vec::new(),
+                installed_bundle_sha256: Some(installed.installation.bundle_sha256),
+            }),
+            Err(_) => Ok(ToolchainInspectionV1 {
+                schema: INSPECTION_SCHEMA,
+                runtime: "reporch_vm".into(),
+                entry,
+                installed: false,
+                installed_repo_digests: Vec::new(),
+                installed_bundle_sha256: None,
+            }),
+        };
+    }
     let runtime = resolve_secure_runtime(runtime).await?;
     inspect_entry(&runtime, entry).await
 }
 
 pub async fn install(id: &str, runtime: OciRuntime) -> Result<ToolchainInspectionV1> {
     let entry = find_entry(id)?;
+    if runtime == OciRuntime::Auto {
+        let installed = reporch_runtime_host::install_toolchain(id).await?;
+        return Ok(ToolchainInspectionV1 {
+            schema: INSPECTION_SCHEMA,
+            runtime: "reporch_vm".into(),
+            entry,
+            installed: true,
+            installed_repo_digests: Vec::new(),
+            installed_bundle_sha256: Some(installed.installation.bundle_sha256),
+        });
+    }
     let runtime = resolve_secure_runtime(runtime).await?;
     let before = inspect_entry(&runtime, entry.clone()).await?;
     if before.installed {
         return Ok(before);
     }
 
-    let mut child = Command::new(&runtime)
+    let mut command = Command::new(&runtime);
+    command
         .args(["pull", entry.image.as_str()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    configure_process_group(&mut command);
+    let mut child = command
         .spawn()
         .with_context(|| format!("start {runtime} toolchain pull"))?;
     let status = match tokio::time::timeout(INSTALL_TIMEOUT, child.wait()).await {
         Ok(status) => status.context("wait for toolchain image pull")?,
         Err(_) => {
-            let _ = child.kill().await;
+            kill_process_tree(&mut child).await;
             bail!("toolchain installation exceeded 30 minutes");
         }
     };
@@ -130,6 +168,14 @@ pub fn resolve_for_language(explicit_id: Option<&str>, language: &str) -> Result
         entry.language
     );
     Ok(entry)
+}
+
+pub fn resolve_for_image(image: &str) -> Result<ToolchainEntryV1> {
+    verified_index()?
+        .entries
+        .into_iter()
+        .find(|entry| entry.image == image)
+        .context("native execution requires an image from the signed Reporch toolchain catalog")
 }
 
 fn normalize_language(language: &str) -> Result<&'static str> {
@@ -214,7 +260,8 @@ fn find_entry(id: &str) -> Result<ToolchainEntryV1> {
 }
 
 async fn inspect_entry(runtime: &str, entry: ToolchainEntryV1) -> Result<ToolchainInspectionV1> {
-    let mut child = Command::new(runtime)
+    let mut command = Command::new(runtime);
+    command
         .args([
             "image",
             "inspect",
@@ -225,7 +272,9 @@ async fn inspect_entry(runtime: &str, entry: ToolchainEntryV1) -> Result<Toolcha
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    configure_process_group(&mut command);
+    let mut child = command
         .spawn()
         .with_context(|| format!("inspect {} toolchain image", entry.id))?;
     let stdout = child
@@ -241,7 +290,7 @@ async fn inspect_entry(runtime: &str, entry: ToolchainEntryV1) -> Result<Toolcha
     let status = match tokio::time::timeout(INSPECTION_TIMEOUT, child.wait()).await {
         Ok(status) => status.context("wait for OCI image inspection")?,
         Err(_) => {
-            let _ = child.kill().await;
+            kill_process_tree(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             bail!("OCI image inspection exceeded 10 seconds");
@@ -260,6 +309,7 @@ async fn inspect_entry(runtime: &str, entry: ToolchainEntryV1) -> Result<Toolcha
             entry,
             installed: false,
             installed_repo_digests: Vec::new(),
+            installed_bundle_sha256: None,
         });
     }
     let repo_digests: Vec<String> =
@@ -279,6 +329,7 @@ async fn inspect_entry(runtime: &str, entry: ToolchainEntryV1) -> Result<Toolcha
         entry,
         installed,
         installed_repo_digests: repo_digests,
+        installed_bundle_sha256: None,
     })
 }
 

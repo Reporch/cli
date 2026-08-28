@@ -14,7 +14,8 @@ concurrency:
 
 jobs:
   source:
-    runs-on: ubuntu-24.04
+    if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
@@ -33,14 +34,14 @@ jobs:
       - name: Install checksum-verified actionlint
         shell: bash
         env:
-          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_SHA256: aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/actionlint.tar.gz"
           curl --proto '=https' --tlsv1.2 --fail --show-error --location --retry 3 \
             --output "$archive" \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check --strict -
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_darwin_arm64.tar.gz
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | shasum -a 256 --check
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - run: actionlint
@@ -52,11 +53,18 @@ jobs:
           cargo fmt --manifest-path tools/toolchain-index-signer/Cargo.toml -- --check
           cargo clippy --locked --manifest-path tools/toolchain-index-signer/Cargo.toml --all-targets -- -D warnings
           cargo test --locked --manifest-path tools/toolchain-index-signer/Cargo.toml --all-targets
+      - name: Check isolated runtime manifest signer
+        run: |
+          cargo fmt --manifest-path tools/runtime-manifest-signer/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path tools/runtime-manifest-signer/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path tools/runtime-manifest-signer/Cargo.toml --all-targets
       - run: cargo deny check
       - run: cargo deny --manifest-path fuzz/Cargo.toml check
       - run: cargo deny --manifest-path tools/toolchain-index-signer/Cargo.toml check
+      - run: cargo deny --manifest-path tools/runtime-manifest-signer/Cargo.toml check
       - run: cargo audit
       - run: cargo audit --file tools/toolchain-index-signer/Cargo.lock
+      - run: cargo audit --file tools/runtime-manifest-signer/Cargo.lock
       - run: cargo audit --file fuzz/Cargo.lock
       - run: npm test
       - run: npm run check:versions
@@ -64,26 +72,27 @@ jobs:
       - run: git diff --exit-code
 
   native:
+    if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: cli-macos-arm64
             target: aarch64-apple-darwin
             binary: target/aarch64-apple-darwin/release/reporch
-          - runner: macos-15-intel
+          - runner: cli-macos-x64
             target: x86_64-apple-darwin
             binary: target/x86_64-apple-darwin/release/reporch
-          - runner: ubuntu-24.04
+          - runner: cli-linux-x64
             target: x86_64-unknown-linux-gnu
             binary: target/x86_64-unknown-linux-gnu/release/reporch
-          - runner: ubuntu-24.04-arm
+          - runner: cli-linux-arm64
             target: aarch64-unknown-linux-gnu
             binary: target/aarch64-unknown-linux-gnu/release/reporch
-          - runner: windows-2025
+          - runner: cli-windows-x64
             target: x86_64-pc-windows-msvc
             binary: target/x86_64-pc-windows-msvc/release/reporch.exe
-    runs-on: ${{ matrix.runner }}
+    runs-on: [self-hosted, "${{ matrix.runner }}", cli-zero-cost]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11

@@ -1,12 +1,25 @@
 [workspace]
 members = [
   "crates/reporch-format",
+  "crates/reporch-runtime-core",
+  "crates/reporch-guestd",
+  "crates/reporch-runtime-host",
+  "crates/reporch-runtime-hcs",
+  "crates/reporch-runtime-protocol",
+  "crates/reporch-runtime-service",
   "crates/studio-core",
   "crates/studio-contracts",
   "crates/studio-native-auth",
   "crates/reporch-cli",
+  "tools/runtime-image-builder",
+  "tools/runtime-bundle-builder",
+  "tools/toolchain-bundle-builder",
 ]
-exclude = ["fuzz", "tools/toolchain-index-signer"]
+exclude = [
+  "fuzz",
+  "tools/runtime-manifest-signer",
+  "tools/toolchain-index-signer",
+]
 resolver = "2"
 
 [workspace.package]
@@ -29,6 +42,7 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 futures-util = "0.3"
+fs2 = "0.4"
 hex = "0.4"
 keyring = "4.1.5"
 minisign-verify = "0.2.5"
@@ -37,21 +51,23 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 proptest = "1"
 quick-xml = { version = "0.41", features = ["serialize"] }
 rand = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls", "stream"] }
-rustix = { version = "1.1.4", features = ["process"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "stream"] }
+rustix = { version = "1.1.4", features = ["fs", "mount", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 toml = "1.1.4"
 unicode-normalization = "0.1"
 url = { version = "2", features = ["serde"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 uuid = { version = "1", features = ["serde", "v7"] }
+windows = "0.62.2"
+windows-service = "0.8.1"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = "1"
 

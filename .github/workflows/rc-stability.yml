@@ -15,7 +15,8 @@ concurrency:
 
 jobs:
   monitor:
-    runs-on: ubuntu-24.04
+    if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -150,7 +151,7 @@ jobs:
             --arg source_revision "$GITHUB_SHA" \
             '{schema:"reporch.cli-rc-stability.v1",version:$version,completed_at:$completed_at,run_id:$run_id,source_revision:$source_revision,npm_registry:true,github_release:true,studio_health:true,studio_capabilities:true,control_health:true,fresh_install:true,project_init:true,offline_check:true,passed:true}' \
             > "$evidence/result.json"
-          (cd "$evidence" && sha256sum ./* > SHA256SUMS)
+          (cd "$evidence" && shasum -a 256 ./* > SHA256SUMS)
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()

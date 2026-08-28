@@ -1,0 +1,69 @@
+[package]
+name = "reporch-runtime-host"
+version = "1.0.0-rc.8"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+cap-std.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+fs2.workspace = true
+hex.workspace = true
+minisign-verify.workspace = true
+reporch-runtime-core = { path = "../reporch-runtime-core" }
+reporch-runtime-protocol = { path = "../reporch-runtime-protocol" }
+rustix.workspace = true
+serde.workspace = true
+serde_bytes = "0.11"
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+url.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSError", "NSFileHandle", "NSString", "NSURL"] }
+objc2-virtualization = { version = "0.3", default-features = false, features = [
+    "block2",
+    "dispatch2",
+    "VZBootLoader",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZEntropyDeviceConfiguration",
+    "VZFileHandleSerialPortAttachment",
+    "VZLinuxBootLoader",
+    "VZSerialPortAttachment",
+    "VZSerialPortConfiguration",
+    "VZSocketDevice",
+    "VZSocketDeviceConfiguration",
+    "VZStorageDeviceAttachment",
+    "VZStorageDeviceConfiguration",
+    "VZVirtioBlockDeviceConfiguration",
+    "VZVirtioEntropyDeviceConfiguration",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+    "VZVirtioSocketConnection",
+    "VZVirtioSocketDevice",
+    "VZVirtioSocketDeviceConfiguration",
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { workspace = true, features = ["rustls"] }
+
+[target.'cfg(windows)'.dependencies]
+reporch-runtime-hcs = { path = "../reporch-runtime-hcs" }
+reqwest = { workspace = true, features = ["native-tls"] }
+
+[dev-dependencies]
+tempfile.workspace = true

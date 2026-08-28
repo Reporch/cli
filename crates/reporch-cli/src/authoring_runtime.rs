@@ -71,7 +71,11 @@ pub async fn run_program(request: &ProgramRequest<'_>) -> Result<LocalSandboxRes
         request.options.toolchain_id.as_deref(),
         request.language,
     )?;
-    let inspection = crate::toolchain::inspect(&entry.id, request.options.runtime).await?;
+    let inspection = if request.options.runtime == OciRuntime::Auto {
+        crate::toolchain::install(&entry.id, request.options.runtime).await?
+    } else {
+        crate::toolchain::inspect(&entry.id, request.options.runtime).await?
+    };
     ensure!(
         inspection.installed,
         "signed toolchain {} is not installed; run `reporch toolchain install {}` explicitly",
@@ -199,7 +203,11 @@ async fn checked_installed_toolchain(
     options: &AuthoringRunOptions,
 ) -> Result<crate::toolchain::ToolchainEntryV1> {
     let entry = crate::toolchain::resolve_for_language(options.toolchain_id.as_deref(), language)?;
-    let inspection = crate::toolchain::inspect(&entry.id, options.runtime).await?;
+    let inspection = if options.runtime == OciRuntime::Auto {
+        crate::toolchain::install(&entry.id, options.runtime).await?
+    } else {
+        crate::toolchain::inspect(&entry.id, options.runtime).await?
+    };
     ensure!(
         inspection.installed,
         "signed toolchain {} is not installed; run `reporch toolchain install {}` explicitly",
