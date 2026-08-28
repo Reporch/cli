@@ -234,6 +234,28 @@ pub async fn verify_installed() -> Result<RuntimeInstallationV1> {
     Ok(installation)
 }
 
+/// Imports a native-installer seed into the per-user runtime before any
+/// network bootstrap. The seed is never trusted because of its install
+/// location: its manifest signature, declared contents, modes, and target are
+/// verified again after the copy, and `current.json` is committed last.
+pub async fn bootstrap_packaged_seed() -> Result<bool> {
+    let root = runtime_root()?;
+    if read_installation(&root)?.is_some() {
+        return Ok(false);
+    }
+    let Some(seed) = packaged_seed_path()? else {
+        return Ok(false);
+    };
+    if !seed.join("current.json").is_file() {
+        return Ok(false);
+    }
+    let lock_root = root.clone();
+    let _installation_lock = acquire_installation_lock(&lock_root).await?;
+    tokio::task::spawn_blocking(move || import_packaged_seed_at(&seed, &root))
+        .await
+        .context("join packaged runtime seed import")?
+}
+
 #[derive(Debug, Clone)]
 pub struct VerifiedRuntimeBundleV1 {
     pub installation: RuntimeInstallationV1,
@@ -2149,6 +2171,14 @@ fn verify_installed_bundle_at(
     root: &Path,
     installation: &RuntimeInstallationV1,
 ) -> Result<RuntimeBundleManifestV1> {
+    verify_runtime_bundle_at(root, installation, true)
+}
+
+fn verify_runtime_bundle_at(
+    root: &Path,
+    installation: &RuntimeInstallationV1,
+    require_artifact_permissions: bool,
+) -> Result<RuntimeBundleManifestV1> {
     installation.validate().map_err(anyhow::Error::from)?;
     let bundle = bundle_directory(root, installation.sequence, &installation.version);
     ensure_runtime_child(root, &bundle)?;
@@ -2201,7 +2231,9 @@ fn verify_installed_bundle_at(
             "runtime artifact size or type changed: {}",
             artifact.file_name
         );
-        verify_runtime_artifact_permissions(&metadata, artifact.kind)?;
+        if require_artifact_permissions {
+            verify_runtime_artifact_permissions(&metadata, artifact.kind)?;
+        }
         let actual = hash_regular_file(&path, artifact.size)?;
         anyhow::ensure!(
             actual == artifact.sha256,
@@ -2232,6 +2264,122 @@ fn verify_installed_bundle_at(
         "runtime bundle is missing declared files"
     );
     Ok(manifest)
+}
+
+fn packaged_seed_path() -> Result<Option<PathBuf>> {
+    if let Some(value) = std::env::var_os("REPORCH_RUNTIME_SEED") {
+        let path = PathBuf::from(value);
+        anyhow::ensure!(path.is_absolute(), "REPORCH_RUNTIME_SEED must be absolute");
+        return Ok(Some(path));
+    }
+    let Some(target) = HostTarget::current() else {
+        return Ok(None);
+    };
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        let adjacent = directory.join("runtime").join(target_name(target));
+        if adjacent.join("current.json").is_file() {
+            return Ok(Some(adjacent));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    return Ok(Some(
+        PathBuf::from("/Library/Application Support/Reporch/RuntimeSeed").join(target_name(target)),
+    ));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = target;
+        Ok(None)
+    }
+}
+
+fn import_packaged_seed_at(seed: &Path, root: &Path) -> Result<bool> {
+    ensure_runtime_root_is_narrow(root)?;
+    if read_installation(root)?.is_some() {
+        return Ok(false);
+    }
+    let seed_metadata = fs::symlink_metadata(seed).context("inspect packaged runtime seed")?;
+    anyhow::ensure!(
+        seed.is_absolute() && seed_metadata.is_dir() && !seed_metadata.file_type().is_symlink(),
+        "packaged runtime seed must be an absolute non-symlink directory"
+    );
+    let installation =
+        read_installation(seed)?.context("packaged runtime seed has no installation record")?;
+    let manifest = verify_runtime_bundle_at(seed, &installation, false)
+        .context("verify packaged runtime seed")?;
+    let current_target = HostTarget::current().context("unsupported runtime host target")?;
+    anyhow::ensure!(
+        installation.target == current_target,
+        "packaged runtime seed target does not match this host"
+    );
+
+    create_private_directory(root)?;
+    if read_installation(root)?.is_some() {
+        return Ok(false);
+    }
+    let bundles = root.join("bundles");
+    create_private_directory(&bundles)?;
+    let destination = bundle_directory(root, installation.sequence, &installation.version);
+    if destination.exists() {
+        return Ok(false);
+    }
+    let staging = root.join(format!(".seed-import-{}", Uuid::now_v7()));
+    create_private_directory(&staging)?;
+    let source = bundle_directory(seed, installation.sequence, &installation.version);
+    let import = (|| -> Result<()> {
+        for name in ["manifest.json", "manifest.json.minisig", ".complete"] {
+            let path = staging.join(name);
+            copy_seed_regular(&source.join(name), &path)?;
+            set_runtime_artifact_permissions(&path, RuntimeArtifactKindV1::Kernel)?;
+        }
+        for artifact in &manifest.artifacts {
+            let path = staging.join(&artifact.file_name);
+            copy_seed_regular(&source.join(&artifact.file_name), &path)?;
+            set_runtime_artifact_permissions(&path, artifact.kind)?;
+        }
+        fs::rename(&staging, &destination).context("atomically install packaged runtime bundle")?;
+        if let Err(error) = write_json_atomic(&root.join("current.json"), &installation) {
+            let _ = fs::remove_dir_all(&destination);
+            return Err(error).context("commit packaged runtime installation state");
+        }
+        if let Err(error) = verify_installed_bundle_at(root, &installation) {
+            let _ = fs::remove_file(root.join("current.json"));
+            let _ = fs::remove_dir_all(&destination);
+            return Err(error).context("verify imported packaged runtime seed");
+        }
+        Ok(())
+    })();
+    if import.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    import?;
+    Ok(true)
+}
+
+fn copy_seed_regular(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("inspect packaged runtime file {}", source.display()))?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() > 0
+            && metadata.len() <= 4 * 1_073_741_824,
+        "packaged runtime file must be a bounded regular non-symlink file"
+    );
+    let mut input = fs::File::open(source).context("open packaged runtime file")?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .context("create imported runtime file")?;
+    let copied = std::io::copy(&mut input, &mut output).context("copy packaged runtime file")?;
+    anyhow::ensure!(
+        copied == metadata.len(),
+        "packaged runtime file changed while copying"
+    );
+    output.sync_all().context("sync imported runtime file")?;
+    Ok(())
 }
 
 fn read_bounded_regular(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>> {

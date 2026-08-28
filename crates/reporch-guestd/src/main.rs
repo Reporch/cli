@@ -212,8 +212,8 @@ fn initialize_linux_guest() -> Result<GuestBootV1> {
         "tmpfs",
         "/workspace",
         "tmpfs",
-        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
-        c"mode=0755",
+        MountFlags::NOSUID | MountFlags::NODEV,
+        c"mode=0700",
     )
     .context("mount guest input tmpfs")?;
     mount(
@@ -240,6 +240,7 @@ fn initialize_linux_guest() -> Result<GuestBootV1> {
         Some(Gid::from_raw(65_534)),
     )
     .context("set guest execution directory ownership")?;
+    make_workload_directory(Path::new("/workspace"))?;
     load_optional_vsock_modules()?;
     mount_optional_toolchain()?;
     read_kernel_boot_identity()
@@ -536,8 +537,32 @@ fn create_safe_parent_directories(root: &Path, relative: &Path) -> Result<()> {
                 metadata.is_dir() && !metadata.file_type().is_symlink(),
                 "guest input path contains a symlink or non-directory"
             );
+            make_workload_directory(&cursor)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_workload_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restrict guest workload directory {}", path.display()))?;
+    #[cfg(target_os = "linux")]
+    if rustix::process::getuid().is_root() {
+        rustix::fs::chown(
+            path,
+            Some(rustix::process::Uid::from_raw(65_534)),
+            Some(rustix::process::Gid::from_raw(65_534)),
+        )
+        .with_context(|| format!("assign guest workload directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_workload_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 

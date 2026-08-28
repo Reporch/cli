@@ -1416,6 +1416,9 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
         return Ok(());
     }
 
+    reporch_runtime_host::bootstrap_packaged_seed()
+        .await
+        .context("import the packaged Reporch Runtime")?;
     let status = reporch_runtime_host::status().await?;
     if status.installed_version.is_none() {
         reporch_runtime_host::update()

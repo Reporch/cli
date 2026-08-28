@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -9,18 +10,19 @@ import {
   PLATFORM_PACKAGES,
   packageFor,
   extractPlatformBinary,
+  extractPlatformPayload,
   resolveBinary,
   resolveOrRecoverBinary,
   sha256File,
   verifyBinary
 } from "../bin/reporch.mjs";
 
-function tarEntry(path, contents, type = "0") {
+function tarEntry(path, contents, type = "0", mode = 0o755) {
   const body = Buffer.from(contents);
   const header = Buffer.alloc(512);
   header.write(path, 0, 100, "utf8");
   const octal = (value, length) => `${value.toString(8).padStart(length - 1, "0")}\0`;
-  header.write(octal(0o755, 8), 100, 8, "ascii");
+  header.write(octal(mode, 8), 100, 8, "ascii");
   header.write(octal(0, 8), 108, 8, "ascii");
   header.write(octal(0, 8), 116, 8, "ascii");
   header.write(octal(body.length, 12), 124, 12, "ascii");
@@ -37,6 +39,76 @@ function tarEntry(path, contents, type = "0") {
 
 function npmTarball(path, contents, type = "0") {
   return gzipSync(Buffer.concat([tarEntry(path, contents, type), Buffer.alloc(1024)]));
+}
+
+function npmTarballEntries(entries) {
+  return gzipSync(
+    Buffer.concat([
+      ...entries.map(({ path, contents, type = "0", mode = 0o444 }) =>
+        tarEntry(path, contents, type, mode)
+      ),
+      Buffer.alloc(1024)
+    ])
+  );
+}
+
+function runtimePayloadEntries(binaryContents, target = "linux-x64-gnu") {
+  const digest = (contents) =>
+    `sha256:${createHash("sha256").update(contents).digest("hex")}`;
+  const definitions = [
+    ["kernel", "vmlinux", Buffer.from("kernel\n")],
+    ["rootfs", "rootfs.cpio", Buffer.from("rootfs\n")],
+    ["guest_agent", "reporch-guestd", Buffer.from("guestd\n")]
+  ];
+  const artifacts = definitions.map(([kind, file_name, contents]) => ({
+    kind,
+    file_name,
+    sha256: digest(contents),
+    size: contents.length,
+    source_url: `https://example.test/${file_name}`,
+    sbom_url: `https://example.test/${file_name}.spdx.json`,
+    provenance_url: `https://example.test/${file_name}.intoto.jsonl`
+  }));
+  const manifest = Buffer.from(
+    `${JSON.stringify({
+      schema: "reporch.runtime-bundle-manifest.v1",
+      sequence: 8,
+      version: "1.0.0-rc.8",
+      target,
+      backend: "firecracker",
+      minimum_os_version: "1",
+      protocol_min: 1,
+      protocol_max: 1,
+      generated_at: "2026-08-29T00:00:00Z",
+      expires_at: "2026-10-03T00:00:00Z",
+      signing_key_id: "FF2F931B66DAA966",
+      artifacts
+    })}\n`
+  );
+  const manifestDigest = digest(manifest);
+  const bundle = `package/bin/runtime/${target}/bundles/8-1.0.0-rc.8`;
+  return [
+    { path: "package/bin/reporch", contents: binaryContents, mode: 0o755 },
+    {
+      path: `package/bin/runtime/${target}/current.json`,
+      contents: Buffer.from(`${JSON.stringify({
+        schema: "reporch.runtime-installation.v1",
+        sequence: 8,
+        version: "1.0.0-rc.8",
+        target,
+        bundle_sha256: manifestDigest,
+        installed_at: "2026-08-29T00:00:00Z"
+      })}\n`)
+    },
+    { path: `${bundle}/manifest.json`, contents: manifest },
+    { path: `${bundle}/manifest.json.minisig`, contents: Buffer.from("signature\n") },
+    { path: `${bundle}/.complete`, contents: Buffer.from(`${manifestDigest}\n`) },
+    ...definitions.map(([kind, file_name, contents]) => ({
+      path: `${bundle}/${file_name}`,
+      contents,
+      mode: kind === "guest_agent" ? 0o555 : 0o444
+    }))
+  ];
 }
 
 test("maps every supported npm target exactly", () => {
@@ -56,6 +128,8 @@ test("resolves and verifies the selected native binary", () => {
   mkdirSync(dirname(binary));
   writeFileSync(packageJson, "{}\n");
   writeFileSync(binary, "safe fixture\n");
+  mkdirSync(join(root, "bin/runtime/darwin-arm64"), { recursive: true });
+  writeFileSync(join(root, "bin/runtime/darwin-arm64/current.json"), "{}\n");
   chmodSync(binary, 0o755);
   const packageName = "@reporch/cli-darwin-arm64";
   assert.equal(
@@ -100,12 +174,27 @@ test("safely extracts only the exact regular platform binary", () => {
   );
 });
 
+test("extracts a complete digest-bound runtime payload and rejects mutation", () => {
+  const entries = runtimePayloadEntries(Buffer.from("verified binary\n"));
+  const tarball = npmTarballEntries(entries);
+  const payload = extractPlatformPayload(tarball, "reporch", "linux-x64-gnu");
+  assert.equal(payload.get("reporch").contents.toString(), "verified binary\n");
+  assert.ok(payload.has("runtime/linux-x64-gnu/current.json"));
+
+  const changed = runtimePayloadEntries(Buffer.from("verified binary\n"));
+  changed.find((entry) => entry.path.endsWith("/vmlinux")).contents = Buffer.from("changed\n");
+  assert.throws(
+    () => extractPlatformPayload(npmTarballEntries(changed), "reporch", "linux-x64-gnu"),
+    /failed integrity/
+  );
+});
+
 test("recovers an omitted optional package once and reuses the verified cache", async () => {
   const root = mkdtempSync(join(tmpdir(), "reporch-cli-recovery-"));
   const contents = Buffer.from("recovered native binary\n");
   const packageName = "@reporch/cli-linux-x64-gnu";
   const checksums = { [packageName]: sha256File(writeFixture(root, contents)) };
-  const tarball = npmTarball("package/bin/reporch", contents);
+  const tarball = npmTarballEntries(runtimePayloadEntries(contents));
   let requests = 0;
   const fetchImpl = async () => {
     requests += 1;
