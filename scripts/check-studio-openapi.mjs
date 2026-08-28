@@ -22,7 +22,10 @@ const requiredPaths = [
   "/api/v1/review-pool/{request_id}",
   "/api/v1/review-pool/{request_id}/claim",
   "/api/v1/review-pool/{request_id}/cancel",
-  "/api/v1/review-pool/{request_id}/decision"
+  "/api/v1/review-pool/{request_id}/decision",
+  "/api/v1/runtime-previews",
+  "/api/v1/runtime-previews/{preview_id}",
+  "/api/v1/runtime-previews/{preview_id}/events"
 ];
 
 for (const path of requiredPaths) {
@@ -37,7 +40,11 @@ for (const schema of [
   "ReviewApprovalSourceV1",
   "ValidationRunPage",
   "ValidationRunSummaryResponse",
-  "ReleasePage"
+  "ReleasePage",
+  "RuntimePreviewRequestV1",
+  "RuntimePreviewResultV1",
+  "RuntimePreviewOperationV1",
+  "RuntimePreviewStatusV1"
 ]) {
   assert.ok(schemas?.[schema], `Studio OpenAPI is missing schema ${schema}`);
 }
@@ -54,5 +61,14 @@ assert.ok(validations?.post, "Studio OpenAPI lacks validation creation");
 const commitDownload =
   document.paths?.["/api/v1/projects/{project_id}/commits/{commit_id}/file-download"];
 assert.ok(commitDownload?.get, "Studio OpenAPI lacks immutable commit file download");
+const previews = document.paths?.["/api/v1/runtime-previews"];
+assert.ok(previews?.post, "Studio OpenAPI lacks runtime preview creation");
+const preview = document.paths?.["/api/v1/runtime-previews/{preview_id}"];
+assert.ok(preview?.get, "Studio OpenAPI lacks runtime preview lookup");
+assert.ok(preview?.delete, "Studio OpenAPI lacks runtime preview cancellation");
+assert.ok(
+  document.paths?.["/api/v1/runtime-previews/{preview_id}/events"]?.get,
+  "Studio OpenAPI lacks runtime preview event stream"
+);
 
 console.log(`Studio OpenAPI lock passed: ${actualChecksum}`);

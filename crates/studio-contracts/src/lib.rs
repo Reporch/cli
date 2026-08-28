@@ -97,6 +97,7 @@ pub struct RuntimePreviewRequestV1 {
     pub source_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin_path: Option<String>,
+    pub files: Vec<ManifestFile>,
     pub limits: ToolExecutionLimitsV1,
 }
 

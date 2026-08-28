@@ -1635,17 +1635,34 @@ pub async fn runtime_preview_operation(
         message: "Runtime preview upload".into(),
         timeout_seconds: options.timeout_seconds.min(600),
     };
-    upload_manifest_files(&client, &upload_options, &manifest, &root).await?;
-    let remote_copy = client.get_working_copy(spec.project_id()).await?;
-    if remote_copy.spec != spec {
-        client
-            .update_working_copy(
-                spec.project_id(),
-                remote_copy.revision,
-                &UpdateWorkingCopyRequestV1 { spec: spec.clone() },
-            )
-            .await?;
+    let mut preview_files = Vec::with_capacity(2);
+    for path in [
+        &options.source_path,
+        options.stdin_path.as_ref().unwrap_or(&options.source_path),
+    ] {
+        if preview_files
+            .iter()
+            .any(|file: &ManifestFile| &file.path == path)
+        {
+            continue;
+        }
+        preview_files.push(
+            manifest
+                .files()
+                .iter()
+                .find(|file| &file.path == path)
+                .with_context(|| format!("runtime preview file is not declared: {path}"))?
+                .clone(),
+        );
     }
+    upload_manifest_file_entries(
+        &client,
+        &upload_options,
+        manifest.project_id(),
+        &preview_files,
+        &root,
+    )
+    .await?;
     let request = RuntimePreviewRequestV1 {
         schema: studio_contracts::RUNTIME_PREVIEW_REQUEST_SCHEMA_V1.into(),
         project_id: spec.project_id(),
@@ -1655,6 +1672,7 @@ pub async fn runtime_preview_operation(
         language: options.language.clone(),
         source_path: options.source_path.clone(),
         stdin_path: options.stdin_path.clone(),
+        files: preview_files,
         limits: options.limits.clone(),
     };
     let key = operation_key("runtime-preview", None)?;
@@ -2492,15 +2510,32 @@ async fn upload_manifest_files(
     manifest: &VersionedReleaseManifest,
     source_root: &Path,
 ) -> Result<usize> {
+    upload_manifest_file_entries(
+        client,
+        options,
+        manifest.project_id(),
+        manifest.files(),
+        source_root,
+    )
+    .await
+}
+
+async fn upload_manifest_file_entries(
+    client: &StudioApiClient,
+    options: &PushOptions,
+    project_id: Uuid,
+    files: &[ManifestFile],
+    source_root: &Path,
+) -> Result<usize> {
     let remote = client
-        .list_files(manifest.project_id())
+        .list_files(project_id)
         .await?
         .items
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect::<HashMap<_, _>>();
     let mut uploaded = 0_usize;
-    for file in manifest.files() {
+    for file in files {
         let source = source_root.join(&file.path);
         verify_local_file(&source, file).await?;
         if remote.get(&file.path).is_some_and(|remote| {
@@ -2513,7 +2548,7 @@ async fn upload_manifest_files(
         }
         let upload = client
             .begin_upload(
-                manifest.project_id(),
+                project_id,
                 &BeginFileUploadRequest {
                     path: file.path.clone(),
                     sha256: file.sha256.clone(),
@@ -2524,16 +2559,8 @@ async fn upload_manifest_files(
             )
             .await?;
         client.upload_file(&source, &upload).await?;
-        let status = client
-            .complete_upload(manifest.project_id(), upload.upload.id)
-            .await?;
-        wait_for_upload(
-            client,
-            manifest.project_id(),
-            status,
-            options.timeout_seconds,
-        )
-        .await?;
+        let status = client.complete_upload(project_id, upload.upload.id).await?;
+        wait_for_upload(client, project_id, status, options.timeout_seconds).await?;
         uploaded += 1;
     }
     Ok(uploaded)
