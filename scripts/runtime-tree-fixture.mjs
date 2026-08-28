@@ -11,14 +11,32 @@ export function createRuntimeTreeFixture(root, target, version = "1.0.0-rc.8") {
   const bundle = join(root, "bundles", `${sequence}-${version}`);
   mkdirSync(bundle, { recursive: true });
   const definitions = [
-    ["kernel", "vmlinux", Buffer.from(`kernel ${target}\n`)],
-    ["rootfs", target === "windows-x64-msvc" ? "rootfs.vhdx" : "rootfs.cpio", Buffer.from(`rootfs ${target}\n`)],
-    ["guest_agent", target === "windows-x64-msvc" ? "reporch-guestd.exe" : "reporch-guestd", Buffer.from(`guestd ${target}\n`)]
+    ["kernel", target === "windows-x64-msvc" ? "kernel" : "vmlinux", Buffer.from(`kernel ${target}\n`)],
+    ["rootfs", "rootfs.cpio", Buffer.from(`rootfs ${target}\n`)],
+    ["guest_agent", "reporch-guestd", Buffer.from(`guestd ${target}\n`)]
   ];
+  if (target.startsWith("linux")) {
+    definitions.push(
+      ["virtual_machine_monitor", "firecracker", Buffer.from(`firecracker ${target}\n`)],
+      ["jailer", "jailer", Buffer.from(`jailer ${target}\n`)],
+      ["host_service", "reporch-runtime-service", Buffer.from(`service ${target}\n`)]
+    );
+  } else if (target === "windows-x64-msvc") {
+    definitions.push([
+      "host_service",
+      "reporch-runtime-service.exe",
+      Buffer.from(`service ${target}\n`)
+    ]);
+  }
   const artifacts = definitions.map(([kind, file_name, bytes]) => {
     const path = join(bundle, file_name);
     writeFileSync(path, bytes);
-    chmodSync(path, kind === "guest_agent" ? 0o555 : 0o444);
+    chmodSync(
+      path,
+      ["guest_agent", "host_service", "virtual_machine_monitor", "jailer"].includes(kind)
+        ? 0o555
+        : 0o444
+    );
     return {
       kind,
       file_name,

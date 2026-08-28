@@ -1,0 +1,40 @@
+[Unit]
+Description=Reporch isolated local execution broker
+Documentation=https://github.com/Reporch/cli
+After=local-fs.target
+ConditionPathExists=/usr/lib/reporch/bin/reporch-runtime-service
+
+[Service]
+Type=simple
+User=root
+Group=reporch-runtime
+UMask=0007
+ExecStart=/usr/lib/reporch/bin/reporch-runtime-service
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+KillMode=mixed
+RuntimeDirectory=reporch-runtime
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+StateDirectory=reporch-runtime
+StateDirectoryMode=0750
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=no
+LockPersonality=yes
+SystemCallArchitectures=native
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+ReadWritePaths=/var/lib/reporch-runtime /run/reporch-runtime /run/user
+
+[Install]
+WantedBy=multi-user.target

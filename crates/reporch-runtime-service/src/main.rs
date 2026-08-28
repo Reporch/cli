@@ -30,9 +30,11 @@ mod unix_service {
     const MAX_CONNECTIONS: usize = 16;
 
     pub async fn run() -> Result<()> {
+        #[cfg(target_os = "linux")]
+        bootstrap_system_runtime_seed().await?;
         let socket = service_socket_path()?;
         let spool_override = spool_root_override()?;
-        prepare_private_directory(socket.parent().context("service socket has no parent")?)?;
+        prepare_service_directory(socket.parent().context("service socket has no parent")?)?;
         if let Some(spool) = &spool_override {
             prepare_private_directory(spool)?;
         }
@@ -43,6 +45,12 @@ mod unix_service {
         let socket_mode = if service_uid == 0 { 0o660 } else { 0o600 };
         fs::set_permissions(&socket, fs::Permissions::from_mode(socket_mode))
             .context("restrict runtime service socket")?;
+        let socket_metadata = fs::symlink_metadata(&socket).context("inspect runtime socket")?;
+        ensure!(
+            socket_metadata.uid() == service_uid
+                && socket_metadata.gid() == rustix::process::getgid().as_raw(),
+            "runtime service socket owner or group is invalid"
+        );
         let cleanup = SocketCleanup(socket.clone());
         let semaphore = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
@@ -313,6 +321,30 @@ mod unix_service {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    async fn bootstrap_system_runtime_seed() -> Result<()> {
+        if !rustix::process::getuid().is_root() {
+            return Ok(());
+        }
+        let executable = std::env::current_exe().context("resolve runtime service executable")?;
+        let target = reporch_runtime_core::HostTarget::current()
+            .context("runtime service target is unsupported")?;
+        let seed = executable
+            .parent()
+            .context("runtime service executable has no parent")?
+            .join("runtime")
+            .join(reporch_runtime_host::target_name(target));
+        if seed.join("current.json").is_file() {
+            reporch_runtime_host::bootstrap_packaged_seed_to(
+                &seed,
+                Path::new("/var/lib/reporch-runtime/runtime"),
+            )
+            .await
+            .context("import installer runtime seed")?;
+        }
+        Ok(())
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn ensure_system_runtime_root() -> Result<()> {
         anyhow::bail!("privileged runtime management is available only on Linux")
@@ -361,6 +393,25 @@ mod unix_service {
         );
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .context("restrict private runtime directory")?;
+        Ok(())
+    }
+
+    fn prepare_service_directory(path: &Path) -> Result<()> {
+        fs::create_dir_all(path)
+            .with_context(|| format!("create runtime service directory {}", path.display()))?;
+        let metadata = fs::symlink_metadata(path).context("inspect runtime service directory")?;
+        let service_uid = rustix::process::getuid().as_raw();
+        let service_gid = rustix::process::getgid().as_raw();
+        ensure!(
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == service_uid
+                && metadata.gid() == service_gid,
+            "runtime service directory must be owned by the service UID and GID"
+        );
+        let mode = if service_uid == 0 { 0o750 } else { 0o700 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .context("restrict runtime service directory")?;
         Ok(())
     }
 
@@ -498,7 +549,10 @@ mod windows_entry {
             .map_err(::windows_service::Error::Winapi)
             .and_then(|runtime| {
                 runtime
-                    .block_on(crate::windows_service::run(shutdown_rx))
+                    .block_on(async {
+                        bootstrap_system_runtime_seed().await?;
+                        crate::windows_service::run(shutdown_rx).await
+                    })
                     .map_err(|error| {
                         ::windows_service::Error::Winapi(std::io::Error::other(format!(
                             "{error:#}"
@@ -508,6 +562,33 @@ mod windows_entry {
         let exit_code = u32::from(result.is_err());
         status_handle.set_service_status(status(ServiceState::Stopped, false, exit_code))?;
         result
+    }
+
+    async fn bootstrap_system_runtime_seed() -> anyhow::Result<()> {
+        use anyhow::{Context as _, ensure};
+
+        let program_data = std::env::var_os("PROGRAMDATA").context("PROGRAMDATA is required")?;
+        let root = std::path::PathBuf::from(program_data)
+            .join("Reporch")
+            .join("Runtime");
+        let executable = std::env::current_exe().context("resolve runtime service executable")?;
+        let target = reporch_runtime_core::HostTarget::current()
+            .context("runtime service target is unsupported")?;
+        let seed = executable
+            .parent()
+            .context("runtime service executable has no parent")?
+            .join("runtime")
+            .join(reporch_runtime_host::target_name(target));
+        ensure!(
+            seed.is_absolute(),
+            "runtime service seed path is not absolute"
+        );
+        if seed.join("current.json").is_file() {
+            reporch_runtime_host::bootstrap_packaged_seed_to(&seed, &root)
+                .await
+                .context("import installer runtime seed")?;
+        }
+        Ok(())
     }
 
     fn status(state: ServiceState, accepts_stop: bool, exit_code: u32) -> ServiceStatus {

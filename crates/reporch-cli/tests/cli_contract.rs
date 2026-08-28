@@ -42,6 +42,19 @@ fn completion_is_immediate_but_operational_commands_require_runtime_bootstrap() 
     assert!(completion.status.success(), "{completion:?}");
     assert!(String::from_utf8_lossy(&completion.stdout).contains("_reporch"));
 
+    let status = Command::new(env!("CARGO_BIN_EXE_reporch"))
+        .env_remove("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP")
+        .env("REPORCH_RUNTIME_HOME", runtime_home.path())
+        .env("REPORCH_RUNTIME_CHANNEL_URL", "not-a-runtime-channel")
+        .args(["runtime", "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("Reporch Runtime"),
+        "{status:?}"
+    );
+
     let project = tempfile::tempdir().unwrap();
     reporch()
         .args([

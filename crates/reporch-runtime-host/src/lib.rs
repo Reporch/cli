@@ -240,17 +240,31 @@ pub async fn verify_installed() -> Result<RuntimeInstallationV1> {
 /// verified again after the copy, and `current.json` is committed last.
 pub async fn bootstrap_packaged_seed() -> Result<bool> {
     let root = runtime_root()?;
-    if read_installation(&root)?.is_some() {
-        return Ok(false);
-    }
     let Some(seed) = packaged_seed_path()? else {
         return Ok(false);
     };
+    bootstrap_packaged_seed_to(&seed, &root).await
+}
+
+/// Imports one installer-owned seed into an explicit narrow runtime root.
+/// Privileged brokers use this during first service start so package installs
+/// never need to download or execute an unverified bootstrap helper.
+pub async fn bootstrap_packaged_seed_to(seed: &Path, root: &Path) -> Result<bool> {
+    ensure_runtime_root_is_narrow(root)?;
+    anyhow::ensure!(
+        seed.is_absolute() && root.is_absolute(),
+        "packaged runtime seed and destination must be absolute"
+    );
+    if read_installation(root)?.is_some() {
+        return Ok(false);
+    }
     if !seed.join("current.json").is_file() {
         return Ok(false);
     }
-    let lock_root = root.clone();
+    let lock_root = root.to_owned();
     let _installation_lock = acquire_installation_lock(&lock_root).await?;
+    let seed = seed.to_owned();
+    let root = root.to_owned();
     tokio::task::spawn_blocking(move || import_packaged_seed_at(&seed, &root))
         .await
         .context("join packaged runtime seed import")?
@@ -1909,6 +1923,9 @@ async fn install_manifest_artifacts(
         format!("sha256:{}\n", hex::encode(Sha256::digest(manifest_bytes))),
     )
     .context("write runtime completion marker")?;
+    for name in ["manifest.json", "manifest.json.minisig", ".complete"] {
+        set_runtime_artifact_permissions(&staging.join(name), RuntimeArtifactKindV1::Rootfs)?;
+    }
     Ok(())
 }
 
@@ -2595,10 +2612,31 @@ fn create_private_directory(path: &Path) -> Result<()> {
         metadata.is_dir() && !metadata.file_type().is_symlink(),
         "runtime directory must not be a symlink"
     );
+    #[cfg(target_os = "linux")]
+    if rustix::process::getuid().is_root() {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            metadata.uid() == 0,
+            "system runtime directory must remain root-owned"
+        );
+        let service_gid = rustix::process::getgid();
+        if !service_gid.is_root() && metadata.gid() != service_gid.as_raw() {
+            rustix::fs::chown(path, None, Some(service_gid))
+                .context("assign runtime directory to the broker group")?;
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        #[cfg(target_os = "linux")]
+        let mode = if rustix::process::getuid().is_root() {
+            0o750
+        } else {
+            0o700
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mode = 0o700;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .context("restrict runtime directory permissions")?;
     }
     Ok(())
@@ -2620,6 +2658,20 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
         file.write_all(&bytes)
             .context("write temporary runtime state")?;
         file.sync_all().context("sync temporary runtime state")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            #[cfg(target_os = "linux")]
+            let mode = if rustix::process::getuid().is_root() {
+                0o640
+            } else {
+                0o600
+            };
+            #[cfg(not(target_os = "linux"))]
+            let mode = 0o600;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
+                .context("restrict runtime state permissions")?;
+        }
         let had_previous = path.exists();
         if had_previous {
             fs::rename(path, &backup).context("move previous runtime state aside")?;

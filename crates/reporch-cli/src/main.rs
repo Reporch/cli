@@ -1400,7 +1400,9 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
         || matches!(
             command,
             Command::Runtime {
-                command: RuntimeCommand::Update
+                command: RuntimeCommand::Status
+                    | RuntimeCommand::Doctor { .. }
+                    | RuntimeCommand::Update
                     | RuntimeCommand::Repair
                     | RuntimeCommand::Reset { .. }
             }
