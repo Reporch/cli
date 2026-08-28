@@ -521,7 +521,10 @@ fn build_ext4(
             metadata.is_file()
                 && !metadata.file_type().is_symlink()
                 && metadata.len() == image_bytes,
-            "toolchain builder produced an invalid image"
+            "toolchain builder produced an invalid image: expected {image_bytes} bytes, got {} bytes, regular={}, symlink={}",
+            metadata.len(),
+            metadata.is_file(),
+            metadata.file_type().is_symlink()
         );
         verify_ext4_magic(&temporary)?;
         verify_root_filesystem(&temporary, architecture)?;
