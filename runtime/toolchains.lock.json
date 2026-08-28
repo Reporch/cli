@@ -12,7 +12,7 @@
     {
       "id": "pypy-3.11",
       "language": "pypy",
-      "image_mib": 1024,
+      "image_mib": 1536,
       "image": "pypy:3.11-7.3.23-trixie@sha256:bc9daca429f6e4c592e33be0d03e0d6e3de28d4e389ae7028022cd3a1065ddb4"
     },
     {
