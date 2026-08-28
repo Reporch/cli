@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -27,8 +27,12 @@ test("one independently rebuilt toolchain covers every platform artifact", async
     const rebuild = join(root, "rebuild");
     fixture(primary, "bash-5.3");
     fixture(rebuild, "bash-5.3");
+    chmodSync(join(rebuild, "bash-5.3-linux-arm64.source.spdx.json"), 0o444);
     const report = await compareToolchainEntry(primary, rebuild, "bash-5.3");
     assert.equal(report.files, 9);
+    chmodSync(join(rebuild, "bash-5.3-linux-arm64.ext4.zst"), 0o444);
+    await assert.rejects(() => compareToolchainEntry(primary, rebuild, "bash-5.3"), /differs/u);
+    chmodSync(join(rebuild, "bash-5.3-linux-arm64.ext4.zst"), 0o644);
     writeFileSync(join(rebuild, "bash-5.3-windows-x64.vhdx.zst"), "changed\n");
     await assert.rejects(() => compareToolchainEntry(primary, rebuild, "bash-5.3"), /differs/u);
   } finally {

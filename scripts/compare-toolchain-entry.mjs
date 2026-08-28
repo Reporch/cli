@@ -49,7 +49,11 @@ export async function compareToolchainEntry(primaryArgument, rebuildArgument, id
     const rebuiltSbom = join(rebuild, `${id}-${sourceSbom}`);
     const expectedSbom = await digest(primarySbom, 32 * 1024 * 1024);
     const actualSbom = await digest(rebuiltSbom, 32 * 1024 * 1024);
-    assert.deepEqual(actualSbom, expectedSbom, `${sourceSbom} differs from its independent rebuild`);
+    assert.deepEqual(
+      { size: actualSbom.size, sha256: actualSbom.sha256 },
+      { size: expectedSbom.size, sha256: expectedSbom.sha256 },
+      `${sourceSbom} differs from its independent rebuild`
+    );
     records.push({ name: basename(primarySbom), ...expectedSbom });
   }
   return {
