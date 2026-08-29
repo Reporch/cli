@@ -1,0 +1,120 @@
+name: Apple VM qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-vm-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUNTIME_TAG: reporch-runtime-v1
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+      - name: Initialize qualification evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/apple-vm-evidence"
+          mkdir -p "$evidence"
+          jq -n \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg orchestrator_revision "$GITHUB_SHA" \
+            '{schema:"reporch.apple-vm-qualification-bootstrap.v1",run_id:$run_id,run_attempt:$run_attempt,orchestrator_revision:$orchestrator_revision}' \
+            > "$evidence/bootstrap.json"
+      - name: Download and verify the public runtime and toolchain channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/apple-vm-assets"
+          evidence="$RUNNER_TEMP/apple-vm-evidence"
+          mkdir -p "$assets"
+          gh release download "$RUNTIME_TAG" --dir "$assets" \
+            --pattern SHA256SUMS \
+            --pattern TOOLCHAIN-SHA256SUMS \
+            --pattern runtime-darwin-arm64-manifest.json \
+            --pattern runtime-darwin-arm64-manifest.json.minisig \
+            --pattern runtime-darwin-arm64-vmlinux \
+            --pattern runtime-darwin-arm64-rootfs.cpio \
+            --pattern toolchains-v2-index.json \
+            --pattern toolchains-v2-index.json.minisig \
+            --pattern bash-5.3-linux-arm64.ext4.zst
+          grep -E '  (runtime-darwin-arm64-manifest.json|runtime-darwin-arm64-manifest.json.minisig|runtime-darwin-arm64-vmlinux|runtime-darwin-arm64-rootfs.cpio)$' \
+            "$assets/SHA256SUMS" > "$assets/selected-runtime-SHA256SUMS"
+          grep -E '  (toolchains-v2-index.json|toolchains-v2-index.json.minisig|bash-5.3-linux-arm64.ext4.zst)$' \
+            "$assets/TOOLCHAIN-SHA256SUMS" > "$assets/selected-toolchain-SHA256SUMS"
+          test "$(wc -l < "$assets/selected-runtime-SHA256SUMS" | tr -d ' ')" = 4
+          test "$(wc -l < "$assets/selected-toolchain-SHA256SUMS" | tr -d ' ')" = 3
+          (cd "$assets" && shasum -a 256 --check selected-runtime-SHA256SUMS)
+          (cd "$assets" && shasum -a 256 --check selected-toolchain-SHA256SUMS)
+
+          cargo build --locked -p reporch-cli
+          public_key=$(base64 < artifacts/runtime-v1.minisign.pub | tr -d '\r\n')
+          runtime_signature=$(base64 < "$assets/runtime-darwin-arm64-manifest.json.minisig" | tr -d '\r\n')
+          toolchain_signature=$(base64 < "$assets/toolchains-v2-index.json.minisig" | tr -d '\r\n')
+          target/debug/reporch artifact verify-minisign \
+            --artifact "$assets/runtime-darwin-arm64-manifest.json" \
+            --signature "$runtime_signature" --public-key "$public_key" \
+            > "$evidence/runtime-signature.json"
+          target/debug/reporch artifact verify-minisign \
+            --artifact "$assets/toolchains-v2-index.json" \
+            --signature "$toolchain_signature" --public-key "$public_key" \
+            > "$evidence/toolchain-signature.json"
+          jq -e '.passed and .minisign_verified' "$evidence/runtime-signature.json" >/dev/null
+          jq -e '.passed and .minisign_verified' "$evidence/toolchain-signature.json" >/dev/null
+
+          jq -e '
+            .schema == "reporch.runtime-bundle-manifest.v1"
+            and .target == "darwin-arm64"
+            and .backend == "apple_virtualization"
+          ' "$assets/runtime-darwin-arm64-manifest.json" >/dev/null
+          bundle=$(jq -er '
+            .entries[]
+            | select(.id == "bash-5.3")
+            | .bundles[]
+            | select(.target == "darwin-arm64")
+          ' "$assets/toolchains-v2-index.json")
+          test "$(jq -r .archive_file_name <<<"$bundle")" = bash-5.3-linux-arm64.ext4.zst
+          expected_archive_size=$(jq -er .archive_size <<<"$bundle")
+          expected_archive_sha=$(jq -er '.archive_sha256 | sub("^sha256:"; "")' <<<"$bundle")
+          test "$(stat -f %z "$assets/bash-5.3-linux-arm64.ext4.zst")" = "$expected_archive_size"
+          test "$(shasum -a 256 "$assets/bash-5.3-linux-arm64.ext4.zst" | awk '{print $1}')" = "$expected_archive_sha"
+          zstd -d "$assets/bash-5.3-linux-arm64.ext4.zst" \
+            -o "$assets/bash-5.3-linux-arm64.ext4"
+          expected_size=$(jq -er .size <<<"$bundle")
+          expected_sha=$(jq -er '.sha256 | sub("^sha256:"; "")' <<<"$bundle")
+          test "$(stat -f %z "$assets/bash-5.3-linux-arm64.ext4")" = "$expected_size"
+          test "$(shasum -a 256 "$assets/bash-5.3-linux-arm64.ext4" | awk '{print $1}')" = "$expected_sha"
+      - name: Boot, execute, and clean up 100 Apple VMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/qualify-apple-vm.sh \
+            "$RUNNER_TEMP/apple-vm-assets/runtime-darwin-arm64-vmlinux" \
+            "$RUNNER_TEMP/apple-vm-assets/runtime-darwin-arm64-rootfs.cpio" \
+            "$RUNNER_TEMP/apple-vm-assets/bash-5.3-linux-arm64.ext4" \
+            "$RUNNER_TEMP/apple-vm-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: apple-vm-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/apple-vm-evidence
+          if-no-files-found: error
+          retention-days: 90

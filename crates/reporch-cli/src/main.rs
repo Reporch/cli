@@ -1429,6 +1429,13 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
             .context("complete mandatory Reporch Runtime bootstrap")?;
         return Ok(());
     }
+    if matches!(
+        status.availability,
+        reporch_runtime_core::RuntimeAvailability::Ready
+            | reporch_runtime_core::RuntimeAvailability::RemoteOnly
+    ) {
+        return Ok(());
+    }
     if reporch_runtime_host::verify_installed().await.is_err() {
         reporch_runtime_host::repair()
             .await

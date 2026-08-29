@@ -1426,13 +1426,30 @@ pub async fn status_at(root: &Path) -> Result<RuntimeStatusV1> {
     };
     let installation = read_installation(root)?;
     let (virtualization_available, reason) = probe_virtualization(target).await;
-    let bundle_complete = installation
+    let bundle_verification = match installation.clone() {
+        Some(installation) => {
+            let verification_root = root.to_owned();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    verify_installed_bundle_at(&verification_root, &installation)
+                        .map(|_| ())
+                        .map_err(|error| format!("{error:#}"))
+                })
+                .await
+                .context("join runtime status bundle verification")?,
+            )
+        }
+        None => None,
+    };
+    let bundle_verified = matches!(&bundle_verification, Some(Ok(())));
+    let asset_failure = bundle_verification
         .as_ref()
-        .is_some_and(|value| installed_bundle_complete(root, value));
+        .and_then(|verification| verification.as_ref().err())
+        .map(|error| format!("Runtime asset verification failed: {error}"));
     // Apple Virtualization runs in-process. Linux and Windows require the
     // least-privilege broker and must never be reported ready merely because
     // its executable is present on disk.
-    let service_available = if !bundle_complete {
+    let service_available = if !bundle_verified {
         false
     } else {
         match target {
@@ -1441,11 +1458,17 @@ pub async fn status_at(root: &Path) -> Result<RuntimeStatusV1> {
             HostTarget::WindowsX64Msvc => probe_runtime_service().await,
         }
     };
-    let availability = match (&installation, virtualization_available, service_available) {
-        (None, _, _) => RuntimeAvailability::NotInstalled,
-        (Some(_), false, _) => RuntimeAvailability::RemoteOnly,
-        (Some(_), true, false) => RuntimeAvailability::Broken,
-        (Some(_), true, true) => RuntimeAvailability::Ready,
+    let availability = match (
+        &installation,
+        bundle_verified,
+        virtualization_available,
+        service_available,
+    ) {
+        (None, _, _, _) => RuntimeAvailability::NotInstalled,
+        (Some(_), false, _, _) => RuntimeAvailability::Broken,
+        (Some(_), true, false, _) => RuntimeAvailability::RemoteOnly,
+        (Some(_), true, true, false) => RuntimeAvailability::Broken,
+        (Some(_), true, true, true) => RuntimeAvailability::Ready,
     };
     Ok(RuntimeStatusV1 {
         schema: STATUS_SCHEMA.into(),
@@ -1464,7 +1487,7 @@ pub async fn status_at(root: &Path) -> Result<RuntimeStatusV1> {
         reason: if installation.is_none() {
             Some(RuntimeError::BootstrapIncomplete.to_string())
         } else {
-            reason
+            asset_failure.or(reason)
         },
     })
 }
@@ -2959,6 +2982,36 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["version"], 2);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_status_never_reports_an_unverified_bundle_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let installation = RuntimeInstallationV1 {
+            schema: INSTALLATION_SCHEMA.into(),
+            sequence: 8,
+            version: "1.0.0-rc.8".into(),
+            target: HostTarget::current().unwrap(),
+            bundle_sha256: format!("sha256:{}", "a".repeat(64)),
+            installed_at: Utc::now(),
+        };
+        let bundle = bundle_directory(root.path(), installation.sequence, &installation.version);
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join(".complete"), b"complete\n").unwrap();
+        write_json_atomic(&root.path().join("current.json"), &installation).unwrap();
+
+        let status = status_at(root.path()).await.unwrap();
+
+        assert_eq!(status.availability, RuntimeAvailability::Broken);
+        assert!(!status.service_available);
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Runtime asset verification failed")),
+            "{:?}",
+            status.reason
+        );
     }
 
     #[test]
