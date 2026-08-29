@@ -1,0 +1,94 @@
+name: Free hosted virtualization capability probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-virtualization-capability-probe
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Linux KVM (${{ matrix.target }})
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64-gnu
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64-gnu
+    steps:
+      - name: Prove the KVM API is usable
+        shell: bash
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          case "$EXPECTED_TARGET" in
+            linux-x64-gnu) test "$(uname -m)" = x86_64 ;;
+            linux-arm64-gnu) test "$(uname -m)" = aarch64 ;;
+            *) exit 2 ;;
+          esac
+          source_file="$RUNNER_TEMP/kvm-api.c"
+          binary="$RUNNER_TEMP/kvm-api"
+          printf '%s\n' \
+            '#include <fcntl.h>' \
+            '#include <linux/kvm.h>' \
+            '#include <sys/ioctl.h>' \
+            '#include <unistd.h>' \
+            'int main(void) {' \
+            '  int fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);' \
+            '  if (fd < 0) return 10;' \
+            '  int version = ioctl(fd, KVM_GET_API_VERSION, 0);' \
+            '  close(fd);' \
+            '  return version == KVM_API_VERSION ? 0 : 11;' \
+            '}' > "$source_file"
+          cc -O2 -Wall -Wextra -Werror "$source_file" -o "$binary"
+          "$binary"
+
+  macos-intel:
+    name: macOS Intel Virtualization.framework
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: macos-15-intel
+    timeout-minutes: 5
+    steps:
+      - name: Prove Apple hypervisor support is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$(sysctl -n kern.hv_support)" = 1
+          test -d /System/Library/Frameworks/Virtualization.framework
+          test -d /System/Library/Frameworks/Hypervisor.framework
+
+  windows:
+    name: Windows Hyper-V and HCS
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Prove Hyper-V compute services are available
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $system = Get-CimInstance Win32_ComputerSystem
+          if (-not $system.HypervisorPresent) { throw 'Hyper-V is unavailable' }
+          $hcsdiag = Join-Path $env:SystemRoot 'System32\hcsdiag.exe'
+          if (-not (Test-Path -LiteralPath $hcsdiag -PathType Leaf)) {
+            throw 'hcsdiag.exe is unavailable'
+          }
+          $service = Get-Service vmcompute
+          if ($service.Status -ne 'Running') {
+            throw "vmcompute is not running: $($service.Status)"
+          }
+          & $hcsdiag list | Out-String | Write-Host
