@@ -1918,16 +1918,30 @@ fn acquire_installation_lock_blocking(path: &Path) -> Result<InstallationLock> {
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => return Ok(InstallationLock(file)),
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
+                if installation_lock_is_contended(&error)
                     && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if installation_lock_is_contended(&error) => {
                 anyhow::bail!("another runtime installation is still in progress")
             }
             Err(error) => return Err(error).context("lock runtime installation"),
         }
+    }
+}
+
+fn installation_lock_is_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(windows::Win32::Foundation::ERROR_LOCK_VIOLATION.0 as i32)
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -2954,7 +2968,7 @@ mod tests {
         let first = acquire_installation_lock_blocking(&lock_path).unwrap();
         let second_file = open_installation_lock(&lock_path).unwrap();
         let error = fs2::FileExt::try_lock_exclusive(&second_file).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(installation_lock_is_contended(&error), "{error:?}");
         drop(first);
         fs2::FileExt::try_lock_exclusive(&second_file).unwrap();
         fs2::FileExt::unlock(&second_file).unwrap();
