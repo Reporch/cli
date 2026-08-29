@@ -17,10 +17,15 @@ for path in "$KERNEL" "$INITRAMFS" "$TOOLCHAIN" "$EVIDENCE"; do
     exit 2
   }
 done
-[[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]] || {
-  echo "Apple VM qualification requires a macOS arm64 host" >&2
+[[ "$(uname -s)" == "Darwin" ]] || {
+  echo "Apple VM qualification requires a macOS host" >&2
   exit 2
 }
+case "$(uname -m)" in
+  arm64) EXPECTED_TARGET=darwin-arm64; MACH_ARCH=arm64 ;;
+  x86_64) EXPECTED_TARGET=darwin-x64; MACH_ARCH=x86_64 ;;
+  *) echo "unsupported Apple qualification architecture: $(uname -m)" >&2; exit 2 ;;
+esac
 for command_name in cargo codesign file git jq shasum; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "required command is unavailable: $command_name" >&2
@@ -71,7 +76,7 @@ TEST_BINARY="$(
   echo "runtime-host test binary escaped the repository target directory" >&2
   exit 1
 }
-file "$TEST_BINARY" | grep -Eq 'Mach-O 64-bit.*arm64'
+file "$TEST_BINARY" | grep -Eq "Mach-O 64-bit.*$MACH_ARCH"
 codesign --force --sign - \
   --entitlements installers/macos/reporch.entitlements \
   --options runtime "$TEST_BINARY"
@@ -115,6 +120,7 @@ COMPLETED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 jq -n \
   --arg source_revision "$SOURCE_REVISION" \
   --arg completed_at "$COMPLETED_AT" \
+  --arg target "$EXPECTED_TARGET" \
   --arg kernel_sha256 "sha256:$KERNEL_SHA256" \
   --arg initramfs_sha256 "sha256:$INITRAMFS_SHA256" \
   --arg toolchain_sha256 "sha256:$TOOLCHAIN_SHA256" \
@@ -127,7 +133,7 @@ jq -n \
     schema:"reporch.apple-vm-qualification.v1",
     source_revision:$source_revision,
     completed_at:$completed_at,
-    target:"darwin-arm64",
+    target:$target,
     backend:"apple_virtualization",
     kernel_sha256:$kernel_sha256,
     initramfs_sha256:$initramfs_sha256,

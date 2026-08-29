@@ -2,26 +2,35 @@ name: Apple VM qualification
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Native Apple host target
+        type: choice
+        required: true
+        default: darwin-arm64
+        options:
+          - darwin-arm64
+          - darwin-x64
 
 permissions:
   contents: read
 
 concurrency:
-  group: apple-vm-qualification
+  group: apple-vm-qualification-${{ inputs.target }}
   cancel-in-progress: false
 
 jobs:
   qualify:
     if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
-    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
+    runs-on: ${{ inputs.target == 'darwin-x64' && fromJSON('["self-hosted","macOS","X64","cli-zero-cost","cli-macos-x64"]') || fromJSON('["self-hosted","macOS","ARM64","cli-zero-cost","cli-macos-arm64"]') }}
     timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
       RUNTIME_TAG: reporch-runtime-v1
+      RUNTIME_TARGET: ${{ inputs.target }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: main
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
@@ -46,20 +55,35 @@ jobs:
           assets="$RUNNER_TEMP/apple-vm-assets"
           evidence="$RUNNER_TEMP/apple-vm-evidence"
           mkdir -p "$assets"
+          case "$RUNTIME_TARGET" in
+            darwin-arm64) toolchain_arch=arm64 ;;
+            darwin-x64) toolchain_arch=x64 ;;
+            *) echo "unsupported Apple runtime target: $RUNTIME_TARGET" >&2; exit 2 ;;
+          esac
+          runtime_manifest="runtime-$RUNTIME_TARGET-manifest.json"
+          runtime_signature_file="$runtime_manifest.minisig"
+          kernel="runtime-$RUNTIME_TARGET-vmlinux"
+          initramfs="runtime-$RUNTIME_TARGET-rootfs.cpio"
+          toolchain_archive="bash-5.3-linux-$toolchain_arch.ext4.zst"
+          toolchain_image="bash-5.3-linux-$toolchain_arch.ext4"
           gh release download "$RUNTIME_TAG" --dir "$assets" \
             --pattern SHA256SUMS \
             --pattern TOOLCHAIN-SHA256SUMS \
-            --pattern runtime-darwin-arm64-manifest.json \
-            --pattern runtime-darwin-arm64-manifest.json.minisig \
-            --pattern runtime-darwin-arm64-vmlinux \
-            --pattern runtime-darwin-arm64-rootfs.cpio \
+            --pattern "$runtime_manifest" \
+            --pattern "$runtime_signature_file" \
+            --pattern "$kernel" \
+            --pattern "$initramfs" \
             --pattern toolchains-v2-index.json \
             --pattern toolchains-v2-index.json.minisig \
-            --pattern bash-5.3-linux-arm64.ext4.zst
-          grep -E '  (runtime-darwin-arm64-manifest.json|runtime-darwin-arm64-manifest.json.minisig|runtime-darwin-arm64-vmlinux|runtime-darwin-arm64-rootfs.cpio)$' \
-            "$assets/SHA256SUMS" > "$assets/selected-runtime-SHA256SUMS"
-          grep -E '  (toolchains-v2-index.json|toolchains-v2-index.json.minisig|bash-5.3-linux-arm64.ext4.zst)$' \
-            "$assets/TOOLCHAIN-SHA256SUMS" > "$assets/selected-toolchain-SHA256SUMS"
+            --pattern "$toolchain_archive"
+          : > "$assets/selected-runtime-SHA256SUMS"
+          for name in "$runtime_manifest" "$runtime_signature_file" "$kernel" "$initramfs"; do
+            grep -F "  $name" "$assets/SHA256SUMS" >> "$assets/selected-runtime-SHA256SUMS"
+          done
+          : > "$assets/selected-toolchain-SHA256SUMS"
+          for name in toolchains-v2-index.json toolchains-v2-index.json.minisig "$toolchain_archive"; do
+            grep -F "  $name" "$assets/TOOLCHAIN-SHA256SUMS" >> "$assets/selected-toolchain-SHA256SUMS"
+          done
           test "$(wc -l < "$assets/selected-runtime-SHA256SUMS" | tr -d ' ')" = 4
           test "$(wc -l < "$assets/selected-toolchain-SHA256SUMS" | tr -d ' ')" = 3
           (cd "$assets" && shasum -a 256 --check selected-runtime-SHA256SUMS)
@@ -67,10 +91,10 @@ jobs:
 
           cargo build --locked -p reporch-cli
           public_key=$(base64 < artifacts/runtime-v1.minisign.pub | tr -d '\r\n')
-          runtime_signature=$(base64 < "$assets/runtime-darwin-arm64-manifest.json.minisig" | tr -d '\r\n')
+          runtime_signature=$(base64 < "$assets/$runtime_signature_file" | tr -d '\r\n')
           toolchain_signature=$(base64 < "$assets/toolchains-v2-index.json.minisig" | tr -d '\r\n')
           target/debug/reporch artifact verify-minisign \
-            --artifact "$assets/runtime-darwin-arm64-manifest.json" \
+            --artifact "$assets/$runtime_manifest" \
             --signature "$runtime_signature" --public-key "$public_key" \
             > "$evidence/runtime-signature.json"
           target/debug/reporch artifact verify-minisign \
@@ -80,41 +104,45 @@ jobs:
           jq -e '.passed and .minisign_verified' "$evidence/runtime-signature.json" >/dev/null
           jq -e '.passed and .minisign_verified' "$evidence/toolchain-signature.json" >/dev/null
 
-          jq -e '
+          jq -e --arg target "$RUNTIME_TARGET" '
             .schema == "reporch.runtime-bundle-manifest.v1"
-            and .target == "darwin-arm64"
+            and .target == $target
             and .backend == "apple_virtualization"
-          ' "$assets/runtime-darwin-arm64-manifest.json" >/dev/null
-          bundle=$(jq -er '
+          ' "$assets/$runtime_manifest" >/dev/null
+          bundle=$(jq -er --arg target "$RUNTIME_TARGET" '
             .entries[]
             | select(.id == "bash-5.3")
             | .bundles[]
-            | select(.target == "darwin-arm64")
+            | select(.target == $target)
           ' "$assets/toolchains-v2-index.json")
-          test "$(jq -r .archive_file_name <<<"$bundle")" = bash-5.3-linux-arm64.ext4.zst
+          test "$(jq -r .archive_file_name <<<"$bundle")" = "$toolchain_archive"
           expected_archive_size=$(jq -er .archive_size <<<"$bundle")
           expected_archive_sha=$(jq -er '.archive_sha256 | sub("^sha256:"; "")' <<<"$bundle")
-          test "$(stat -f %z "$assets/bash-5.3-linux-arm64.ext4.zst")" = "$expected_archive_size"
-          test "$(shasum -a 256 "$assets/bash-5.3-linux-arm64.ext4.zst" | awk '{print $1}')" = "$expected_archive_sha"
-          zstd -d "$assets/bash-5.3-linux-arm64.ext4.zst" \
-            -o "$assets/bash-5.3-linux-arm64.ext4"
+          test "$(stat -f %z "$assets/$toolchain_archive")" = "$expected_archive_size"
+          test "$(shasum -a 256 "$assets/$toolchain_archive" | awk '{print $1}')" = "$expected_archive_sha"
+          zstd -d "$assets/$toolchain_archive" -o "$assets/$toolchain_image"
           expected_size=$(jq -er .size <<<"$bundle")
           expected_sha=$(jq -er '.sha256 | sub("^sha256:"; "")' <<<"$bundle")
-          test "$(stat -f %z "$assets/bash-5.3-linux-arm64.ext4")" = "$expected_size"
-          test "$(shasum -a 256 "$assets/bash-5.3-linux-arm64.ext4" | awk '{print $1}')" = "$expected_sha"
+          test "$(stat -f %z "$assets/$toolchain_image")" = "$expected_size"
+          test "$(shasum -a 256 "$assets/$toolchain_image" | awk '{print $1}')" = "$expected_sha"
+          {
+            echo "QUALIFICATION_KERNEL=$assets/$kernel"
+            echo "QUALIFICATION_INITRAMFS=$assets/$initramfs"
+            echo "QUALIFICATION_TOOLCHAIN=$assets/$toolchain_image"
+          } >> "$GITHUB_ENV"
       - name: Boot, execute, and clean up 100 Apple VMs
         shell: bash
         run: |
           set -euo pipefail
           scripts/qualify-apple-vm.sh \
-            "$RUNNER_TEMP/apple-vm-assets/runtime-darwin-arm64-vmlinux" \
-            "$RUNNER_TEMP/apple-vm-assets/runtime-darwin-arm64-rootfs.cpio" \
-            "$RUNNER_TEMP/apple-vm-assets/bash-5.3-linux-arm64.ext4" \
+            "$QUALIFICATION_KERNEL" \
+            "$QUALIFICATION_INITRAMFS" \
+            "$QUALIFICATION_TOOLCHAIN" \
             "$RUNNER_TEMP/apple-vm-evidence"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: apple-vm-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          name: apple-vm-qualification-${{ inputs.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/apple-vm-evidence
           if-no-files-found: error
           retention-days: 90

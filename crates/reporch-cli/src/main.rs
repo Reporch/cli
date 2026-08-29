@@ -294,6 +294,14 @@ enum RuntimeCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Run release qualification against the installed native VM backend.
+    #[command(hide = true)]
+    Qualification {
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        iterations: u32,
+        #[arg(long, default_value = "bash-5.3")]
+        toolchain: String,
+    },
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -1014,6 +1022,22 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     &format!("Reset Reporch Runtime to {}", result.installed_version),
                 )
             }
+            RuntimeCommand::Qualification {
+                iterations,
+                toolchain,
+            } => {
+                let result =
+                    reporch_runtime_host::qualify_installed_native_runtime(iterations, &toolchain)
+                        .await?;
+                output.emit(
+                    "runtime qualification",
+                    &result,
+                    &format!(
+                        "Qualified {} native VM iterations; p95 {} ms",
+                        result.iterations, result.p95_ms
+                    ),
+                )
+            }
         },
         Command::Completion { shell } => generate_completion(shell, output),
         Command::Quota { command } => match command {
@@ -1455,6 +1479,7 @@ fn command_skips_runtime_bootstrap(command: &Command) -> bool {
                     | RuntimeCommand::Update
                     | RuntimeCommand::Repair
                     | RuntimeCommand::Reset { .. }
+                    | RuntimeCommand::Qualification { .. }
             }
         )
 }
@@ -1816,6 +1841,7 @@ fn command_name(command: &Command) -> &'static str {
             RuntimeCommand::Update => "runtime update",
             RuntimeCommand::Repair => "runtime repair",
             RuntimeCommand::Reset { .. } => "runtime reset",
+            RuntimeCommand::Qualification { .. } => "runtime qualification",
         },
         Command::Completion { .. } => "completion",
         Command::Quota { .. } => "quota show",

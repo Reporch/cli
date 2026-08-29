@@ -1,0 +1,148 @@
+name: Linux VM qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Native KVM host target
+        type: choice
+        required: true
+        default: linux-x64-gnu
+        options:
+          - linux-x64-gnu
+          - linux-arm64-gnu
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-vm-qualification-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  qualify-x64:
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR && inputs.target == 'linux-x64-gnu'
+    runs-on: [self-hosted, Linux, X64, cli-zero-cost, cli-linux-x64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+      - name: Verify native KVM host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          systemctl --version
+          command -v dpkg-deb
+          command -v rpmbuild
+      - name: Build exact CLI and mandatory runtime installer
+        shell: bash
+        env:
+          RUNTIME_TARGET: linux-x64-gnu
+          RUST_TARGET: x86_64-unknown-linux-gnu
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p reporch-cli --target "$RUST_TARGET"
+          binary="target/$RUST_TARGET/release/reporch"
+          bundle="$RUNNER_TEMP/runtime-bundle-$RUNTIME_TARGET"
+          tree="$RUNNER_TEMP/runtime-tree-$RUNTIME_TARGET"
+          output="$RUNNER_TEMP/system-installer-$RUST_TARGET"
+          node scripts/fetch-runtime-bundle.mjs "$RUNTIME_TARGET" "$bundle"
+          generated_at=$(node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync(process.argv[1])); process.stdout.write(String(Date.parse(value.generated_at)/1000));' "$bundle/manifest.json")
+          SOURCE_DATE_EPOCH="$generated_at" cargo run --locked -p reporch-runtime-install-tree-builder -- \
+            "$bundle/manifest.json" "$bundle/manifest.json.minisig" "$bundle/artifacts" "$tree"
+          node scripts/pack-system-installer.mjs "$RUST_TARGET" "$binary" "$tree" "$output"
+          package=$(find "$output" -maxdepth 1 -type f -name '*.deb' -print)
+          test -n "$package"
+          sudo REPORCH_INSTALL_USER="$USER" dpkg --install "$package"
+          systemctl is-active --quiet reporch-runtime.service
+          printf 'QUALIFICATION_BINARY=%s\n' /usr/lib/reporch/bin/reporch >> "$GITHUB_ENV"
+      - name: Boot, execute, and clean up 100 Firecracker VMs
+        shell: bash
+        run: scripts/qualify-linux-vm.sh "$QUALIFICATION_BINARY" "$RUNNER_TEMP/linux-vm-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: linux-vm-qualification-linux-x64-gnu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-vm-evidence
+          if-no-files-found: error
+          retention-days: 90
+      - name: Remove qualification package
+        if: always()
+        shell: bash
+        run: sudo dpkg --remove reporch-cli || true
+  qualify-arm64:
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR && inputs.target == 'linux-arm64-gnu'
+    runs-on: [self-hosted, Linux, ARM64, cli-zero-cost, cli-linux-arm64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+          targets: aarch64-unknown-linux-gnu
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+      - name: Verify native KVM host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          systemctl --version
+          command -v dpkg-deb
+          command -v rpmbuild
+      - name: Build exact CLI and mandatory runtime installer
+        shell: bash
+        env:
+          RUNTIME_TARGET: linux-arm64-gnu
+          RUST_TARGET: aarch64-unknown-linux-gnu
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p reporch-cli --target "$RUST_TARGET"
+          binary="target/$RUST_TARGET/release/reporch"
+          bundle="$RUNNER_TEMP/runtime-bundle-$RUNTIME_TARGET"
+          tree="$RUNNER_TEMP/runtime-tree-$RUNTIME_TARGET"
+          output="$RUNNER_TEMP/system-installer-$RUST_TARGET"
+          node scripts/fetch-runtime-bundle.mjs "$RUNTIME_TARGET" "$bundle"
+          generated_at=$(node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync(process.argv[1])); process.stdout.write(String(Date.parse(value.generated_at)/1000));' "$bundle/manifest.json")
+          SOURCE_DATE_EPOCH="$generated_at" cargo run --locked -p reporch-runtime-install-tree-builder -- \
+            "$bundle/manifest.json" "$bundle/manifest.json.minisig" "$bundle/artifacts" "$tree"
+          node scripts/pack-system-installer.mjs "$RUST_TARGET" "$binary" "$tree" "$output"
+          package=$(find "$output" -maxdepth 1 -type f -name '*.deb' -print)
+          test -n "$package"
+          sudo REPORCH_INSTALL_USER="$USER" dpkg --install "$package"
+          systemctl is-active --quiet reporch-runtime.service
+          printf 'QUALIFICATION_BINARY=%s\n' /usr/lib/reporch/bin/reporch >> "$GITHUB_ENV"
+      - name: Boot, execute, and clean up 100 Firecracker VMs
+        shell: bash
+        run: scripts/qualify-linux-vm.sh "$QUALIFICATION_BINARY" "$RUNNER_TEMP/linux-vm-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: linux-vm-qualification-linux-arm64-gnu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-vm-evidence
+          if-no-files-found: error
+          retention-days: 90
+      - name: Remove qualification package
+        if: always()
+        shell: bash
+        run: sudo dpkg --remove reporch-cli || true
