@@ -13,7 +13,7 @@ concurrency:
 jobs:
   qualify:
     if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
-    runs-on: [self-hosted, Windows, X64, cli-zero-cost, cli-windows-x64]
+    runs-on: windows-2025
     timeout-minutes: 75
     env:
       RUNTIME_TARGET: windows-x64-msvc
@@ -32,6 +32,14 @@ jobs:
         with:
           node-version: "24.2.0"
           package-manager-cache: false
+      - name: Install pinned WiX toolset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toolPath = Join-Path $env:RUNNER_TEMP "wix-tools"
+          dotnet tool install wix --version 6.0.2 --tool-path $toolPath
+          $toolPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $toolPath "wix.exe") --version
       - name: Verify native Hyper-V host prerequisites
         shell: pwsh
         run: |
