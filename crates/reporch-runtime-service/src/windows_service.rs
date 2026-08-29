@@ -5,13 +5,14 @@ use std::future::Future;
 use std::io::{BufReader, Read as _, Write as _};
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use reporch_runtime_core::RuntimeArtifactKindV1;
-use reporch_runtime_hcs::{HYPERV_VSOCK_PORT, HcsVirtualMachine, HcsVmConfigV1};
+use reporch_runtime_hcs::{
+    HYPERV_VSOCK_PORT, HcsCancellationHandle, HcsVirtualMachine, HcsVmConfigV1,
+};
 use reporch_runtime_protocol::{
     PROTOCOL_VERSION, ProtocolFailureV1, RuntimeServiceCommandV1, RuntimeServiceRequestV1,
     RuntimeServiceResponseV1, RuntimeServiceResultV1, SERVICE_RESPONSE_SCHEMA,
@@ -37,6 +38,113 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 16;
 const MAX_RUNNING_JOBS: usize = 1;
+
+struct HcsJobLifecycle<C = HcsCancellationHandle> {
+    state: Mutex<HcsJobState<C>>,
+}
+
+enum HcsJobState<C> {
+    Pending { cancel_requested: bool },
+    Running { capability: C },
+    Canceling,
+    Finished,
+}
+
+impl<C: Clone> HcsJobLifecycle<C> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HcsJobState::Pending {
+                cancel_requested: false,
+            }),
+        }
+    }
+
+    fn cancellation_requested(&self) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("HCS lifecycle lock poisoned"))?;
+        Ok(matches!(
+            &*state,
+            HcsJobState::Pending {
+                cancel_requested: true
+            } | HcsJobState::Canceling
+        ))
+    }
+
+    /// Publish a creation-derived cancellation capability.
+    ///
+    /// Returns true when cancellation arrived while the VM was being created;
+    /// the worker still owns the VM and must terminate it through that handle.
+    fn publish_running(&self, capability: C) -> Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("HCS lifecycle lock poisoned"))?;
+        match &*state {
+            HcsJobState::Pending {
+                cancel_requested: true,
+            } => {
+                *state = HcsJobState::Canceling;
+                Ok(true)
+            }
+            HcsJobState::Pending {
+                cancel_requested: false,
+            } => {
+                *state = HcsJobState::Running { capability };
+                Ok(false)
+            }
+            HcsJobState::Running { .. } | HcsJobState::Canceling | HcsJobState::Finished => {
+                anyhow::bail!("HCS lifecycle was already published")
+            }
+        }
+    }
+
+    fn request_cancel_with<F>(&self, terminate: F) -> Result<bool>
+    where
+        F: FnOnce(&C) -> Result<()>,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("HCS lifecycle lock poisoned"))?;
+        match &*state {
+            HcsJobState::Pending { .. } => {
+                *state = HcsJobState::Pending {
+                    cancel_requested: true,
+                };
+                Ok(false)
+            }
+            HcsJobState::Running { capability } => {
+                let capability = capability.clone();
+                *state = HcsJobState::Canceling;
+                terminate(&capability)?;
+                Ok(true)
+            }
+            HcsJobState::Canceling | HcsJobState::Finished => Ok(false),
+        }
+    }
+
+    fn finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = HcsJobState::Finished;
+        }
+    }
+}
+
+impl HcsJobLifecycle<HcsCancellationHandle> {
+    fn request_cancel(&self) -> Result<bool> {
+        self.request_cancel_with(HcsCancellationHandle::terminate)
+    }
+}
+
+struct HcsJobLifecycleGuard(Arc<HcsJobLifecycle>);
+
+impl Drop for HcsJobLifecycleGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
 
 pub async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
     let pipe_name = reporch_runtime_host::service_pipe_name()?;
@@ -98,27 +206,21 @@ async fn handle_connection(
         .context("runtime service request timed out")??;
     let result = match request.validate() {
         Ok(()) => {
-            let cancellation = matches!(&request.command, RuntimeServiceCommandV1::RunJob { .. })
-                .then(|| Arc::new(AtomicBool::new(false)));
-            let execution = execute_request(&request, job_semaphore, cancellation.as_ref());
-            let completed = if cancellation.is_some() {
+            let lifecycle = matches!(&request.command, RuntimeServiceCommandV1::RunJob { .. })
+                .then(|| Arc::new(HcsJobLifecycle::new()));
+            let execution = execute_request(&request, job_semaphore, lifecycle.as_ref());
+            let completed = if lifecycle.is_some() {
                 await_job_or_client_disconnect(&mut stream, execution).await
             } else {
                 Some(execution.await)
             };
             let Some(completed) = completed else {
-                let cancellation = cancellation.context("missing HCS cancellation token")?;
-                cancellation.store(true, Ordering::SeqCst);
-                if let RuntimeServiceCommandV1::RunJob { job, .. } = &request.command {
-                    let id = job.id;
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(6),
-                        tokio::task::spawn_blocking(move || {
-                            reporch_runtime_hcs::terminate_compute_system(id)
-                        }),
-                    )
-                    .await;
-                }
+                let lifecycle = lifecycle.context("missing HCS job lifecycle")?;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(6),
+                    tokio::task::spawn_blocking(move || lifecycle.request_cancel()),
+                )
+                .await;
                 return Ok(());
             };
             completed.unwrap_or_else(|error| {
@@ -164,7 +266,7 @@ where
 async fn execute_request(
     request: &RuntimeServiceRequestV1,
     job_semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
-    cancellation: Option<&Arc<AtomicBool>>,
+    lifecycle: Option<&Arc<HcsJobLifecycle>>,
 ) -> Result<RuntimeServiceResultV1> {
     match &request.command {
         RuntimeServiceCommandV1::Ping => Ok(RuntimeServiceResultV1::Pong {
@@ -205,14 +307,14 @@ async fn execute_request(
             runtime_sequence,
             runtime_bundle_digest,
         } => {
-            let cancellation = cancellation
-                .context("HCS execution requires a connection-bound cancellation token")?
+            let lifecycle = lifecycle
+                .context("HCS execution requires a connection-bound lifecycle")?
                 .clone();
             ensure!(
-                !cancellation.load(Ordering::SeqCst),
+                !lifecycle.cancellation_requested()?,
                 "HCS job was canceled before execution"
             );
-            let _job_permit = job_semaphore
+            let job_permit = job_semaphore
                 .clone()
                 .acquire_owned()
                 .await
@@ -240,7 +342,10 @@ async fn execute_request(
             };
             let job = (**job).clone();
             let result = tokio::task::spawn_blocking(move || {
-                execute_hcs_job(&bundle, toolchain.as_ref(), &job, &cancellation)
+                // The blocking worker, not the client-facing async future,
+                // owns the permit until its VM and job directories are gone.
+                let _job_permit = job_permit;
+                execute_hcs_job(&bundle, toolchain.as_ref(), &job, &lifecycle)
             })
             .await??;
             Ok(RuntimeServiceResultV1::JobCompleted {
@@ -264,11 +369,14 @@ fn execute_hcs_job(
     bundle: &reporch_runtime_host::VerifiedRuntimeBundleV1,
     toolchain: Option<&reporch_runtime_host::VerifiedToolchainBundleV2>,
     job: &reporch_runtime_protocol::GuestJobV1,
-    cancellation: &AtomicBool,
+    lifecycle: &Arc<HcsJobLifecycle>,
 ) -> Result<reporch_runtime_protocol::GuestResultV1> {
+    // Declared before the VM so normal unwinding closes the owned HCS handle
+    // before publishing Finished to a racing disconnect watcher.
+    let _lifecycle_guard = HcsJobLifecycleGuard(lifecycle.clone());
     job.validate()?;
     ensure!(
-        !cancellation.load(Ordering::SeqCst),
+        !lifecycle.cancellation_requested()?,
         "HCS job was canceled before VM creation"
     );
     let spool = reporch_runtime_host::service_spool_root()?;
@@ -277,7 +385,9 @@ fn execute_hcs_job(
     let kernel = bundle.artifact_path(RuntimeArtifactKindV1::Kernel)?;
     let initrd = bundle.artifact_path(RuntimeArtifactKindV1::Rootfs)?;
     let config = HcsVmConfigV1 {
-        id: job.id,
+        // HCS object identity is broker-private. The client job ID remains in
+        // the guest protocol, but can never select a privileged host object.
+        id: uuid::Uuid::now_v7(),
         kernel,
         initrd,
         toolchain_vhdx: toolchain.map(|toolchain| toolchain.path.clone()),
@@ -286,7 +396,8 @@ fn execute_hcs_job(
         vsock_port: HYPERV_VSOCK_PORT,
     };
     let mut vm = HcsVirtualMachine::create(&config)?;
-    if cancellation.load(Ordering::SeqCst) {
+    let cancellation = vm.cancellation_handle()?;
+    if lifecycle.publish_running(cancellation)? {
         let _ = vm.terminate();
         anyhow::bail!("HCS job was canceled during VM creation");
     }
@@ -305,43 +416,6 @@ fn execute_hcs_job(
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error).context("cleanup HCS virtual machine"),
-    }
-}
-
-#[cfg(test)]
-mod cancellation_tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    use super::await_job_or_client_disconnect;
-
-    struct DropSignal(Arc<AtomicBool>);
-
-    impl Drop for DropSignal {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    #[tokio::test]
-    async fn disconnect_drops_the_hcs_join_future() {
-        let (mut service, client) = tokio::io::duplex(64);
-        let dropped = Arc::new(AtomicBool::new(false));
-        let signal = DropSignal(dropped.clone());
-        let operation = async move {
-            let _signal = signal;
-            std::future::pending::<()>().await;
-        };
-        drop(client);
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            await_job_or_client_disconnect(&mut service, operation),
-        )
-        .await
-        .unwrap();
-        assert!(result.is_none());
-        assert!(dropped.load(Ordering::SeqCst));
     }
 }
 
@@ -649,5 +723,125 @@ struct JobDirectoryCleanup(PathBuf);
 impl Drop for JobDirectoryCleanup {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::{HcsJobLifecycle, await_job_or_client_disconnect};
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_drops_the_hcs_join_future() {
+        let (mut service, client) = tokio::io::duplex(64);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let signal = DropSignal(dropped.clone());
+        let operation = async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        };
+        drop(client);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_job_or_client_disconnect(&mut service, operation),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn disconnect_before_creation_cannot_terminate_a_client_selected_system() {
+        let lifecycle = HcsJobLifecycle::<u64>::new();
+        let calls = AtomicUsize::new(0);
+        let terminated = lifecycle
+            .request_cancel_with(|_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!terminated);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(lifecycle.publish_running(41).unwrap());
+    }
+
+    #[test]
+    fn running_capability_is_canceled_once_and_finished_is_terminal() {
+        let lifecycle = HcsJobLifecycle::<u64>::new();
+        assert!(!lifecycle.publish_running(73).unwrap());
+        let calls = AtomicUsize::new(0);
+        let terminate = |capability: &u64| {
+            assert_eq!(*capability, 73);
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+
+        assert!(lifecycle.request_cancel_with(terminate).unwrap());
+        assert!(!lifecycle.request_cancel_with(|_| Ok(())).unwrap());
+        lifecycle.finish();
+        assert!(!lifecycle.request_cancel_with(|_| Ok(())).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn normal_completion_prevents_late_cancellation() {
+        let lifecycle = HcsJobLifecycle::<u64>::new();
+        assert!(!lifecycle.publish_running(99).unwrap());
+        lifecycle.finish();
+        let calls = AtomicUsize::new(0);
+
+        assert!(
+            !lifecycle
+                .request_cancel_with(|_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_blocking_worker_retains_the_job_permit() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_release = release.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*worker_release;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = wake.wait(ready).unwrap();
+            }
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(worker);
+
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_one();
+        let permit =
+            tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned())
+                .await
+                .unwrap()
+                .unwrap();
+        drop(permit);
     }
 }
