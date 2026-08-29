@@ -6,7 +6,7 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use minisign::{PublicKeyBox, SecretKeyBox, sign};
+use minisign::{PublicKeyBox, SecretKey, SecretKeyBox, sign};
 
 const MAX_INDEX_BYTES: u64 = 256 * 1024;
 const MAX_KEY_BYTES: u64 = 4 * 1024;
@@ -28,10 +28,7 @@ fn main() -> Result<()> {
     let public = read_bounded_regular(&public_path, MAX_KEY_BYTES, "public key")?;
     let secret = String::from_utf8(secret).context("secret key must be UTF-8")?;
     let public = String::from_utf8(public).context("public key must be UTF-8")?;
-    let secret = SecretKeyBox::from_string(&secret)
-        .context("decode toolchain secret key")?
-        .into_secret_key(None)
-        .context("open unencrypted toolchain secret key")?;
+    let secret = open_unencrypted_secret_key(&secret)?;
     let public = PublicKeyBox::from_string(&public)
         .context("decode toolchain public key")?
         .into_public_key()
@@ -74,6 +71,13 @@ fn main() -> Result<()> {
     write_result
 }
 
+fn open_unencrypted_secret_key(encoded: &str) -> Result<SecretKey> {
+    SecretKeyBox::from_string(encoded)
+        .context("decode toolchain secret key")?
+        .into_unencrypted_secret_key()
+        .context("open unencrypted toolchain secret key")
+}
+
 fn read_bounded_regular(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {label} {}", path.display()))?;
@@ -97,4 +101,26 @@ fn tempfile_path(parent: &Path) -> PathBuf {
         ".toolchain-index-signature-{}.tmp",
         std::process::id()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use minisign::{KeyPair, SecretKeyBox};
+
+    use super::open_unencrypted_secret_key;
+
+    #[test]
+    fn opens_the_same_unencrypted_key_format_as_the_runtime_release() {
+        let key_pair = KeyPair::generate_unencrypted_keypair().expect("generate key pair");
+        let encoded = key_pair
+            .sk
+            .to_box(Some("Reporch runtime signing key"))
+            .expect("box secret key")
+            .into_string();
+
+        open_unencrypted_secret_key(&encoded).expect("open unencrypted secret key");
+
+        let parsed = SecretKeyBox::from_string(&encoded).expect("parse secret key box");
+        assert!(parsed.into_secret_key(None).is_err());
+    }
 }
