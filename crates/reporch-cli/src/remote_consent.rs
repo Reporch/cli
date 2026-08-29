@@ -317,6 +317,7 @@ fn write_store(path: &Path, store: &ConsentStoreV1) -> Result<()> {
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("replace {}", path.display()))?;
+    #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -354,6 +355,13 @@ mod tests {
         let loaded = read_store(&path).unwrap();
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[&key].credential_fingerprint, "a".repeat(64));
+        store.entries.get_mut(&key).unwrap().credential_fingerprint = "b".repeat(64);
+        write_store(&path, &store).unwrap();
+        let replaced = read_store(&path).unwrap();
+        assert_eq!(
+            replaced.entries[&key].credential_fingerprint,
+            "b".repeat(64)
+        );
         assert_ne!(
             key,
             consent_key(

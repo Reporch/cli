@@ -2818,10 +2818,12 @@ fn required_env(name: &str) -> Result<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use reporch_runtime_protocol::{
         ContentObjectV1, GuestHandshakeV1, GuestOperationV1, GuestOutputV1, GuestResultV1,
         HANDSHAKE_SCHEMA, JOB_SCHEMA, PROTOCOL_VERSION, RESULT_SCHEMA, ResourceLimitsV1,
     };
+    #[cfg(unix)]
     use std::collections::BTreeMap;
 
     const SIGNED_FIXTURE: &[u8] =
