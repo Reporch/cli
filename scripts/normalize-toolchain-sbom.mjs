@@ -5,6 +5,16 @@ import { pathToFileURL } from "node:url";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;
 const CREATED = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u;
+const DEPENDENCY_RELATIONSHIPS = new Set([
+  "DEPENDS_ON",
+  "DEPENDENCY_OF",
+  "BUILD_DEPENDENCY_OF",
+  "DEV_DEPENDENCY_OF",
+  "OPTIONAL_DEPENDENCY_OF",
+  "PROVIDED_DEPENDENCY_OF",
+  "RUNTIME_DEPENDENCY_OF",
+  "TEST_DEPENDENCY_OF"
+]);
 
 function replaceIdentity(value, from, to) {
   if (Array.isArray(value)) return value.map((item) => replaceIdentity(item, from, to));
@@ -18,6 +28,53 @@ function replaceIdentity(value, from, to) {
 
 function sorted(values, field) {
   return [...(values ?? [])].sort((left, right) => String(left[field] ?? "").localeCompare(String(right[field] ?? "")));
+}
+
+function packageCoordinate(pkg) {
+  const purls = (pkg.externalRefs ?? [])
+    .filter(({ referenceCategory, referenceType, referenceLocator }) =>
+      referenceCategory === "PACKAGE-MANAGER" &&
+      referenceType === "purl" &&
+      typeof referenceLocator === "string"
+    )
+    .map(({ referenceLocator }) => referenceLocator)
+    .sort();
+  if (purls.length === 0) return null;
+  return `${pkg.name ?? ""}\0${pkg.versionInfo ?? ""}\0${purls.join("\0")}`;
+}
+
+function canonicalDependencyPackageIds(packages) {
+  const groups = new Map();
+  for (const pkg of packages) {
+    const coordinate = packageCoordinate(pkg);
+    if (coordinate === null) continue;
+    const ids = groups.get(coordinate) ?? [];
+    ids.push(pkg.SPDXID);
+    groups.set(coordinate, ids);
+  }
+  const canonical = new Map();
+  for (const ids of groups.values()) {
+    if (ids.length < 2) continue;
+    ids.sort();
+    for (const id of ids) canonical.set(id, ids[0]);
+  }
+  return canonical;
+}
+
+function canonicalizeDependencyRelationships(relationships, packageIds) {
+  const values = relationships.map((relationship) => {
+    const type = relationship.relationshipType ?? "";
+    if (!DEPENDENCY_RELATIONSHIPS.has(type)) return relationship;
+    return {
+      ...relationship,
+      spdxElementId: packageIds.get(relationship.spdxElementId) ?? relationship.spdxElementId,
+      relatedSpdxElement:
+        packageIds.get(relationship.relatedSpdxElement) ?? relationship.relatedSpdxElement
+    };
+  });
+  const unique = new Map();
+  for (const relationship of values) unique.set(JSON.stringify(relationship), relationship);
+  return [...unique.values()];
 }
 
 export function normalizeToolchainSbom(value, sourceIdentity, architecture, created) {
@@ -51,8 +108,8 @@ export function normalizeToolchainSbom(value, sourceIdentity, architecture, crea
   normalized.name = `Reporch Toolchain Source ${sourceIdentity} ${architecture}`;
   normalized.documentNamespace = `https://reporch.com/spdx/toolchain-source/${sourceIdentity.slice("sha256:".length)}/${architecture}`;
   normalized.creationInfo.created = created;
-  normalized.creationInfo.creators = ["Organization: Anchore, Inc", "Tool: syft-1.51.0", "Tool: reporch-sbom-normalizer-1.0.0-rc.8"];
-  normalized.documentComment = `Exact package and license inventory for ${sourceIdentity} (${architecture}); generated before deterministic VM filesystem conversion.`;
+  normalized.creationInfo.creators = ["Organization: Anchore, Inc", "Tool: syft-1.51.0", "Tool: reporch-sbom-normalizer-1.0.1-rc.8"];
+  normalized.documentComment = `Exact package and license inventory for ${sourceIdentity} (${architecture}); coordinate-equivalent dependency endpoints are canonicalized before deterministic VM filesystem conversion.`;
   const rootPackage = normalized.packages.find(({ SPDXID }) => SPDXID === root);
   assert.ok(rootPackage, "SBOM described root is not present in the package inventory");
   rootPackage.name = "reporch-toolchain-source";
@@ -66,7 +123,11 @@ export function normalizeToolchainSbom(value, sourceIdentity, architecture, crea
   ];
   normalized.packages = sorted(normalized.packages, "SPDXID");
   normalized.files = sorted(normalized.files, "SPDXID");
-  normalized.relationships = [...(normalized.relationships ?? [])].sort((left, right) =>
+  const canonicalPackageIds = canonicalDependencyPackageIds(normalized.packages);
+  normalized.relationships = canonicalizeDependencyRelationships(
+    normalized.relationships ?? [],
+    canonicalPackageIds
+  ).sort((left, right) =>
     `${left.spdxElementId}\0${left.relationshipType}\0${left.relatedSpdxElement}`.localeCompare(
       `${right.spdxElementId}\0${right.relationshipType}\0${right.relatedSpdxElement}`
     )
