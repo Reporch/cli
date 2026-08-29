@@ -1,0 +1,27 @@
+[package]
+name = "reporch-runtime-hcs"
+version = "1.0.0-rc.8"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_System_HostComputeSystem",
+  "Win32_System_Hypervisor",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+] }

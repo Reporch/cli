@@ -1,6 +1,6 @@
 {
   "name": "reporch-cli-source",
-  "version": "1.0.0-rc.7",
+  "version": "1.0.0-rc.8",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,6 +9,7 @@
   "scripts": {
     "test": "node --test npm/cli/test/*.test.mjs scripts/*.test.mjs",
     "check:versions": "node scripts/check-versions.mjs",
-    "check:workflows": "node scripts/check-workflows.mjs"
+    "check:workflows": "node scripts/check-workflows.mjs",
+    "check:runtime-sources": "node scripts/check-runtime-sources.mjs"
   }
 }

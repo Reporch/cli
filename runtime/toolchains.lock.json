@@ -1,0 +1,79 @@
+{
+  "schema": "reporch.toolchain-sources-lock.v1",
+  "sequence": 8,
+  "source_date_epoch": 1787961600,
+  "entries": [
+    {
+      "id": "python-3.14",
+      "language": "python",
+      "image_mib": 512,
+      "image": "python:3.14-slim@sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061"
+    },
+    {
+      "id": "pypy-3.11",
+      "language": "pypy",
+      "image_mib": 1536,
+      "image": "pypy:3.11-7.3.23-trixie@sha256:bc9daca429f6e4c592e33be0d03e0d6e3de28d4e389ae7028022cd3a1065ddb4"
+    },
+    {
+      "id": "gcc-16.1-c",
+      "language": "c",
+      "image_mib": 4096,
+      "image": "gcc:16.1.0@sha256:47c649664b62db94d186b16936e203bb07ab1d10a0ef860cee198e594f636757"
+    },
+    {
+      "id": "gcc-16.1-cpp",
+      "language": "cpp",
+      "image_mib": 4096,
+      "image": "gcc:16.1.0@sha256:47c649664b62db94d186b16936e203bb07ab1d10a0ef860cee198e594f636757"
+    },
+    {
+      "id": "temurin-26-java",
+      "language": "java",
+      "image_mib": 2048,
+      "image": "eclipse-temurin:26-jdk@sha256:0e52e08108f27ab71328304e0c704ad53e2b6be812718ad38a2821c11ecb231d"
+    },
+    {
+      "id": "rust-1.96",
+      "language": "rust",
+      "image_mib": 4096,
+      "image": "rust:1.96.0-slim-bookworm@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d"
+    },
+    {
+      "id": "node-24",
+      "language": "javascript",
+      "image_mib": 1024,
+      "image": "node:24-bookworm-slim@sha256:c2d5ade763cacfb03fe9cb8e8af5d1be5041ff331921fa26a9b231ca3a4f780a"
+    },
+    {
+      "id": "dotnet-10-csharp",
+      "language": "csharp",
+      "image_mib": 4096,
+      "image": "mcr.microsoft.com/dotnet/sdk:10.0@sha256:548d93f8a18a1acbe6cc127bc4f47281430d34a9e35c18afa80a8d6741c2adc3"
+    },
+    {
+      "id": "php-8.5",
+      "language": "php",
+      "image_mib": 1024,
+      "image": "php:8.5.7-cli-bookworm@sha256:8d9e011523af1e27e3706192bbf399cba9525ad477d7bcb01127ca50d132a926"
+    },
+    {
+      "id": "r-4.6",
+      "language": "r",
+      "image_mib": 1024,
+      "image": "r-base:4.6.0@sha256:b01b8c91e0596c3c8a174d818dfc6e3740f192f29009ab5f71a90fa20e131edc"
+    },
+    {
+      "id": "bash-5.3",
+      "language": "bash",
+      "image_mib": 256,
+      "image": "bash:5.3.15@sha256:a19c811ee9e97fa8a080001d82b8e0ded303f0795cffdb1cbd162731bc8ce208"
+    },
+    {
+      "id": "swift-6.3",
+      "language": "swift",
+      "image_mib": 4096,
+      "image": "swift:6.3.2-jammy@sha256:5f846f008aa76859377d4e9dafe2826c74dde99421bbc60ae2b98d0f1daf72cf"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 [package]
 name = "reporch-cli"
-version = "1.0.0-rc.7"
+version = "1.0.0-rc.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -28,8 +28,9 @@ open.workspace = true
 pulldown-cmark.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
-reqwest.workspace = true
 reporch-format = { path = "../reporch-format" }
+reporch-runtime-core = { path = "../reporch-runtime-core" }
+reporch-runtime-host = { path = "../reporch-runtime-host" }
 rustix.workspace = true
 serde_json.workspace = true
 serde.workspace = true
@@ -50,3 +51,9 @@ zeroize.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { workspace = true, features = ["rustls"] }
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }

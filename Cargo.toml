@@ -1,12 +1,29 @@
 [workspace]
 members = [
   "crates/reporch-format",
+  "crates/reporch-runtime-core",
+  "crates/reporch-guestd",
+  "crates/reporch-runtime-host",
+  "crates/reporch-runtime-hcs",
+  "crates/reporch-runtime-protocol",
+  "crates/reporch-runtime-service",
   "crates/studio-core",
   "crates/studio-contracts",
   "crates/studio-native-auth",
   "crates/reporch-cli",
+  "tools/runtime-image-builder",
+  "tools/runtime-bundle-builder",
+  "tools/runtime-evidence-builder",
+  "tools/runtime-install-tree-builder",
+  "tools/runtime-source-fetcher",
+  "tools/toolchain-bundle-builder",
+  "tools/toolchain-release-builder",
 ]
-exclude = ["fuzz", "tools/toolchain-index-signer"]
+exclude = [
+  "fuzz",
+  "tools/runtime-manifest-signer",
+  "tools/toolchain-index-signer",
+]
 resolver = "2"
 
 [workspace.package]
@@ -20,43 +37,61 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+arcbox-ext4 = "=0.1.2"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
+cab = "=0.6.0"
 cap-std = "4.0.3"
 cap-primitives = "4.0.3"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
+flate2 = "1"
 futures-util = "0.3"
+fs2 = "0.4"
 hex = "0.4"
 keyring = "4.1.5"
+msi = "=0.10.0"
 minisign-verify = "0.2.5"
 open = "5.3"
+oci2rootfs = { version = "=0.2.1", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 proptest = "1"
 quick-xml = { version = "0.41", features = ["serialize"] }
 rand = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls", "stream"] }
-rustix = { version = "1.1.4", features = ["process"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "stream"] }
+rustix = { version = "1.1.4", features = ["fs", "mount", "process", "system"] }
+ruzstd = "=0.9.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.11"
+tar = "0.4"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 toml = "1.1.4"
 unicode-normalization = "0.1"
 url = { version = "2", features = ["serde"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 uuid = { version = "1", features = ["serde", "v7"] }
+wait-timeout = "0.2.1"
+windows = "0.62.2"
+windows-service = "0.8.1"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = "1"
+zstd = "=0.13.3"
 
 [profile.release]
 codegen-units = 1
 lto = "thin"
 panic = "abort"
 strip = "symbols"
+
+[patch.crates-io]
+# Upstream 0.1.2 always stamps inode ctime from wall-clock time. The vendored
+# Apache/MIT patch honors mandatory SOURCE_DATE_EPOCH so signed VM toolchain
+# images are byte-identical across independent builds.
+arcbox-ext4 = { path = "vendor/arcbox-ext4" }

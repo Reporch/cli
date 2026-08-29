@@ -25,4 +25,7 @@
 !/artifacts/toolchains-v1.json
 !/artifacts/toolchains-v1.json.minisig
 !/artifacts/toolchains-v1.minisign.pub
+!/artifacts/runtime-v1.minisign.pub
+!/artifacts/runtime-signature-fixture.json
+!/artifacts/runtime-signature-fixture.json.minisig
 /.gstack/

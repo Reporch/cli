@@ -1,0 +1,138 @@
+name: Release Reporch VM Toolchains
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-toolchains-v2
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUNTIME_TAG: reporch-runtime-v1
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+      - name: Verify pinned build-only tools and source lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          SKOPEO="$(realpath "$(command -v skopeo)")"
+          QEMU_IMG="$(realpath "$(command -v qemu-img)")"
+          SYFT="$(realpath "$(command -v syft)")"
+          export SKOPEO QEMU_IMG SYFT
+          test "$($SKOPEO --version)" = 'skopeo version 1.24.0'
+          test "$($QEMU_IMG --version | head -1)" = 'qemu-img version 11.1.1'
+          test "$($SYFT version -o json | jq -r .version)" = '1.51.0'
+          node scripts/check-toolchain-sources.mjs
+          node scripts/check-workflows.mjs
+          test -z "$(git status --porcelain)"
+          printf 'SKOPEO=%s\nQEMU_IMG=%s\nSYFT=%s\n' \
+            "$SKOPEO" "$QEMU_IMG" "$SYFT" >> "$GITHUB_ENV"
+      - name: Materialize and verify both OCI architectures
+        shell: bash
+        run: scripts/materialize-toolchain-sources.sh "$RUNNER_TEMP/toolchain-sources"
+      - name: Build and independently reproduce every VM toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/build-toolchain-candidates.sh \
+            "$RUNNER_TEMP/toolchain-sources" "$RUNNER_TEMP/toolchain-candidates"
+          scripts/qualify-toolchain-reproducibility.sh \
+            "$RUNNER_TEMP/toolchain-sources" \
+            "$RUNNER_TEMP/toolchain-candidates" \
+            "$RUNNER_TEMP/toolchain-reproducibility.json"
+      - name: Materialize the isolated runtime signing key
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.REPORCH_RUNTIME_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$SIGNING_KEY"
+          printf '%s' "$SIGNING_KEY" > "$RUNNER_TEMP/toolchain-index.key"
+      - name: Sign the verified V2 index with trusted code
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked --manifest-path tools/toolchain-index-signer/Cargo.toml -- \
+            "$RUNNER_TEMP/toolchain-candidates/toolchains-v2-index.json" \
+            "$RUNNER_TEMP/toolchain-index.key" \
+            artifacts/runtime-v1.minisign.pub \
+            "$RUNNER_TEMP/toolchain-candidates/toolchains-v2-index.json.minisig"
+          encoded_signature=$(base64 < "$RUNNER_TEMP/toolchain-candidates/toolchains-v2-index.json.minisig" | tr -d '\r\n')
+          encoded_key=$(base64 < artifacts/runtime-v1.minisign.pub | tr -d '\r\n')
+          cargo run --locked -p reporch-cli -- artifact verify-minisign \
+            --artifact "$RUNNER_TEMP/toolchain-candidates/toolchains-v2-index.json" \
+            --signature "$encoded_signature" --public-key "$encoded_key"
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/toolchain-index.key"
+      - name: Stage and verify the flat toolchain channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/toolchain-release"
+          cp "$RUNNER_TEMP/toolchain-candidates"/* "$RUNNER_TEMP/toolchain-release/"
+          cp "$RUNNER_TEMP/toolchain-reproducibility.json" "$RUNNER_TEMP/toolchain-release/"
+          (cd "$RUNNER_TEMP/toolchain-release" && shasum -a 256 ./*) \
+            > "$RUNNER_TEMP/TOOLCHAIN-SHA256SUMS"
+          mv "$RUNNER_TEMP/TOOLCHAIN-SHA256SUMS" \
+            "$RUNNER_TEMP/toolchain-release/TOOLCHAIN-SHA256SUMS"
+          (cd "$RUNNER_TEMP/toolchain-release" && shasum -a 256 --check TOOLCHAIN-SHA256SUMS)
+      - name: Attest every immutable toolchain asset
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: ${{ runner.temp }}/toolchain-release/*
+      - name: Upload to the existing prerelease runtime channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RUNTIME_TAG" --json isPrerelease --jq .isPrerelease)" = true
+          gh release edit "$RUNTIME_TAG" --target "$GITHUB_SHA"
+          gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/toolchain-release"/* --clobber
+      - name: Fetch through the public updater and prefetch without Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          export REPORCH_RUNTIME_HOME="$RUNNER_TEMP/public-toolchain-runtime"
+          export REPORCH_RUNTIME_CHANNEL_URL="https://github.com/Reporch/cli/releases/download/$RUNTIME_TAG"
+          unset DOCKER_HOST CONTAINER_HOST
+          cargo build --locked --release -p reporch-cli
+          target/release/reporch --format json toolchain prefetch bash-5.3 \
+            > "$RUNNER_TEMP/toolchain-prefetch.json"
+          jq -e '.schema == "reporch.cli-result.v1"' "$RUNNER_TEMP/toolchain-prefetch.json"
+          test -f "$REPORCH_RUNTIME_HOME/toolchains/installed/bash-5.3.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-v2-release-evidence
+          path: |
+            ${{ runner.temp }}/toolchain-release/TOOLCHAIN-SHA256SUMS
+            ${{ runner.temp }}/toolchain-release/toolchains-v2-index.json
+            ${{ runner.temp }}/toolchain-release/toolchains-v2-index.json.minisig
+            ${{ runner.temp }}/toolchain-release/toolchain-reproducibility.json
+            ${{ runner.temp }}/toolchain-prefetch.json
+          if-no-files-found: error
+          retention-days: 90

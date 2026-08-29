@@ -16,13 +16,18 @@ chrono.workspace = true
 keyring.workspace = true
 open.workspace = true
 rand.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { workspace = true, features = ["rustls"] }
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
 
 [dev-dependencies]
 axum.workspace = true

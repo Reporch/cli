@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   utimesSync,
@@ -20,6 +21,7 @@ import { pathToFileURL } from "node:url";
 import {
   TARGETS,
   assertReleaseBinary,
+  copyRuntimeInstallTree,
   sha256,
   validateOutputArgument
 } from "./release-lib.mjs";
@@ -43,22 +45,36 @@ function normalize(path, mode) {
   utimesSync(path, NORMALIZED_TIME, NORMALIZED_TIME);
 }
 
-function stageArchiveDirectory(root, directoryName, binary, binaryName) {
+function normalizeTree(path) {
+  const stat = lstatSync(path);
+  if (stat.isDirectory()) {
+    for (const entry of readdirSync(path).sort()) normalizeTree(join(path, entry));
+  }
+  utimesSync(path, NORMALIZED_TIME, NORMALIZED_TIME);
+}
+
+function stageArchiveDirectory(root, directoryName, binary, target, runtimeTree) {
   const directory = join(root, directoryName);
   mkdirSync(directory, { mode: 0o755 });
   const entries = [
     ["LICENSE", "LICENSE", 0o644],
     ["NOTICE", "NOTICE", 0o644],
     ["README.md", "README.md", 0o644],
-    [binary, binaryName, 0o755]
+    [binary, target.binaryName, 0o755]
   ];
   for (const [source, name, mode] of entries) {
     const destination = join(directory, name);
     copyFileSync(source, destination);
     normalize(destination, mode);
   }
+  const runtime = copyRuntimeInstallTree(
+    runtimeTree,
+    join(directory, "runtime", target.runtimeTarget),
+    target.runtimeTarget
+  );
+  normalizeTree(join(directory, "runtime"));
   normalize(directory, 0o755);
-  return directory;
+  return { directory, runtime };
 }
 
 function createTarGz(stagingRoot, directoryName, output) {
@@ -82,10 +98,20 @@ function createTarGz(stagingRoot, directoryName, output) {
   renameSync(`${tarPath}.gz`, output);
 }
 
-function createZip(stagingRoot, directoryName, binaryName, output) {
-  const entries = ["LICENSE", "NOTICE", "README.md", binaryName].map((name) =>
-    join(directoryName, name)
-  );
+function listFiles(root, relative = "") {
+  const result = [];
+  for (const name of readdirSync(join(root, relative)).sort()) {
+    const child = join(relative, name);
+    const stat = lstatSync(join(root, child));
+    assert.ok(!stat.isSymbolicLink(), "release archive input must not contain symlinks");
+    if (stat.isDirectory()) result.push(...listFiles(root, child));
+    else result.push(child);
+  }
+  return result;
+}
+
+function createZip(stagingRoot, directoryName, output) {
+  const entries = listFiles(stagingRoot, directoryName);
   run("zip", ["-X", "-9", output, ...entries], { cwd: stagingRoot });
 }
 
@@ -109,10 +135,11 @@ export function packNativeRelease(artifactsArgument, outputArgument) {
       assertReleaseBinary(binary);
       const archiveName = nativeArchiveName(version, target);
       const directoryName = archiveName.replace(/\.(?:tar\.gz|zip)$/, "");
-      stageArchiveDirectory(stagingRoot, directoryName, binary, target.binaryName);
+      const runtimeTree = join(artifacts, "runtime", target.runtimeTarget);
+      const staged = stageArchiveDirectory(stagingRoot, directoryName, binary, target, runtimeTree);
       const archive = join(output, archiveName);
       if (archiveName.endsWith(".zip")) {
-        createZip(stagingRoot, directoryName, target.binaryName, archive);
+        createZip(stagingRoot, directoryName, archive);
       } else {
         createTarGz(stagingRoot, directoryName, archive);
       }
@@ -124,7 +151,9 @@ export function packNativeRelease(artifactsArgument, outputArgument) {
         binary: target.binaryName,
         binarySha256: sha256(binary),
         archiveSha256: sha256(archive),
-        size: stat.size
+        size: stat.size,
+        runtimeSequence: staged.runtime.sequence,
+        runtimeManifestSha256: staged.runtime.manifestSha256
       });
     }
   } finally {

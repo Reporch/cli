@@ -22,13 +22,16 @@ const checksums = {};
 const manifestTargets = [];
 for (const target of TARGETS) {
   const binary = join(artifacts, target.target, target.binaryName);
-  const staged = stagePlatformPackage(target, binary, output);
+  const runtimeTree = join(artifacts, "runtime", target.runtimeTarget);
+  const staged = stagePlatformPackage(target, binary, runtimeTree, output);
   checksums[target.packageName] = staged.sha256;
   manifestTargets.push({
     target: target.target,
     package: target.packageName,
     binary: `bin/${target.binaryName}`,
-    sha256: staged.sha256
+    sha256: staged.sha256,
+    runtimeSequence: staged.runtime.sequence,
+    runtimeManifestSha256: staged.runtime.manifestSha256
   });
 }
 stageRootPackage(checksums, output);

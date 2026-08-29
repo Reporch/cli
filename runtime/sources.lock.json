@@ -1,0 +1,56 @@
+{
+  "schema": "reporch.runtime-sources-lock.v1",
+  "source_date_epoch": 1787961600,
+  "guest_kernel": {
+    "version": "6.1.182",
+    "provenance": "Firecracker CI artifact documented by the upstream getting-started guide",
+    "artifacts": {
+      "aarch64": {
+        "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260826-761f88fbb951-0/aarch64/vmlinux-6.1.182",
+        "sha256": "9ededdd702b0e7e9745de928dab0abec82a86a3ea7bbcde84214adb21b110082",
+        "config_url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260826-761f88fbb951-0/aarch64/vmlinux-6.1.182.config",
+        "config_sha256": "49eb7425960999c9e04d24c9e7f056fb53d040f5c681dd264c46db273c549e48"
+      },
+      "x86_64": {
+        "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260826-761f88fbb951-0/x86_64/vmlinux-6.1.182",
+        "sha256": "90f6c45a719c76c08f09ba5e80b4a7f1044e33152c92b9e45a22e87c0021bac5",
+        "config_url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260826-761f88fbb951-0/x86_64/vmlinux-6.1.182.config",
+        "config_sha256": "a4596ee7e7a317422d4d946b1362541359d536e0559b51472368dbc5b2049630"
+      }
+    }
+  },
+  "windows_guest_kernel": {
+    "version": "6.18.33.2",
+    "provenance": "Microsoft WSL 2.7.12 official x64 MSI release asset",
+    "package_version": "2.7.12.0",
+    "url": "https://github.com/microsoft/WSL/releases/download/2.7.12/wsl.2.7.12.0.x64.msi",
+    "sha256": "a460d4560215f2efe003c136244b78ea3415d773824d7a688ea9ded36dbe9145",
+    "size": 258998272,
+    "msi_cabinet_stream": "cab3.cab",
+    "cabinet_entry": "kernel",
+    "kernel_sha256": "d540850bfbf1beba3ded6b2965b9d0249b23fbcb3e90e7dc0845ac7ad86bc861",
+    "config_url": "https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.18.33.2/arch/x86/configs/config-wsl",
+    "config_sha256": "265f4b0906e06d26fb19cec4d03d385295516c3edaf944b63101725ded66fad5"
+  },
+  "firecracker": {
+    "version": "1.16.1",
+    "tag_commit": "2038188f145fb81b8d098147a10e9d9f392fd22f",
+    "artifacts": {
+      "aarch64": {
+        "url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.1/firecracker-v1.16.1-aarch64.tgz",
+        "sha256": "8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e"
+      },
+      "x86_64": {
+        "url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.1/firecracker-v1.16.1-x86_64.tgz",
+        "sha256": "382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6"
+      }
+    }
+  },
+  "rust": {
+    "toolchain": "1.96.0",
+    "guest_targets": [
+      "aarch64-unknown-linux-musl",
+      "x86_64-unknown-linux-musl"
+    ]
+  }
+}

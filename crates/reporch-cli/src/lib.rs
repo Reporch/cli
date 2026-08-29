@@ -5,8 +5,10 @@ pub mod local_project;
 pub mod local_project_v2;
 pub mod local_sandbox;
 mod project_template;
+pub mod remote_consent;
 pub mod studio_remote;
 pub mod toolchain;
+pub mod verified_file;
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;

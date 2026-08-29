@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { TARGETS, stagePlatformPackage, stageRootPackage } from "./release-lib.mjs";
+import { createRuntimeTreeFixture } from "./runtime-tree-fixture.mjs";
 
 const [targetName, binaryArgument] = process.argv.slice(2);
 const target = TARGETS.find((candidate) => candidate.target === targetName);
@@ -17,7 +18,11 @@ const binary = resolve(binaryArgument);
 const temporary = mkdtempSync(join(tmpdir(), "reporch-npm-e2e-"));
 const packages = join(temporary, "packages");
 mkdirSync(packages);
-const staged = stagePlatformPackage(target, binary, packages);
+const runtimeTree = createRuntimeTreeFixture(
+  join(temporary, "runtime", target.runtimeTarget),
+  target.runtimeTarget
+);
+const staged = stagePlatformPackage(target, binary, runtimeTree, packages);
 const checksums = Object.fromEntries(TARGETS.map((item) => [item.packageName, "0".repeat(64)]));
 checksums[target.packageName] = staged.sha256;
 const root = stageRootPackage(checksums, packages);

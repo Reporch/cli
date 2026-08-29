@@ -1,6 +1,6 @@
 {
   "name": "@reporch/cli-linux-arm64-gnu",
-  "version": "1.0.0-rc.7",
+  "version": "1.0.0-rc.8",
   "description": "Reporch CLI native binary for Linux glibc arm64",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/Reporch/cli.git" },

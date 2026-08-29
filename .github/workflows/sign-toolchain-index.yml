@@ -13,8 +13,8 @@ permissions:
 
 jobs:
   sign:
-    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
     steps:
       - name: Check out trusted signer from main
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

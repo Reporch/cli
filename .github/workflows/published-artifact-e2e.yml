@@ -6,7 +6,7 @@ on:
       version:
         description: Published Reporch CLI version to qualify
         required: true
-        default: 1.0.0-rc.6
+        default: 1.0.0-rc.8
         type: string
 
 permissions:
@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   resolve:
+    if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
@@ -42,6 +43,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   qualify:
+    if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
     needs: resolve
     strategy:
       fail-fast: false
@@ -62,7 +64,7 @@ jobs:
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             archive_kind: zip
-    runs-on: ${{ matrix.runner }}
+    runs-on: "${{ matrix.runner }}"
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}

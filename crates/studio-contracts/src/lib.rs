@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 pub const WORKING_COPY_SCHEMA_V1: &str = "reporch.working-copy.v1";
 pub const STUDIO_CAPABILITIES_SCHEMA_V1: &str = "reporch.studio-capabilities.v1";
+pub const RUNTIME_PREVIEW_REQUEST_SCHEMA_V1: &str = "reporch.runtime-preview-request.v1";
+pub const RUNTIME_PREVIEW_RESULT_SCHEMA_V1: &str = "reporch.runtime-preview-result.v1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +63,85 @@ pub struct StudioCapabilitiesV1 {
     pub release_manifest_versions: Vec<String>,
     pub minimum_cli_version: String,
     pub maximum_cli_major: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePreviewOperationV1 {
+    Program,
+    Generator,
+    Validator,
+    Checker,
+}
+
+impl RuntimePreviewOperationV1 {
+    pub const fn tool_execution_kind(self) -> ToolExecutionKindV1 {
+        match self {
+            Self::Program => ToolExecutionKindV1::ReferenceSolution,
+            Self::Generator => ToolExecutionKindV1::Generator,
+            Self::Validator => ToolExecutionKindV1::Validator,
+            Self::Checker => ToolExecutionKindV1::Checker,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePreviewRequestV1 {
+    pub schema: String,
+    pub project_id: Uuid,
+    pub snapshot: VersionedAuthoringSpec,
+    pub operation: RuntimePreviewOperationV1,
+    pub toolchain_id: String,
+    pub language: String,
+    pub source_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_path: Option<String>,
+    pub files: Vec<ManifestFile>,
+    pub limits: ToolExecutionLimitsV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePreviewStatusV1 {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePreviewResultV1 {
+    pub schema: String,
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub snapshot_sha256: Sha256Digest,
+    pub operation: RuntimePreviewOperationV1,
+    pub toolchain_id: String,
+    pub status: RuntimePreviewStatusV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_millis: Option<u64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePreviewRequestedV1 {
+    pub preview_id: Uuid,
+    pub project_id: Uuid,
 }
 
 pub const EVENT_SCHEMA_V1: &str = "reporch.studio-event.v1";

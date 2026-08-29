@@ -140,6 +140,39 @@ impl NativeAuthConfig {
         store.delete(&self.credential_key()).await
     }
 
+    /// Return a non-secret fingerprint for binding local consent to the
+    /// currently stored credential. A fresh login or account change produces
+    /// a different value without exposing OAuth material to callers.
+    pub async fn local_credential_fingerprint<S: TokenStore + ?Sized>(
+        &self,
+        store: &S,
+    ) -> Result<Option<String>, NativeAuthError> {
+        let token = store.load(&self.credential_key()).await?;
+        let Some(token) = token else {
+            return Ok(None);
+        };
+        self.validate_stored_token(&token)?;
+        let binding = token
+            .id_token
+            .as_deref()
+            .or(token.refresh_token.as_deref())
+            .unwrap_or(&token.access_token);
+        let mut digest = Sha256::new();
+        digest.update(b"reporch.remote-fallback-consent.v1\0");
+        digest.update(self.issuer().as_bytes());
+        digest.update(b"\0");
+        digest.update(self.client_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(binding.as_bytes());
+        Ok(Some(
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        ))
+    }
+
     fn credential_key(&self) -> CredentialKey {
         let identity = format!("{}\u{1f}{}", self.issuer(), self.client_id);
         CredentialKey {
@@ -1224,6 +1257,60 @@ mod tests {
                 .await
                 .unwrap()
                 .authenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_fingerprint_is_stable_non_secret_and_account_bound() {
+        let config = NativeAuthConfig::device(
+            "https://reporch.test/oauth",
+            "native-test",
+            vec!["offline_access".into(), "openid".into()],
+            false,
+        )
+        .unwrap();
+        let store = MemoryStore::default();
+        let token = |id_token: &str| StoredTokenSet {
+            schema: TOKEN_SCHEMA_V1.into(),
+            issuer: config.issuer().into(),
+            client_id: config.client_id().into(),
+            access_token: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            id_token: Some(id_token.into()),
+            token_type: "Bearer".into(),
+            expires_at: Utc::now() + Duration::minutes(10),
+            scopes: vec!["openid".into()],
+        };
+        store
+            .save(&config.credential_key(), &token("account-a-id-token"))
+            .await
+            .unwrap();
+        let first = config
+            .local_credential_fingerprint(&store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(!first.contains("account-a-id-token"));
+        assert_eq!(
+            config
+                .local_credential_fingerprint(&store)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first.as_str())
+        );
+        store
+            .save(&config.credential_key(), &token("account-b-id-token"))
+            .await
+            .unwrap();
+        assert_ne!(
+            config
+                .local_credential_fingerprint(&store)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first.as_str())
         );
     }
 

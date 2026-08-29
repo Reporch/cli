@@ -4,7 +4,9 @@ use std::process::Command;
 use serde_json::Value;
 
 fn reporch() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_reporch"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_reporch"));
+    command.env("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP", "1");
+    command
 }
 
 fn assert_help_commands(arguments: &[&str], expected: &[&str]) {
@@ -25,6 +27,60 @@ fn assert_help_commands(arguments: &[&str], expected: &[&str]) {
             "missing stable command {arguments:?} {command}:\n{help}"
         );
     }
+}
+
+#[test]
+fn completion_is_immediate_but_operational_commands_require_runtime_bootstrap() {
+    let runtime_home = tempfile::tempdir().unwrap();
+    let completion = Command::new(env!("CARGO_BIN_EXE_reporch"))
+        .env_remove("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP")
+        .env("REPORCH_RUNTIME_HOME", runtime_home.path())
+        .env("REPORCH_RUNTIME_CHANNEL_URL", "not-a-runtime-channel")
+        .args(["completion", "bash"])
+        .output()
+        .unwrap();
+    assert!(completion.status.success(), "{completion:?}");
+    assert!(String::from_utf8_lossy(&completion.stdout).contains("_reporch"));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_reporch"))
+        .env_remove("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP")
+        .env("REPORCH_RUNTIME_HOME", runtime_home.path())
+        .env("REPORCH_RUNTIME_CHANNEL_URL", "not-a-runtime-channel")
+        .args(["runtime", "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("Reporch Runtime"),
+        "{status:?}"
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    reporch()
+        .args([
+            "project",
+            "init",
+            "--title",
+            "Bootstrap contract",
+            "--directory",
+        ])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    let check = Command::new(env!("CARGO_BIN_EXE_reporch"))
+        .env_remove("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP")
+        .env("REPORCH_RUNTIME_HOME", runtime_home.path())
+        .env("REPORCH_RUNTIME_CHANNEL_URL", "not-a-runtime-channel")
+        .arg("--cwd")
+        .arg(project.path())
+        .arg("check")
+        .output()
+        .unwrap();
+    assert!(!check.status.success(), "{check:?}");
+    assert!(
+        String::from_utf8_lossy(&check.stderr).contains("mandatory Reporch Runtime bootstrap"),
+        "{check:?}"
+    );
 }
 
 #[test]
@@ -140,6 +196,7 @@ fn the_documented_1_x_command_surface_cannot_be_removed_accidentally() {
             "project",
             "member",
             "doctor",
+            "runtime",
             "completion",
             "quota",
             "release",
@@ -197,7 +254,14 @@ fn the_documented_1_x_command_surface_cannot_be_removed_accidentally() {
         ),
         (&["package"][..], &["export", "import"][..]),
         (&["sandbox"][..], &["plan", "run"][..]),
-        (&["toolchain"][..], &["list", "inspect", "install"][..]),
+        (
+            &["runtime"][..],
+            &["status", "doctor", "update", "repair", "reset"][..],
+        ),
+        (
+            &["toolchain"][..],
+            &["list", "inspect", "install", "prefetch"][..],
+        ),
         (&["quota"][..], &["show"][..]),
     ] {
         assert_help_commands(arguments, expected);

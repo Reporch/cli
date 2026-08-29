@@ -3,11 +3,43 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const workflows = readdirSync(".github/workflows").filter((name) => /\.ya?ml$/.test(name));
+const standardHostedRunners = new Set([
+  "ubuntu-24.04",
+  "ubuntu-24.04-arm",
+  "macos-15",
+  "macos-15-intel",
+  "windows-2025"
+]);
 assert.ok(workflows.length >= 2, "CI and release workflows are required");
 for (const name of workflows) {
   const content = readFileSync(join(".github/workflows", name), "utf8");
   assert.doesNotMatch(content, /pull_request_target:/, `${name} must not use pull_request_target`);
   assert.doesNotMatch(content, /NODE_AUTH_TOKEN|NPM_TOKEN/, `${name} must not use npm tokens`);
+  for (const line of content.split("\n").filter((candidate) => /\bruns-on:/.test(candidate))) {
+    if (/self-hosted/.test(line)) {
+      assert.match(line, /cli-zero-cost/, `${name} omits the zero-cost runner guard: ${line.trim()}`);
+      continue;
+    }
+    const runner = line
+      .split(/\bruns-on:\s*/u, 2)[1]
+      ?.trim()
+      .replace(/^['"]|['"]$/gu, "");
+    assert.ok(
+      runner === "${{ matrix.runner }}" || standardHostedRunners.has(runner),
+      `${name} selects a non-standard or billable hosted runner: ${line.trim()}`
+    );
+  }
+  for (const match of content.matchAll(/^\s*-\s+runner:\s+([^\s#]+)\s*$/gmu)) {
+    assert.ok(
+      standardHostedRunners.has(match[1]),
+      `${name} matrix selects a non-standard or billable hosted runner: ${match[1]}`
+    );
+  }
+  assert.match(
+    content,
+    /github\.actor == vars\.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR/,
+    `${name} must restrict jobs to the configured trusted actor`
+  );
   for (const line of content.split("\n")) {
     const match = line.match(/^\s*-?\s*uses:\s*([^#\s]+)/);
     if (!match) continue;
@@ -23,7 +55,7 @@ assert.doesNotMatch(
 );
 assert.match(release, /npm-11\.18\.0\.tgz/);
 assert.match(release, /NPM_TARBALL_SHA256:\s*[a-f0-9]{64}/);
-assert.match(release, /sha256sum --check --strict/);
+assert.match(release, /shasum -a 256 --check/);
 assert.doesNotMatch(
   release,
   /echo "\$install_dir\/package\/bin" >> "\$GITHUB_PATH"/,
@@ -59,10 +91,10 @@ assert.match(
 );
 assert.match(
   release,
-  /\(cd dist\/release-assets && sha256sum \.\/\*\) > dist\/SHA256SUMS/,
+  /\(cd dist\/release-assets && shasum -a 256 \.\/\*\) > dist\/SHA256SUMS/,
   "release checksums must remain verifiable after downloading flat release assets"
 );
-assert.match(release, /sha256sum --check --strict/, "release checksum verification must be strict");
+assert.match(release, /shasum -a 256 --check/, "release checksum verification must be strict");
 assert.match(
   release,
   /cmp "\$native" "\$npm_native"/,
@@ -74,9 +106,9 @@ assert.match(
   "every immutable release asset must receive provenance"
 );
 const ci = readFileSync(".github/workflows/ci.yml", "utf8");
-assert.match(ci, /actionlint_1\.7\.12_linux_amd64\.tar\.gz/);
+assert.match(ci, /actionlint_1\.7\.12_darwin_arm64\.tar\.gz/);
 assert.match(ci, /ACTIONLINT_SHA256:\s*[a-f0-9]{64}/);
-assert.match(ci, /sha256sum --check --strict/);
+assert.match(ci, /shasum -a 256 --check/);
 const publisher = readFileSync("scripts/publish-npm-release.mjs", "utf8");
 assert.match(publisher, /"--tag",\s*npmTag/);
 assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prerelease/);
@@ -113,6 +145,23 @@ assert.doesNotMatch(
   "the npm dogfood process must not inherit an issue-write token"
 );
 const publishedE2e = readFileSync(".github/workflows/published-artifact-e2e.yml", "utf8");
+const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
+const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml", "utf8");
+assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates"/);
+assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
+assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
+assert.match(runtimeRelease, /runtime-reproducibility\.json/);
+assert.match(toolchainRelease, /materialize-toolchain-sources\.sh/);
+assert.match(toolchainRelease, /syft[\s\S]*1\.51\.0/i);
+assert.match(toolchainRelease, /normalize-toolchain-sbom\.mjs|build-toolchain-candidates\.sh/);
+assert.match(toolchainRelease, /build-toolchain-candidates\.sh/);
+assert.match(toolchainRelease, /qualify-toolchain-reproducibility\.sh/);
+assert.match(toolchainRelease, /REPORCH_RUNTIME_SIGNING_KEY/);
+assert.match(toolchainRelease, /artifacts\/runtime-v1\.minisign\.pub/);
+assert.match(toolchainRelease, /toolchain prefetch bash-5\.3/);
+assert.match(toolchainRelease, /unset DOCKER_HOST CONTAINER_HOST/);
+assert.match(toolchainRelease, /TOOLCHAIN-SHA256SUMS/);
+assert.match(toolchainRelease, /subject-path: \$\{\{ runner\.temp \}\}\/toolchain-release\/\*/);
 for (const target of [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
