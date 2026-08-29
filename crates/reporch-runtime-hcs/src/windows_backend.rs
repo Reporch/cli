@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use uuid::Uuid;
+use windows::Win32::Foundation::GENERIC_ALL;
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_HYPERV, FIONBIO, POLLWRNORM, SEND_RECV_FLAGS, SO_ERROR, SO_RCVTIMEO,
@@ -16,7 +18,8 @@ use windows::Win32::Networking::WinSock::{
 use windows::Win32::System::HostComputeSystem::{
     HCS_OPERATION, HCS_SYSTEM, HcsCancelOperation, HcsCloseComputeSystem, HcsCloseOperation,
     HcsCreateComputeSystem, HcsCreateOperation, HcsGetComputeSystemProperties,
-    HcsStartComputeSystem, HcsTerminateComputeSystem, HcsWaitForOperationResult,
+    HcsOpenComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
+    HcsWaitForOperationResult,
 };
 use windows::Win32::System::Hypervisor::{HV_PROTOCOL_RAW, SOCKADDR_HV};
 use windows::core::{GUID, HSTRING, PSTR, PWSTR};
@@ -29,9 +32,25 @@ const HVSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct HcsVirtualMachine {
     system: HCS_SYSTEM,
+    name: Uuid,
     id: GUID,
     service_id: GUID,
     terminated: bool,
+}
+
+/// Opaque authority to cancel the exact HCS system created by this process.
+///
+/// There is intentionally no public constructor: the privileged broker can
+/// obtain this capability only from a successfully created virtual machine.
+#[derive(Clone)]
+pub struct HcsCancellationHandle {
+    name: Uuid,
+}
+
+impl HcsCancellationHandle {
+    pub fn terminate(&self) -> Result<()> {
+        terminate_compute_system_by_name(self.name)
+    }
 }
 
 impl HcsVirtualMachine {
@@ -54,6 +73,7 @@ impl HcsVirtualMachine {
         if let Err(error) = operation.wait(HCS_OPERATION_TIMEOUT_MS) {
             let mut vm = Self {
                 system,
+                name: config.id,
                 id: GUID::from_u128(config.id.as_u128()),
                 service_id: service_guid(config.vsock_port),
                 terminated: false,
@@ -76,6 +96,7 @@ impl HcsVirtualMachine {
         let runtime_id = parse_runtime_id(&properties)?;
         Ok(Self {
             system,
+            name: config.id,
             id: runtime_id,
             service_id: service_guid(config.vsock_port),
             terminated: false,
@@ -87,17 +108,25 @@ impl HcsVirtualMachine {
         HvSocketStream::connect(self.id, self.service_id, HVSOCK_CONNECT_TIMEOUT, io_timeout)
     }
 
+    pub fn cancellation_handle(&self) -> Result<HcsCancellationHandle> {
+        ensure!(!self.terminated, "HCS virtual machine is terminated");
+        Ok(HcsCancellationHandle { name: self.name })
+    }
+
     pub fn terminate(&mut self) -> Result<()> {
         if self.terminated {
             return Ok(());
         }
-        self.terminated = true;
         let operation = Operation::new()?;
         unsafe { HcsTerminateComputeSystem(self.system, operation.0, &HSTRING::new()) }
             .context("HcsTerminateComputeSystem")?;
-        operation
+        let result = operation
             .wait(HCS_TERMINATE_TIMEOUT_MS)
-            .context("terminate HCS virtual machine")
+            .context("terminate HCS virtual machine");
+        if result.is_ok() {
+            self.terminated = true;
+        }
+        result
     }
 }
 
@@ -108,6 +137,26 @@ impl Drop for HcsVirtualMachine {
         }
         unsafe { HcsCloseComputeSystem(self.system) };
     }
+}
+
+fn terminate_compute_system_by_name(id: Uuid) -> Result<()> {
+    ensure!(
+        id.get_version_num() == 7,
+        "HCS cancellation identifier must be UUIDv7"
+    );
+    let id_text = HSTRING::from(id.hyphenated().to_string());
+    let system = unsafe { HcsOpenComputeSystem(&id_text, GENERIC_ALL.0) }
+        .context("open HCS virtual machine for cancellation")?;
+    let result = (|| -> Result<()> {
+        let operation = Operation::new()?;
+        unsafe { HcsTerminateComputeSystem(system, operation.0, &HSTRING::new()) }
+            .context("cancel HCS virtual machine")?;
+        operation
+            .wait(HCS_TERMINATE_TIMEOUT_MS)
+            .context("wait for canceled HCS virtual machine")
+    })();
+    unsafe { HcsCloseComputeSystem(system) };
+    result
 }
 
 struct Operation(HCS_OPERATION);

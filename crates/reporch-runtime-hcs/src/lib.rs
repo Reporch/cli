@@ -9,7 +9,7 @@ use uuid::Uuid;
 #[cfg(windows)]
 mod windows_backend;
 #[cfg(windows)]
-pub use windows_backend::{HcsVirtualMachine, HvSocketStream};
+pub use windows_backend::{HcsCancellationHandle, HcsVirtualMachine, HvSocketStream};
 
 pub const HYPERV_VSOCK_PORT: u32 = 7_000;
 const HCS_SCSI_CONTROLLER_0: &str = "df6d0690-79e5-55b6-a5ec-c1e2f77f580a";
