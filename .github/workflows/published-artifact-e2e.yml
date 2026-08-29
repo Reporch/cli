@@ -6,7 +6,7 @@ on:
       version:
         description: Published Reporch CLI version to qualify
         required: true
-        default: 1.0.0-rc.6
+        default: 1.0.0-rc.8
         type: string
 
 permissions:
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   resolve:
     if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
-    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
@@ -49,22 +49,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: cli-macos-arm64
+          - runner: macos-15
             target: aarch64-apple-darwin
             archive_kind: tar
-          - runner: cli-macos-x64
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             archive_kind: tar
-          - runner: cli-linux-x64
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive_kind: tar
-          - runner: cli-linux-arm64
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive_kind: tar
-          - runner: cli-windows-x64
+          - runner: windows-2025
             target: x86_64-pc-windows-msvc
             archive_kind: zip
-    runs-on: [self-hosted, "${{ matrix.runner }}", cli-zero-cost]
+    runs-on: "${{ matrix.runner }}"
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}

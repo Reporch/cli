@@ -3,19 +3,37 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const workflows = readdirSync(".github/workflows").filter((name) => /\.ya?ml$/.test(name));
+const standardHostedRunners = new Set([
+  "ubuntu-24.04",
+  "ubuntu-24.04-arm",
+  "macos-15",
+  "macos-15-intel",
+  "windows-2025"
+]);
 assert.ok(workflows.length >= 2, "CI and release workflows are required");
 for (const name of workflows) {
   const content = readFileSync(join(".github/workflows", name), "utf8");
   assert.doesNotMatch(content, /pull_request_target:/, `${name} must not use pull_request_target`);
   assert.doesNotMatch(content, /NODE_AUTH_TOKEN|NPM_TOKEN/, `${name} must not use npm tokens`);
-  assert.doesNotMatch(
-    content,
-    /runs-on:\s*(?:ubuntu|macos|windows)-/i,
-    `${name} must never select a billable GitHub-hosted runner`
-  );
   for (const line of content.split("\n").filter((candidate) => /\bruns-on:/.test(candidate))) {
-    assert.match(line, /self-hosted/, `${name} has a non-self-hosted job: ${line.trim()}`);
-    assert.match(line, /cli-zero-cost/, `${name} omits the zero-cost runner guard: ${line.trim()}`);
+    if (/self-hosted/.test(line)) {
+      assert.match(line, /cli-zero-cost/, `${name} omits the zero-cost runner guard: ${line.trim()}`);
+      continue;
+    }
+    const runner = line
+      .split(/\bruns-on:\s*/u, 2)[1]
+      ?.trim()
+      .replace(/^['"]|['"]$/gu, "");
+    assert.ok(
+      runner === "${{ matrix.runner }}" || standardHostedRunners.has(runner),
+      `${name} selects a non-standard or billable hosted runner: ${line.trim()}`
+    );
+  }
+  for (const match of content.matchAll(/^\s*-\s+runner:\s+([^\s#]+)\s*$/gmu)) {
+    assert.ok(
+      standardHostedRunners.has(match[1]),
+      `${name} matrix selects a non-standard or billable hosted runner: ${match[1]}`
+    );
   }
   assert.match(
     content,
