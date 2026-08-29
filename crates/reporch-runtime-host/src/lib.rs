@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -31,6 +31,7 @@ use reporch_runtime_protocol::{
     SERVICE_REQUEST_SCHEMA, WireMessageV1, read_service_response, read_wire_message,
     read_wire_message_sync, write_service_request, write_wire_message, write_wire_message_sync,
 };
+use serde::Serialize;
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1889,6 +1890,161 @@ async fn smoke_test_installed_runtime(project_root: &Path) -> Result<()> {
         "runtime self-test returned an unexpected result"
     );
     Ok(())
+}
+
+/// Evidence produced by the release-only native VM qualification command.
+///
+/// This deliberately exercises the installed, signature-verified runtime and
+/// the platform broker instead of a mocked transport. It is public so the
+/// exact release CLI can be used by self-hosted qualification runners without
+/// exposing backend-specific test hooks.
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeRuntimeQualificationV1 {
+    pub schema: &'static str,
+    pub target: HostTarget,
+    pub backend: RuntimeBackend,
+    pub runtime_version: String,
+    pub runtime_sequence: u64,
+    pub toolchain_id: String,
+    pub toolchain_bundle_sha256: String,
+    pub iterations: u32,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub maximum_ms: u64,
+    pub lifecycle: bool,
+    pub handshake: bool,
+    pub guest_workload: bool,
+    pub cleanup: bool,
+    pub signed_toolchain_unchanged: bool,
+    pub completed_at: String,
+    pub passed: bool,
+}
+
+/// Boot, handshake with, execute, and tear down the installed native VM
+/// repeatedly, then run a real command from one signed toolchain image.
+///
+/// Host-level qualification scripts additionally assert that no backend
+/// process, HCS system, jail, socket, or overlay remains after this returns.
+pub async fn qualify_installed_native_runtime(
+    iterations: u32,
+    toolchain_id: &str,
+) -> Result<NativeRuntimeQualificationV1> {
+    anyhow::ensure!(
+        (1..=1_000).contains(&iterations),
+        "native runtime qualification iterations must be between 1 and 1000"
+    );
+    anyhow::ensure!(
+        !toolchain_id.is_empty() && toolchain_id.len() <= 128,
+        "native runtime qualification toolchain ID is invalid"
+    );
+
+    let status = status().await?;
+    anyhow::ensure!(
+        status.availability == RuntimeAvailability::Ready,
+        "native runtime is not ready for qualification: {:?}",
+        status.availability
+    );
+    let target = status
+        .target
+        .context("native runtime qualification has no host target")?;
+    let runtime_version = status
+        .installed_version
+        .clone()
+        .context("native runtime qualification has no installed version")?;
+    let runtime_sequence = status
+        .installed_sequence
+        .context("native runtime qualification has no installed sequence")?;
+    let report = doctor().await?;
+    anyhow::ensure!(
+        report.checks.iter().all(|check| check.passed),
+        "native runtime doctor did not pass every check"
+    );
+
+    let project_root =
+        std::env::current_dir().context("resolve qualification working directory")?;
+    let mut durations = Vec::with_capacity(iterations as usize);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        smoke_test_installed_runtime(&project_root).await?;
+        durations.push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    }
+
+    let installed = install_toolchain(toolchain_id).await?;
+    let before = verified_toolchain(toolchain_id).await?;
+    let id = Uuid::now_v7();
+    let job = GuestJobV1 {
+        schema: reporch_runtime_core::JOB_SCHEMA.into(),
+        protocol_version: PROTOCOL_VERSION,
+        id,
+        nonce: format!("runtime-toolchain-{}", id.simple()),
+        operation: reporch_runtime_protocol::GuestOperationV1::Program,
+        toolchain_id: toolchain_id.to_owned(),
+        toolchain_index_sequence: Some(installed.installation.index_sequence),
+        toolchain_bundle_sha256: Some(installed.installation.bundle_sha256.clone()),
+        toolchain_lock_sha256: Some(installed.installation.toolchain_lock_sha256.clone()),
+        command: vec![
+            "bash".into(),
+            "-c".into(),
+            "printf 'reporch-toolchain-self-test-ok\\n'".into(),
+        ],
+        environment: BTreeMap::new(),
+        inputs: Vec::new(),
+        limits: reporch_runtime_protocol::ResourceLimitsV1 {
+            timeout_ms: 10_000,
+            memory_mib: 128,
+            cpu_millis: 1_000,
+            pids: 16,
+            stdout_bytes: 4_096,
+            stderr_bytes: 4_096,
+            artifact_bytes: 4_096,
+        },
+    };
+    job.validate()
+        .context("validate qualification toolchain job")?;
+    let result = execute_native(&project_root, &job).await?;
+    anyhow::ensure!(
+        result.exit_code == 0
+            && result.stdout.encoding == reporch_runtime_protocol::GuestOutputEncodingV1::Utf8
+            && result.stdout.data == "reporch-toolchain-self-test-ok\n"
+            && !result.stdout.truncated
+            && !result.stderr.truncated,
+        "signed toolchain qualification returned an unexpected result"
+    );
+    let after = verified_toolchain(toolchain_id).await?;
+    anyhow::ensure!(
+        before.bundle.sha256 == after.bundle.sha256
+            && before.bundle.size == after.bundle.size
+            && before.installation.bundle_sha256 == after.installation.bundle_sha256,
+        "signed toolchain image changed during native VM execution"
+    );
+
+    durations.sort_unstable();
+    let percentile = |value: usize| -> u64 {
+        let rank = durations.len().saturating_mul(value).div_ceil(100);
+        durations[rank.saturating_sub(1).min(durations.len() - 1)]
+    };
+    Ok(NativeRuntimeQualificationV1 {
+        schema: "reporch.native-runtime-qualification.v1",
+        target,
+        backend: status.backend,
+        runtime_version,
+        runtime_sequence,
+        toolchain_id: toolchain_id.to_owned(),
+        toolchain_bundle_sha256: installed.installation.bundle_sha256,
+        iterations,
+        p50_ms: percentile(50),
+        p95_ms: percentile(95),
+        p99_ms: percentile(99),
+        maximum_ms: durations.last().copied().unwrap_or_default(),
+        lifecycle: true,
+        handshake: true,
+        guest_workload: true,
+        cleanup: true,
+        signed_toolchain_unchanged: true,
+        completed_at: Utc::now().to_rfc3339(),
+        passed: true,
+    })
 }
 
 fn rollback_failed_install(

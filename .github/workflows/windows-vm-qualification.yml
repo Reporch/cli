@@ -1,0 +1,86 @@
+name: Windows VM qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-vm-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, Windows, X64, cli-zero-cost, cli-windows-x64]
+    timeout-minutes: 75
+    env:
+      RUNTIME_TARGET: windows-x64-msvc
+      RUST_TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.2.0"
+          package-manager-cache: false
+      - name: Verify native Hyper-V host prerequisites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-CimInstance Win32_ComputerSystem).HypervisorPresent) { throw "Hyper-V is unavailable" }
+          if (-not (Test-Path "$env:SystemRoot\System32\hcsdiag.exe" -PathType Leaf)) { throw "hcsdiag is unavailable" }
+          if (-not (Get-Command wix -ErrorAction SilentlyContinue)) { throw "pinned WiX CLI is unavailable" }
+      - name: Build exact CLI and mandatory runtime installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --locked --release -p reporch-cli --target $env:RUST_TARGET
+          $binary = (Resolve-Path "target/$env:RUST_TARGET/release/reporch.exe").Path
+          $bundle = Join-Path $env:RUNNER_TEMP "runtime-bundle-$env:RUNTIME_TARGET"
+          $tree = Join-Path $env:RUNNER_TEMP "runtime-tree-$env:RUNTIME_TARGET"
+          $output = Join-Path $env:RUNNER_TEMP "system-installer-$env:RUST_TARGET"
+          node scripts/fetch-runtime-bundle.mjs $env:RUNTIME_TARGET $bundle
+          $manifest = Get-Content (Join-Path $bundle "manifest.json") -Raw | ConvertFrom-Json
+          $epoch = [DateTimeOffset]::Parse($manifest.generated_at).ToUnixTimeSeconds()
+          $env:SOURCE_DATE_EPOCH = "$epoch"
+          cargo run --locked -p reporch-runtime-install-tree-builder -- `
+            (Join-Path $bundle "manifest.json") (Join-Path $bundle "manifest.json.minisig") `
+            (Join-Path $bundle "artifacts") $tree
+          node scripts/pack-system-installer.mjs $env:RUST_TARGET $binary $tree $output
+          $package = @(Get-ChildItem -LiteralPath $output -Filter *.msi)
+          if ($package.Count -ne 1) { throw "expected exactly one MSI" }
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $package[0].FullName, '/qn', '/norestart') -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI installation failed with $($process.ExitCode)" }
+          "QUALIFICATION_MSI=$($package[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $service = Get-Service ReporchRuntime
+          if ($service.Status -ne 'Running') { throw "ReporchRuntime service is not running" }
+      - name: Boot, execute, and clean up 100 HCS VMs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          scripts/qualify-windows-vm.ps1 `
+            -ReporchBinary "${env:ProgramFiles}\Reporch\bin\reporch.exe" `
+            -EvidenceDirectory "$env:RUNNER_TEMP\windows-vm-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: windows-vm-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-vm-evidence
+          if-no-files-found: error
+          retention-days: 90
+      - name: Remove qualification package
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not $env:QUALIFICATION_MSI) { exit 0 }
+          $process = Start-Process msiexec.exe -ArgumentList @('/x', $env:QUALIFICATION_MSI, '/qn', '/norestart') -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 1605)) { throw "MSI removal failed with $($process.ExitCode)" }
