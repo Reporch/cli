@@ -1,9 +1,12 @@
 #![allow(unsafe_code)]
 
 use std::fs;
+use std::future::Future;
 use std::io::{BufReader, Read as _, Write as _};
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -15,6 +18,7 @@ use reporch_runtime_protocol::{
     read_service_request, write_service_response,
 };
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
@@ -93,14 +97,37 @@ async fn handle_connection(
         .await
         .context("runtime service request timed out")??;
     let result = match request.validate() {
-        Ok(()) => execute_request(&request, job_semaphore)
-            .await
-            .unwrap_or_else(|error| {
+        Ok(()) => {
+            let cancellation = matches!(&request.command, RuntimeServiceCommandV1::RunJob { .. })
+                .then(|| Arc::new(AtomicBool::new(false)));
+            let execution = execute_request(&request, job_semaphore, cancellation.as_ref());
+            let completed = if cancellation.is_some() {
+                await_job_or_client_disconnect(&mut stream, execution).await
+            } else {
+                Some(execution.await)
+            };
+            let Some(completed) = completed else {
+                let cancellation = cancellation.context("missing HCS cancellation token")?;
+                cancellation.store(true, Ordering::SeqCst);
+                if let RuntimeServiceCommandV1::RunJob { job, .. } = &request.command {
+                    let id = job.id;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(6),
+                        tokio::task::spawn_blocking(move || {
+                            reporch_runtime_hcs::terminate_compute_system(id)
+                        }),
+                    )
+                    .await;
+                }
+                return Ok(());
+            };
+            completed.unwrap_or_else(|error| {
                 RuntimeServiceResultV1::Error(ProtocolFailureV1::bounded(
                     "runtime.guest_boot_failed",
                     format!("{error:#}"),
                 ))
-            }),
+            })
+        }
         Err(error) => RuntimeServiceResultV1::Error(ProtocolFailureV1::bounded(
             "runtime.protocol_incompatible",
             error.to_string(),
@@ -121,9 +148,23 @@ async fn handle_connection(
     Ok(())
 }
 
+async fn await_job_or_client_disconnect<R, F, T>(stream: &mut R, operation: F) -> Option<T>
+where
+    R: AsyncRead + Unpin,
+    F: Future<Output = T>,
+{
+    let mut unexpected = [0_u8; 1];
+    tokio::pin!(operation);
+    tokio::select! {
+        result = &mut operation => Some(result),
+        _ = stream.read(&mut unexpected) => None,
+    }
+}
+
 async fn execute_request(
     request: &RuntimeServiceRequestV1,
     job_semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<RuntimeServiceResultV1> {
     match &request.command {
         RuntimeServiceCommandV1::Ping => Ok(RuntimeServiceResultV1::Pong {
@@ -164,6 +205,13 @@ async fn execute_request(
             runtime_sequence,
             runtime_bundle_digest,
         } => {
+            let cancellation = cancellation
+                .context("HCS execution requires a connection-bound cancellation token")?
+                .clone();
+            ensure!(
+                !cancellation.load(Ordering::SeqCst),
+                "HCS job was canceled before execution"
+            );
             let _job_permit = job_semaphore
                 .clone()
                 .acquire_owned()
@@ -192,7 +240,7 @@ async fn execute_request(
             };
             let job = (**job).clone();
             let result = tokio::task::spawn_blocking(move || {
-                execute_hcs_job(&bundle, toolchain.as_ref(), &job)
+                execute_hcs_job(&bundle, toolchain.as_ref(), &job, &cancellation)
             })
             .await??;
             Ok(RuntimeServiceResultV1::JobCompleted {
@@ -216,8 +264,13 @@ fn execute_hcs_job(
     bundle: &reporch_runtime_host::VerifiedRuntimeBundleV1,
     toolchain: Option<&reporch_runtime_host::VerifiedToolchainBundleV2>,
     job: &reporch_runtime_protocol::GuestJobV1,
+    cancellation: &AtomicBool,
 ) -> Result<reporch_runtime_protocol::GuestResultV1> {
     job.validate()?;
+    ensure!(
+        !cancellation.load(Ordering::SeqCst),
+        "HCS job was canceled before VM creation"
+    );
     let spool = reporch_runtime_host::service_spool_root()?;
     let input_view = prepare_input_view(&spool, job)?;
     let _cleanup = JobDirectoryCleanup(input_view.clone());
@@ -233,6 +286,10 @@ fn execute_hcs_job(
         vsock_port: HYPERV_VSOCK_PORT,
     };
     let mut vm = HcsVirtualMachine::create(&config)?;
+    if cancellation.load(Ordering::SeqCst) {
+        let _ = vm.terminate();
+        anyhow::bail!("HCS job was canceled during VM creation");
+    }
     let io_timeout =
         Duration::from_millis(job.limits.timeout_ms).saturating_add(Duration::from_secs(5));
     let mut stream = vm.connect(io_timeout)?;
@@ -248,6 +305,43 @@ fn execute_hcs_job(
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error).context("cleanup HCS virtual machine"),
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::await_job_or_client_disconnect;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_drops_the_hcs_join_future() {
+        let (mut service, client) = tokio::io::duplex(64);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let signal = DropSignal(dropped.clone());
+        let operation = async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        };
+        drop(client);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_job_or_client_disconnect(&mut service, operation),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
 

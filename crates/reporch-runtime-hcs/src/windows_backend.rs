@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use uuid::Uuid;
+use windows::Win32::Foundation::GENERIC_ALL;
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_HYPERV, FIONBIO, POLLWRNORM, SEND_RECV_FLAGS, SO_ERROR, SO_RCVTIMEO,
@@ -16,7 +18,8 @@ use windows::Win32::Networking::WinSock::{
 use windows::Win32::System::HostComputeSystem::{
     HCS_OPERATION, HCS_SYSTEM, HcsCancelOperation, HcsCloseComputeSystem, HcsCloseOperation,
     HcsCreateComputeSystem, HcsCreateOperation, HcsGetComputeSystemProperties,
-    HcsStartComputeSystem, HcsTerminateComputeSystem, HcsWaitForOperationResult,
+    HcsOpenComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
+    HcsWaitForOperationResult,
 };
 use windows::Win32::System::Hypervisor::{HV_PROTOCOL_RAW, SOCKADDR_HV};
 use windows::core::{GUID, HSTRING, PSTR, PWSTR};
@@ -108,6 +111,30 @@ impl Drop for HcsVirtualMachine {
         }
         unsafe { HcsCloseComputeSystem(self.system) };
     }
+}
+
+/// Terminate a VM from the broker's disconnect watcher.
+///
+/// HCS compute-system identity is the UUIDv7 job ID supplied at creation, so
+/// this never accepts an arbitrary handle or path from the client.
+pub fn terminate_compute_system(id: Uuid) -> Result<()> {
+    ensure!(
+        id.get_version_num() == 7,
+        "HCS cancellation identifier must be UUIDv7"
+    );
+    let id_text = HSTRING::from(id.hyphenated().to_string());
+    let system = unsafe { HcsOpenComputeSystem(&id_text, GENERIC_ALL.0) }
+        .context("open HCS virtual machine for cancellation")?;
+    let result = (|| -> Result<()> {
+        let operation = Operation::new()?;
+        unsafe { HcsTerminateComputeSystem(system, operation.0, &HSTRING::new()) }
+            .context("cancel HCS virtual machine")?;
+        operation
+            .wait(HCS_TERMINATE_TIMEOUT_MS)
+            .context("wait for canceled HCS virtual machine")
+    })();
+    unsafe { HcsCloseComputeSystem(system) };
+    result
 }
 
 struct Operation(HCS_OPERATION);

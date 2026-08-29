@@ -9,6 +9,7 @@ mod windows_service;
 #[cfg(unix)]
 mod unix_service {
     use std::fs;
+    use std::future::Future;
     use std::io::{BufReader, Read as _};
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ mod unix_service {
         read_service_request, write_service_response,
     };
     use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt as _;
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::Semaphore;
 
@@ -101,14 +103,28 @@ mod unix_service {
             .await
             .context("runtime service request timed out")??;
         let result = match request.validate() {
-            Ok(()) => execute_request(&request, &spool, peer_uid, job_semaphore)
-                .await
-                .unwrap_or_else(|error| {
+            Ok(()) => {
+                let execution = execute_request(&request, &spool, peer_uid, job_semaphore);
+                let completed =
+                    if matches!(&request.command, RuntimeServiceCommandV1::RunJob { .. }) {
+                        await_job_or_client_disconnect(&mut stream, execution).await
+                    } else {
+                        Some(execution.await)
+                    };
+                let Some(completed) = completed else {
+                    // Dropping the Linux execution future drops a kill-on-drop
+                    // Firecracker child and its jail cleanup guard. A client
+                    // that exits on SIGINT therefore cannot leave work running
+                    // in the privileged broker.
+                    return Ok(());
+                };
+                completed.unwrap_or_else(|error| {
                     RuntimeServiceResultV1::Error(ProtocolFailureV1::bounded(
                         "runtime.asset_verification_failed",
                         format!("{error:#}"),
                     ))
-                }),
+                })
+            }
             Err(error) => RuntimeServiceResultV1::Error(ProtocolFailureV1::bounded(
                 "runtime.protocol_incompatible",
                 error.to_string(),
@@ -127,6 +143,23 @@ mod unix_service {
         .await
         .context("runtime service response timed out")??;
         Ok(())
+    }
+
+    async fn await_job_or_client_disconnect<F, T>(
+        stream: &mut UnixStream,
+        operation: F,
+    ) -> Option<T>
+    where
+        F: Future<Output = T>,
+    {
+        let mut unexpected = [0_u8; 1];
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => Some(result),
+            // A well-formed client sends exactly one request. EOF, a socket
+            // error, or additional bytes all revoke this job's lifetime.
+            _ = stream.read(&mut unexpected) => None,
+        }
     }
 
     async fn execute_request(
@@ -288,6 +321,52 @@ mod unix_service {
             );
         }
         Ok((u32::try_from(objects.len())?, total))
+    }
+
+    #[cfg(test)]
+    mod cancellation_tests {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        use tokio::net::UnixStream;
+
+        use super::await_job_or_client_disconnect;
+
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[tokio::test]
+        async fn disconnect_drops_the_in_flight_job_future() {
+            let (mut service, client) = UnixStream::pair().unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let signal = DropSignal(dropped.clone());
+            let operation = async move {
+                let _signal = signal;
+                std::future::pending::<()>().await;
+            };
+            drop(client);
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                await_job_or_client_disconnect(&mut service, operation),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_none());
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn completed_job_keeps_the_client_connection() {
+            let (mut service, _client) = UnixStream::pair().unwrap();
+            let result = await_job_or_client_disconnect(&mut service, async { 42_u8 }).await;
+            assert_eq!(result, Some(42));
+        }
     }
 
     fn open_spool_object(spool: &Path, digest: &str) -> Result<fs::File> {
