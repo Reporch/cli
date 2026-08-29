@@ -34,7 +34,7 @@ use studio_core::{
 };
 use studio_native_auth::qualification_keyring_canary;
 
-const COMPLETION_GENERATOR_STACK_BYTES: usize = 8 * 1024 * 1024;
+const CLI_STACK_BYTES: usize = 8 * 1024 * 1024;
 use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
 use uuid::Uuid;
 
@@ -595,8 +595,20 @@ impl From<CompletionShell> for clap_complete::Shell {
     }
 }
 
+fn main() {
+    let result = std::thread::Builder::new()
+        .name("reporch-main".into())
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(cli_main)
+        .expect("spawn Reporch CLI main thread")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn cli_main() {
     match profile_config::bootstrap() {
         Ok(Some(exit_code)) => std::process::exit(exit_code),
         Ok(None) => {}
@@ -1696,7 +1708,7 @@ fn generate_completion(shell: CompletionShell, output: &CliOutput) -> Result<()>
     output.ensure_human_format("completion")?;
     std::thread::Builder::new()
         .name("reporch-completion".into())
-        .stack_size(COMPLETION_GENERATOR_STACK_BYTES)
+        .stack_size(CLI_STACK_BYTES)
         .spawn(move || {
             let mut command = Args::command();
             clap_complete::generate(
