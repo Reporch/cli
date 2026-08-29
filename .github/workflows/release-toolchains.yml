@@ -50,6 +50,26 @@ jobs:
           test -z "$(git status --porcelain)"
           printf 'SKOPEO=%s\nQEMU_IMG=%s\nSYFT=%s\n' \
             "$SKOPEO" "$QEMU_IMG" "$SYFT" >> "$GITHUB_ENV"
+      - name: Prove the release key before the expensive reproducibility build
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.REPORCH_RUNTIME_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/toolchain-index-preflight.key"
+          index="$RUNNER_TEMP/toolchain-index-preflight.json"
+          signature="$RUNNER_TEMP/toolchain-index-preflight.json.minisig"
+          trap 'rm -f "$key" "$index" "$signature"' EXIT
+          test -n "$SIGNING_KEY"
+          printf '%s' "$SIGNING_KEY" > "$key"
+          printf '%s\n' '{"schema":"reporch.toolchain-index-signing-preflight.v1"}' > "$index"
+          cargo run --locked --manifest-path tools/toolchain-index-signer/Cargo.toml -- \
+            "$index" "$key" artifacts/runtime-v1.minisign.pub "$signature"
+          encoded_signature=$(base64 < "$signature" | tr -d '\r\n')
+          encoded_key=$(base64 < artifacts/runtime-v1.minisign.pub | tr -d '\r\n')
+          cargo run --locked -p reporch-cli -- artifact verify-minisign \
+            --artifact "$index" --signature "$encoded_signature" --public-key "$encoded_key"
       - name: Materialize and verify both OCI architectures
         shell: bash
         run: scripts/materialize-toolchain-sources.sh "$RUNNER_TEMP/toolchain-sources"
