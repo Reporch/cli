@@ -77,12 +77,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          scripts/build-toolchain-candidates.sh \
-            "$RUNNER_TEMP/toolchain-sources" "$RUNNER_TEMP/toolchain-candidates"
-          scripts/qualify-toolchain-reproducibility.sh \
+          checkpoint="$RUNNER_TOOL_CACHE/reporch-toolchain-v2/$GITHUB_SHA"
+          scripts/build-toolchain-release-resumable.sh \
             "$RUNNER_TEMP/toolchain-sources" \
+            "$checkpoint" \
             "$RUNNER_TEMP/toolchain-candidates" \
             "$RUNNER_TEMP/toolchain-reproducibility.json"
+          printf 'TOOLCHAIN_CHECKPOINT_ROOT=%s\n' "$checkpoint" >> "$GITHUB_ENV"
       - name: Materialize the isolated runtime signing key
         shell: bash
         env:
@@ -115,8 +116,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir "$RUNNER_TEMP/toolchain-release"
-          cp "$RUNNER_TEMP/toolchain-candidates"/* "$RUNNER_TEMP/toolchain-release/"
-          cp "$RUNNER_TEMP/toolchain-reproducibility.json" "$RUNNER_TEMP/toolchain-release/"
+          for source in "$RUNNER_TEMP/toolchain-candidates"/* \
+            "$RUNNER_TEMP/toolchain-reproducibility.json"; do
+            test -f "$source" && test ! -L "$source"
+            ln "$source" "$RUNNER_TEMP/toolchain-release/$(basename "$source")"
+          done
           (cd "$RUNNER_TEMP/toolchain-release" && shasum -a 256 ./*) \
             > "$RUNNER_TEMP/TOOLCHAIN-SHA256SUMS"
           mv "$RUNNER_TEMP/TOOLCHAIN-SHA256SUMS" \
@@ -156,3 +160,13 @@ jobs:
             ${{ runner.temp }}/toolchain-prefetch.json
           if-no-files-found: error
           retention-days: 90
+      - name: Remove the completed persistent checkpoint
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$RUNNER_TOOL_CACHE/reporch-toolchain-v2/$GITHUB_SHA"
+          test "$TOOLCHAIN_CHECKPOINT_ROOT" = "$expected"
+          test -d "$TOOLCHAIN_CHECKPOINT_ROOT"
+          test ! -L "$TOOLCHAIN_CHECKPOINT_ROOT"
+          rm -rf -- "$TOOLCHAIN_CHECKPOINT_ROOT"
