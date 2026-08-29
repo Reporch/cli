@@ -1408,18 +1408,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
 }
 
 async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
-    if matches!(command, Command::Completion { .. })
-        || matches!(
-            command,
-            Command::Runtime {
-                command: RuntimeCommand::Status
-                    | RuntimeCommand::Doctor { .. }
-                    | RuntimeCommand::Update
-                    | RuntimeCommand::Repair
-                    | RuntimeCommand::Reset { .. }
-            }
-        )
-    {
+    if command_skips_runtime_bootstrap(command) {
         return Ok(());
     }
     if cfg!(debug_assertions)
@@ -1446,6 +1435,21 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
             .context("repair mandatory Reporch Runtime assets")?;
     }
     Ok(())
+}
+
+fn command_skips_runtime_bootstrap(command: &Command) -> bool {
+    matches!(command, Command::Completion { .. })
+        || matches!(command, Command::Desktop { .. } | Command::Artifact { .. })
+        || matches!(
+            command,
+            Command::Runtime {
+                command: RuntimeCommand::Status
+                    | RuntimeCommand::Doctor { .. }
+                    | RuntimeCommand::Update
+                    | RuntimeCommand::Repair
+                    | RuntimeCommand::Reset { .. }
+            }
+        )
 }
 
 fn required_package_profile(profile: Option<CompatibilityProfile>) -> Result<PackageProfile> {
@@ -2498,5 +2502,28 @@ mod qualification_regression_tests {
             ]
         );
         assert_eq!(report_count, problem_types.len() * profiles.len());
+    }
+}
+
+#[cfg(test)]
+mod runtime_bootstrap_regression_tests {
+    use super::*;
+
+    #[test]
+    fn signature_verification_can_bootstrap_the_first_runtime_channel() {
+        let arguments = Args::try_parse_from([
+            "reporch",
+            "artifact",
+            "verify-minisign",
+            "--artifact",
+            "runtime-manifest.json",
+            "--signature",
+            "c2lnbmF0dXJl",
+            "--public-key",
+            "cHVibGljLWtleQ==",
+        ])
+        .unwrap();
+        assert!(command_skips_runtime_bootstrap(&arguments.command));
+        assert!(!command_skips_runtime_bootstrap(&Command::Check));
     }
 }
