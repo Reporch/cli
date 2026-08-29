@@ -22,7 +22,7 @@ concurrency:
 jobs:
   qualify-x64:
     if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR && inputs.target == 'linux-x64-gnu'
-    runs-on: [self-hosted, Linux, X64, cli-zero-cost, cli-linux-x64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -38,6 +38,13 @@ jobs:
         with:
           node-version: "24.2.0"
           package-manager-cache: false
+      - name: Install qualification packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends rpm zstd
+          sudo chmod a+rw /dev/kvm
       - name: Verify native KVM host prerequisites
         shell: bash
         run: |

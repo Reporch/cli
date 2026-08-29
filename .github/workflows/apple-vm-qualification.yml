@@ -22,7 +22,7 @@ concurrency:
 jobs:
   qualify:
     if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
-    runs-on: ${{ inputs.target == 'darwin-x64' && fromJSON('["self-hosted","macOS","X64","cli-zero-cost","cli-macos-x64"]') || fromJSON('["self-hosted","macOS","ARM64","cli-zero-cost","cli-macos-arm64"]') }}
+    runs-on: ${{ inputs.target == 'darwin-x64' && 'macos-15-intel' || fromJSON('["self-hosted","macOS","ARM64","cli-zero-cost","cli-macos-arm64"]') }}
     timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
@@ -40,6 +40,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(uname -m)" = "${{ inputs.target == 'darwin-x64' && 'x86_64' || 'arm64' }}"
+          test "$(sysctl -n kern.hv_support)" = 1
+          command -v zstd
           evidence="$RUNNER_TEMP/apple-vm-evidence"
           mkdir -p "$evidence"
           jq -n \
