@@ -379,6 +379,16 @@ mod tests {
         assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
         assert_eq!(classified.error_code, "runtime.virtualization_unavailable");
         assert!(!classified.retryable);
+
+        let unavailable =
+            anyhow::Error::new(reporch_runtime_core::RuntimeError::ServiceUnavailable(
+                "docker command exceeded 8 seconds".into(),
+            ))
+            .context("inspect Docker security mode");
+        let classified = classify_error(&unavailable);
+        assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
+        assert_eq!(classified.error_code, "runtime.service_unavailable");
+        assert!(classified.retryable);
     }
 
     #[test]

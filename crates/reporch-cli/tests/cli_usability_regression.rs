@@ -1138,6 +1138,92 @@ fn local_runtime_guidance_rejects_a_non_rootless_daemon() {
     assert!(stderr.contains("reporch verify"), "{stderr}");
 }
 
+#[cfg(unix)]
+#[test]
+fn hanging_oci_security_probe_returns_retryable_json_and_leaves_no_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+
+    let project = tempfile::tempdir().unwrap();
+    for (hang_on, maximum) in [
+        ("--version", Duration::from_secs(7)),
+        ("info", Duration::from_secs(12)),
+    ] {
+        let runtime = tempfile::tempdir().unwrap();
+        let docker = runtime.path().join("docker");
+        let child_pid = runtime.path().join("child.pid");
+        let script = if hang_on == "--version" {
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --version) /bin/sleep 30 & echo $! > '{}' ; wait ;;\n  info) printf '%s\\n' '[\"name=rootless\"]' ;;\n  *) exit 64 ;;\nesac\n",
+                child_pid.display()
+            )
+        } else {
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --version) exit 0 ;;\n  info) /bin/sleep 30 & echo $! > '{}' ; wait ;;\n  *) exit 64 ;;\nesac\n",
+                child_pid.display()
+            )
+        };
+        fs::write(&docker, script).unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started = Instant::now();
+        let output = reporch()
+            .args([
+                "--cwd",
+                project.path().to_str().unwrap(),
+                "--format",
+                "json",
+                "--no-input",
+                "sandbox",
+                "plan",
+                "--runtime",
+                "docker",
+                "--image",
+                &format!("registry.test/toolchain@sha256:{}", "a".repeat(64)),
+                "--project-directory",
+                project.path().to_str().unwrap(),
+                "--",
+                "/bin/true",
+            ])
+            .env("PATH", runtime.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(6), "{hang_on}: {output:?}");
+        assert!(started.elapsed() < maximum, "{hang_on}: {output:?}");
+        let envelope: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(envelope["schema"], "reporch.cli-error.v1");
+        assert_eq!(envelope["error_code"], "runtime.service_unavailable");
+        assert_eq!(envelope["retryable"], true);
+        let message = envelope["message"].as_str().unwrap();
+        assert!(
+            message.contains("start the rootless Docker daemon"),
+            "{message}"
+        );
+        assert!(message.contains("reporch verify"), "{message}");
+
+        let pid = fs::read_to_string(&child_pid).unwrap();
+        let pid = pid.trim();
+        for attempt in 0..20 {
+            if !std::process::Command::new("/bin/kill")
+                .args(["-0", pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+            assert!(
+                attempt < 19,
+                "bounded {hang_on} probe left child {pid} running"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 #[test]
 fn legacy_1x_aliases_keep_readable_matrix_selectors_and_safe_output_pruning() {
     let scored = tempfile::tempdir().unwrap();
