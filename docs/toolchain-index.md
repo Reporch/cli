@@ -5,9 +5,11 @@ RC8 has two deliberately separate catalogs.
 - `artifacts/toolchains-v1.json` is the embedded, signed compatibility catalog
   for users who explicitly select the deprecated Docker or Podman backend.
 - `toolchains-v2-index.json` is the expiring runtime-channel catalog used by
-  the default Reporch VM backend. It is downloaded from the
-  `reporch-runtime-v1` prerelease and verified with the same offline trust root
-  as the base VM runtime (`FF2F931B66DAA966`).
+  the default Reporch VM backend. It is downloaded from the immutable
+  `reporch-toolchains-v2-seq8` prerelease and verified with the same offline
+  trust root as the base VM runtime (`FF2F931B66DAA966`). Runtime and toolchain
+  channels are separate because a published immutable GitHub release cannot
+  accept additional assets.
 
 Neither private key is stored in the repository or release artifacts.
 
@@ -51,7 +53,8 @@ The zero-cost self-hosted `Release Reporch VM Toolchains` workflow:
 4. requires byte-identical modes, sizes, contents, SPDX, provenance, and index;
 5. signs the V2 index using `REPORCH_RUNTIME_SIGNING_KEY` and trusted signer
    code from `main`;
-6. attests and uploads the flat immutable assets to `reporch-runtime-v1`;
+6. creates a draft, attests and uploads the flat assets, verifies the complete
+   draft, and only then publishes `reporch-toolchains-v2-seq8` immutably;
 7. removes Docker environment variables and installs `bash-5.3` through the
    public updater as the final channel check.
 

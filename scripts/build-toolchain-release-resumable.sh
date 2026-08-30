@@ -146,7 +146,7 @@ done < "$ids_file"
 cargo build --locked --release -p reporch-toolchain-release-builder
 target/release/reporch-toolchain-release-builder \
   runtime/toolchains.lock.json "$candidates" "$source_revision" \
-  https://github.com/Reporch/cli/releases/download/reporch-runtime-v1/ \
+  https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8/ \
   "$candidates/toolchains-v2-index.json"
 rm "$candidates"/*.source.spdx.json
 cp runtime/toolchains.lock.json "$candidates/toolchains.lock.json"

@@ -51,6 +51,8 @@ const GUEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_CHANNEL_BASE: &str =
     "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1";
+const TOOLCHAIN_CHANNEL_BASE: &str =
+    "https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8";
 const RUNTIME_PUBLIC_KEY: &str = include_str!("../../../artifacts/runtime-v1.minisign.pub");
 
 pub fn runtime_root() -> Result<PathBuf> {
@@ -346,7 +348,7 @@ pub async fn install_toolchain_direct(id: &str) -> Result<VerifiedToolchainBundl
     let root = runtime_root.join("toolchains");
     ensure_runtime_root_is_narrow(&root)?;
     create_private_directory(&root)?;
-    let base = runtime_channel_url()?;
+    let base = toolchain_channel_url()?;
     let client = runtime_download_client()?;
     let index_url = base
         .join("toolchains-v2-index.json")
@@ -2170,8 +2172,18 @@ fn open_installation_lock(path: &Path) -> Result<fs::File> {
 fn runtime_channel_url() -> Result<url::Url> {
     let base = std::env::var("REPORCH_RUNTIME_CHANNEL_URL")
         .unwrap_or_else(|_| RUNTIME_CHANNEL_BASE.into());
+    parse_channel_url(&base, "runtime")
+}
+
+fn toolchain_channel_url() -> Result<url::Url> {
+    let base = std::env::var("REPORCH_TOOLCHAIN_CHANNEL_URL")
+        .unwrap_or_else(|_| TOOLCHAIN_CHANNEL_BASE.into());
+    parse_channel_url(&base, "toolchain")
+}
+
+fn parse_channel_url(base: &str, label: &str) -> Result<url::Url> {
     let base = url::Url::parse(&format!("{}/", base.trim_end_matches('/')))
-        .context("parse runtime channel URL")?;
+        .with_context(|| format!("parse {label} channel URL"))?;
     anyhow::ensure!(
         base.scheme() == "https"
             && base.host_str().is_some()
@@ -2179,7 +2191,7 @@ fn runtime_channel_url() -> Result<url::Url> {
             && base.password().is_none()
             && base.query().is_none()
             && base.fragment().is_none(),
-        "runtime channel must be credential-free HTTPS without query or fragment"
+        "{label} channel must be credential-free HTTPS without query or fragment"
     );
     Ok(base)
 }
@@ -3039,6 +3051,34 @@ mod tests {
         let mut changed = SIGNED_FIXTURE.to_vec();
         changed[0] ^= 1;
         assert!(verify_signature(&changed, SIGNED_FIXTURE_SIGNATURE).is_err());
+    }
+
+    #[test]
+    fn runtime_and_toolchain_channels_are_distinct_immutable_releases() {
+        assert_eq!(
+            parse_channel_url(RUNTIME_CHANNEL_BASE, "runtime")
+                .unwrap()
+                .as_str(),
+            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1/"
+        );
+        assert_eq!(
+            parse_channel_url(TOOLCHAIN_CHANNEL_BASE, "toolchain")
+                .unwrap()
+                .as_str(),
+            "https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8/"
+        );
+    }
+
+    #[test]
+    fn channel_urls_reject_credentials_and_insecure_transports() {
+        for value in [
+            "http://github.com/Reporch/cli/releases/download/test",
+            "https://token@github.com/Reporch/cli/releases/download/test",
+            "https://github.com/Reporch/cli/releases/download/test?asset=1",
+            "https://github.com/Reporch/cli/releases/download/test#fragment",
+        ] {
+            assert!(parse_channel_url(value, "toolchain").is_err(), "{value}");
+        }
     }
 
     #[test]
