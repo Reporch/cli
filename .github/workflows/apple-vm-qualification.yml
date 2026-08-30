@@ -27,6 +27,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RUNTIME_TAG: reporch-runtime-v1
+      TOOLCHAIN_TAG: reporch-toolchains-v2-seq8
       RUNTIME_TARGET: ${{ inputs.target }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -71,11 +72,12 @@ jobs:
           toolchain_image="bash-5.3-linux-$toolchain_arch.ext4"
           gh release download "$RUNTIME_TAG" --dir "$assets" \
             --pattern SHA256SUMS \
-            --pattern TOOLCHAIN-SHA256SUMS \
             --pattern "$runtime_manifest" \
             --pattern "$runtime_signature_file" \
             --pattern "$kernel" \
-            --pattern "$initramfs" \
+            --pattern "$initramfs"
+          gh release download "$TOOLCHAIN_TAG" --dir "$assets" \
+            --pattern TOOLCHAIN-SHA256SUMS \
             --pattern toolchains-v2-index.json \
             --pattern toolchains-v2-index.json.minisig \
             --pattern "$toolchain_archive"

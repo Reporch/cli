@@ -20,7 +20,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RUNTIME_TAG: reporch-runtime-v1
+      TOOLCHAIN_TAG: reporch-toolchains-v2-seq8
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -50,6 +50,14 @@ jobs:
           test -z "$(git status --porcelain)"
           printf 'SKOPEO=%s\nQEMU_IMG=%s\nSYFT=%s\n' \
             "$SKOPEO" "$QEMU_IMG" "$SYFT" >> "$GITHUB_ENV"
+      - name: Verify the immutable toolchain release slot
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TOOLCHAIN_TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$TOOLCHAIN_TAG" --json isDraft --jq .isDraft)" = true
+            test "$(gh release view "$TOOLCHAIN_TAG" --json targetCommitish --jq .targetCommitish)" = "$GITHUB_SHA"
+          fi
       - name: Prove the release key before the expensive reproducibility build
         shell: bash
         env:
@@ -130,19 +138,41 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: ${{ runner.temp }}/toolchain-release/*
-      - name: Upload to the existing prerelease runtime channel
+      - name: Create and verify the draft immutable toolchain release
         shell: bash
         run: |
           set -euo pipefail
-          test "$(gh release view "$RUNTIME_TAG" --json isPrerelease --jq .isPrerelease)" = true
-          gh release edit "$RUNTIME_TAG" --target "$GITHUB_SHA"
-          gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/toolchain-release"/* --clobber
+          if ! gh release view "$TOOLCHAIN_TAG" >/dev/null 2>&1; then
+            gh release create "$TOOLCHAIN_TAG" --draft --target "$GITHUB_SHA" \
+              --title "Reporch Toolchains v2 sequence 8" \
+              --notes "Signed Docker-free Reporch VM toolchains. Every bundle is reproducible, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
+          fi
+          test "$(gh release view "$TOOLCHAIN_TAG" --json isDraft --jq .isDraft)" = true
+          gh release upload "$TOOLCHAIN_TAG" "$RUNNER_TEMP/toolchain-release"/* --clobber
+
+          verification="$RUNNER_TEMP/toolchain-release-verification"
+          mkdir "$verification"
+          gh release download "$TOOLCHAIN_TAG" --dir "$verification"
+          test "$(find "$verification" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = \
+            "$(find "$RUNNER_TEMP/toolchain-release" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          (cd "$verification" && shasum -a 256 --check TOOLCHAIN-SHA256SUMS)
+          cmp "$verification/toolchains-v2-index.json" "$RUNNER_TEMP/toolchain-release/toolchains-v2-index.json"
+          cmp "$verification/toolchains-v2-index.json.minisig" "$RUNNER_TEMP/toolchain-release/toolchains-v2-index.json.minisig"
+
+          encoded_signature=$(base64 < "$verification/toolchains-v2-index.json.minisig" | tr -d '\r\n')
+          encoded_key=$(base64 < artifacts/runtime-v1.minisign.pub | tr -d '\r\n')
+          cargo run --locked -p reporch-cli -- artifact verify-minisign \
+            --artifact "$verification/toolchains-v2-index.json" \
+            --signature "$encoded_signature" --public-key "$encoded_key"
+
+          gh release edit "$TOOLCHAIN_TAG" --draft=false --prerelease
+          test "$(gh api "repos/$GH_REPO/releases/tags/$TOOLCHAIN_TAG" --jq .immutable)" = true
       - name: Fetch through the public updater and prefetch without Docker
         shell: bash
         run: |
           set -euo pipefail
           export REPORCH_RUNTIME_HOME="$RUNNER_TEMP/public-toolchain-runtime"
-          export REPORCH_RUNTIME_CHANNEL_URL="https://github.com/Reporch/cli/releases/download/$RUNTIME_TAG"
+          export REPORCH_TOOLCHAIN_CHANNEL_URL="https://github.com/Reporch/cli/releases/download/$TOOLCHAIN_TAG"
           unset DOCKER_HOST CONTAINER_HOST
           cargo build --locked --release -p reporch-cli
           target/release/reporch --format json toolchain prefetch bash-5.3 \

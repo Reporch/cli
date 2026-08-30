@@ -118,7 +118,7 @@ fi
 
 target/release/reporch-toolchain-release-builder \
   runtime/toolchains.lock.json "$staging" "$source_revision" \
-  https://github.com/Reporch/cli/releases/download/reporch-runtime-v1/ \
+  https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8/ \
   "$staging/toolchains-v2-index.json"
 rm "$staging"/*.source.spdx.json
 cp runtime/toolchains.lock.json "$staging/toolchains.lock.json"
