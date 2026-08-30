@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::process::Stdio;
@@ -55,6 +56,8 @@ pub struct LocalSandboxOptions {
 pub struct LocalSandboxPlan {
     schema: &'static str,
     runtime: String,
+    #[serde(skip)]
+    runtime_executable: Option<PathBuf>,
     container_name: String,
     image: String,
     project_directory: PathBuf,
@@ -93,6 +96,7 @@ pub async fn plan(options: &LocalSandboxOptions) -> Result<LocalSandboxPlan> {
         return Ok(LocalSandboxPlan {
             schema: "reporch.local-sandbox-plan.v1",
             runtime: "reporch_vm".into(),
+            runtime_executable: None,
             container_name: String::new(),
             image: options.image.clone(),
             project_directory,
@@ -111,7 +115,8 @@ pub async fn plan(options: &LocalSandboxOptions) -> Result<LocalSandboxPlan> {
     let arguments = container_arguments(options, &project_directory, &container_name)?;
     Ok(LocalSandboxPlan {
         schema: "reporch.local-sandbox-plan.v1",
-        runtime,
+        runtime: runtime.name,
+        runtime_executable: Some(runtime.executable),
         container_name,
         image: options.image.clone(),
         project_directory,
@@ -132,9 +137,13 @@ pub async fn execute(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
     if plan.runtime == "reporch_vm" {
         return execute_native(plan).await;
     }
-    require_rootless(&plan.runtime).await?;
+    let runtime_executable = plan
+        .runtime_executable
+        .as_deref()
+        .context("local sandbox plan is missing its trusted runtime executable")?;
+    require_rootless(&plan.runtime, runtime_executable).await?;
     let started = Instant::now();
-    let mut command = Command::new(&plan.runtime);
+    let mut command = Command::new(runtime_executable);
     command
         .args(&plan.arguments)
         .stdin(Stdio::null())
@@ -156,8 +165,12 @@ pub async fn execute(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
             Ok(result) => result.context("wait for local sandbox")?,
             Err(_) => {
                 kill_process_tree(&mut child).await;
-                remove_exact_container(&plan.runtime, &plan.container_name).await;
-                bail!("local sandbox exceeded {} seconds", plan.timeout_seconds);
+                remove_exact_container(runtime_executable, &plan.container_name).await;
+                return Err(RuntimeError::ServiceUnavailable(format!(
+                    "local sandbox exceeded {} seconds",
+                    plan.timeout_seconds
+                ))
+                .into());
             }
         };
     let (stdout, stdout_truncated) = stdout_task.await.context("join stdout reader")??;
@@ -513,17 +526,21 @@ fn container_arguments(
     Ok(arguments)
 }
 
-async fn resolve_runtime(runtime: OciRuntime) -> Result<String> {
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedOciRuntime {
+    pub name: String,
+    pub executable: PathBuf,
+}
+
+async fn resolve_runtime(runtime: OciRuntime) -> Result<ResolvedOciRuntime> {
     match runtime {
-        OciRuntime::Podman => runtime_available("podman").await.then(|| "podman".into()),
-        OciRuntime::Docker => runtime_available("docker").await.then(|| "docker".into()),
+        OciRuntime::Podman => resolve_named_runtime("podman").await?,
+        OciRuntime::Docker => resolve_named_runtime("docker").await?,
         OciRuntime::Auto => {
-            if runtime_available("podman").await {
-                Some("podman".into())
-            } else if runtime_available("docker").await {
-                Some("docker".into())
+            if let Some(runtime) = resolve_named_runtime("podman").await? {
+                Some(runtime)
             } else {
-                None
+                resolve_named_runtime("docker").await?
             }
         }
     }
@@ -532,42 +549,114 @@ async fn resolve_runtime(runtime: OciRuntime) -> Result<String> {
     )
 }
 
-pub async fn resolve_secure_runtime(runtime: OciRuntime) -> Result<String> {
+pub(crate) async fn resolve_secure_runtime(runtime: OciRuntime) -> Result<ResolvedOciRuntime> {
     let runtime = resolve_runtime(runtime).await?;
-    require_rootless(&runtime).await?;
+    require_rootless(&runtime.name, &runtime.executable).await?;
     Ok(runtime)
 }
 
-async fn runtime_available(runtime: &str) -> bool {
-    run_bounded_command(
+async fn resolve_named_runtime(name: &str) -> Result<Option<ResolvedOciRuntime>> {
+    let Some(executable) = trusted_runtime_executable(name) else {
+        return Ok(None);
+    };
+    let display_name = if name == "podman" { "Podman" } else { "Docker" };
+    Ok(runtime_available(&executable)
+        .await
+        .with_context(|| {
+            format!(
+                "probe {display_name} availability; start the rootless {display_name} daemon and retry. Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification"
+            )
+        })?
+        .then(|| ResolvedOciRuntime {
+            name: name.into(),
+            executable,
+        }))
+}
+
+fn trusted_runtime_executable(name: &str) -> Option<PathBuf> {
+    let project_directory = std::env::current_dir().ok()?.canonicalize().ok()?;
+    let search_path = std::env::var_os("PATH")?;
+    trusted_runtime_executable_in(name, &project_directory, &search_path)
+}
+
+fn trusted_runtime_executable_in(
+    name: &str,
+    project_directory: &Path,
+    search_path: &OsStr,
+) -> Option<PathBuf> {
+    if !matches!(name, "docker" | "podman") {
+        return None;
+    }
+    for directory in std::env::split_paths(search_path) {
+        if !directory.is_absolute() {
+            continue;
+        }
+        #[cfg(windows)]
+        let candidate = directory.join(format!("{name}.exe"));
+        #[cfg(not(windows))]
+        let candidate = directory.join(name);
+        let Ok(candidate) = candidate.canonicalize() else {
+            continue;
+        };
+        if !candidate.is_file() || candidate.starts_with(project_directory) {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if candidate.metadata().ok()?.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+async fn runtime_available(runtime: &Path) -> Result<bool> {
+    match run_bounded_command(
         runtime,
         &["--version"],
         RUNTIME_PROBE_TIMEOUT,
         RUNTIME_DIAGNOSTIC_OUTPUT_LIMIT,
     )
     .await
-    .is_ok_and(|output| output.status.success())
+    {
+        Ok(output) => Ok(output.status.success()),
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.downcast_ref::<RuntimeError>().is_some()) =>
+        {
+            Err(error)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
-async fn require_rootless(runtime: &str) -> Result<()> {
+async fn require_rootless(runtime: &str, executable: &Path) -> Result<()> {
     let output = if runtime == "podman" {
         run_bounded_command(
-            runtime,
+            executable,
             &["info", "--format", "json"],
             RUNTIME_SECURITY_INSPECTION_TIMEOUT,
             RUNTIME_DIAGNOSTIC_OUTPUT_LIMIT,
         )
         .await
-        .context("inspect Podman security mode")?
+        .context(
+            "inspect Podman security mode; start the rootless Podman daemon and retry. Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification",
+        )?
     } else if runtime == "docker" {
         run_bounded_command(
-            runtime,
+            executable,
             &["info", "--format", "{{json .SecurityOptions}}"],
             RUNTIME_SECURITY_INSPECTION_TIMEOUT,
             RUNTIME_DIAGNOSTIC_OUTPUT_LIMIT,
         )
         .await
-        .context("inspect Docker security mode")?
+        .context(
+            "inspect Docker security mode; start the rootless Docker daemon and retry. Reporch intentionally never runs author code directly on the host; use `reporch verify` for official Studio verification",
+        )?
     } else {
         bail!("unsupported OCI runtime");
     };
@@ -626,7 +715,7 @@ pub(crate) async fn read_bounded(
     Ok((output, truncated))
 }
 
-async fn remove_exact_container(runtime: &str, container_name: &str) {
+async fn remove_exact_container(runtime: &Path, container_name: &str) {
     let _ = run_bounded_command(
         runtime,
         &["rm", "--force", container_name],
@@ -637,11 +726,13 @@ async fn remove_exact_container(runtime: &str, container_name: &str) {
 }
 
 pub(crate) async fn run_bounded_command(
-    program: &str,
+    program: impl AsRef<Path>,
     arguments: &[&str],
     timeout: Duration,
     output_limit: usize,
 ) -> Result<BoundedCommandOutput> {
+    let program = program.as_ref();
+    let program_display = program.display().to_string();
     let mut command = Command::new(program);
     command
         .args(arguments)
@@ -652,7 +743,7 @@ pub(crate) async fn run_bounded_command(
     configure_process_group(&mut command);
     let mut child = command
         .spawn()
-        .with_context(|| format!("start bounded {program} command"))?;
+        .with_context(|| format!("start bounded {program_display} command"))?;
     let stdout = child
         .stdout
         .take()
@@ -664,12 +755,18 @@ pub(crate) async fn run_bounded_command(
     let stdout_task = tokio::spawn(read_bounded(stdout, output_limit));
     let stderr_task = tokio::spawn(read_bounded(stderr, output_limit));
     let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(status) => status.with_context(|| format!("wait for bounded {program} command"))?,
+        Ok(status) => {
+            status.with_context(|| format!("wait for bounded {program_display} command"))?
+        }
         Err(_) => {
             kill_process_tree(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
-            bail!("{program} command exceeded {} seconds", timeout.as_secs());
+            return Err(RuntimeError::ServiceUnavailable(format!(
+                "{program_display} command exceeded {} seconds",
+                timeout.as_secs()
+            ))
+            .into());
         }
     };
     let (stdout, stdout_truncated) = stdout_task.await.context("join bounded stdout reader")??;
@@ -702,7 +799,33 @@ pub(crate) async fn kill_process_tree(child: &mut tokio::process::Child) {
     {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
+    #[cfg(windows)]
+    if let (Some(id), Some(taskkill_path)) = (child.id(), trusted_windows_taskkill_path()) {
+        let mut taskkill = Command::new(taskkill_path);
+        taskkill
+            .args(["/PID", &id.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), taskkill.status()).await;
+    }
     let _ = child.kill().await;
+}
+
+#[cfg(windows)]
+fn trusted_windows_taskkill_path() -> Option<PathBuf> {
+    let configured_root = PathBuf::from(std::env::var_os("SystemRoot")?);
+    if !configured_root.is_absolute() {
+        return None;
+    }
+    let system_root = configured_root.canonicalize().ok()?;
+    let system32 = system_root.join("System32").canonicalize().ok()?;
+    if !system32.starts_with(&system_root) {
+        return None;
+    }
+    let taskkill = system32.join("taskkill.exe");
+    taskkill.is_file().then_some(taskkill)
 }
 
 fn ensure_bounded_diagnostics(output: &BoundedCommandOutput) -> Result<()> {
@@ -909,7 +1032,41 @@ mod tests {
         )
         .await
         .unwrap_err();
+        let runtime_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<RuntimeError>())
+            .expect("timeout keeps its stable runtime error identity");
+        assert_eq!(runtime_error.code(), "runtime.service_unavailable");
+        assert!(runtime_error.retryable());
         assert!(error.to_string().contains("exceeded"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_runtime_resolution_skips_project_and_relative_path_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        let trusted = tempfile::tempdir().unwrap();
+        for directory in [project.path(), trusted.path()] {
+            let runtime = directory.join("docker");
+            std::fs::write(&runtime, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let search_path =
+            std::env::join_paths([Path::new("relative-bin"), project.path(), trusted.path()])
+                .unwrap();
+        let resolved = trusted_runtime_executable_in(
+            "docker",
+            &project.path().canonicalize().unwrap(),
+            &search_path,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            trusted.path().join("docker").canonicalize().unwrap()
+        );
+        assert!(trusted_runtime_executable_in("other", project.path(), &search_path).is_none());
     }
 }

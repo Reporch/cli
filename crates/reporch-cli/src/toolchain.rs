@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use minisign_verify::{PublicKey, Signature};
+use reporch_runtime_core::RuntimeError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -93,7 +94,7 @@ pub async fn inspect(id: &str, runtime: OciRuntime) -> Result<ToolchainInspectio
         };
     }
     let runtime = resolve_secure_runtime(runtime).await?;
-    inspect_entry(&runtime, entry).await
+    inspect_entry(&runtime.name, &runtime.executable, entry).await
 }
 
 pub async fn install(id: &str, runtime: OciRuntime) -> Result<ToolchainInspectionV1> {
@@ -110,12 +111,12 @@ pub async fn install(id: &str, runtime: OciRuntime) -> Result<ToolchainInspectio
         });
     }
     let runtime = resolve_secure_runtime(runtime).await?;
-    let before = inspect_entry(&runtime, entry.clone()).await?;
+    let before = inspect_entry(&runtime.name, &runtime.executable, entry.clone()).await?;
     if before.installed {
         return Ok(before);
     }
 
-    let mut command = Command::new(&runtime);
+    let mut command = Command::new(&runtime.executable);
     command
         .args(["pull", entry.image.as_str()])
         .stdin(Stdio::null())
@@ -125,17 +126,20 @@ pub async fn install(id: &str, runtime: OciRuntime) -> Result<ToolchainInspectio
     configure_process_group(&mut command);
     let mut child = command
         .spawn()
-        .with_context(|| format!("start {runtime} toolchain pull"))?;
+        .with_context(|| format!("start {} toolchain pull", runtime.name))?;
     let status = match tokio::time::timeout(INSTALL_TIMEOUT, child.wait()).await {
         Ok(status) => status.context("wait for toolchain image pull")?,
         Err(_) => {
             kill_process_tree(&mut child).await;
-            bail!("toolchain installation exceeded 30 minutes");
+            return Err(RuntimeError::ServiceUnavailable(
+                "toolchain installation exceeded 30 minutes".into(),
+            )
+            .into());
         }
     };
     ensure!(status.success(), "toolchain image pull failed");
 
-    let installed = inspect_entry(&runtime, entry).await?;
+    let installed = inspect_entry(&runtime.name, &runtime.executable, entry).await?;
     ensure!(
         installed.installed,
         "OCI runtime did not retain the exact signed toolchain digest"
@@ -259,8 +263,12 @@ fn find_entry(id: &str) -> Result<ToolchainEntryV1> {
         .with_context(|| format!("unknown signed toolchain: {id}"))
 }
 
-async fn inspect_entry(runtime: &str, entry: ToolchainEntryV1) -> Result<ToolchainInspectionV1> {
-    let mut command = Command::new(runtime);
+async fn inspect_entry(
+    runtime: &str,
+    executable: &std::path::Path,
+    entry: ToolchainEntryV1,
+) -> Result<ToolchainInspectionV1> {
+    let mut command = Command::new(executable);
     command
         .args([
             "image",
@@ -293,7 +301,10 @@ async fn inspect_entry(runtime: &str, entry: ToolchainEntryV1) -> Result<Toolcha
             kill_process_tree(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
-            bail!("OCI image inspection exceeded 10 seconds");
+            return Err(RuntimeError::ServiceUnavailable(
+                "OCI image inspection exceeded 10 seconds".into(),
+            )
+            .into());
         }
     };
     let (stdout, stdout_truncated) = stdout_task.await.context("join OCI stdout reader")??;
