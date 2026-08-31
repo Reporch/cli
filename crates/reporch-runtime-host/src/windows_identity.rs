@@ -11,12 +11,16 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_HANDLE,
+    SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+};
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    IsProcessorFeaturePresent, OpenProcess, OpenProcessToken, PF_VIRT_FIRMWARE_ENABLED,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows::core::PWSTR;
+use windows::core::{PWSTR, w};
 
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 
@@ -31,6 +35,26 @@ pub(crate) fn current_os_version() -> Result<String> {
         "{}.{}.{}.0",
         version.dwMajorVersion, version.dwMinorVersion, version.dwBuildNumber
     ))
+}
+
+pub(crate) fn hyper_v_available() -> bool {
+    hyper_v_available_inner().unwrap_or(false)
+}
+
+fn hyper_v_available_inner() -> Result<bool> {
+    if !unsafe { IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED) }.as_bool() {
+        return Ok(false);
+    }
+    let manager = OwnedServiceHandle(unsafe {
+        OpenSCManagerW(None, None, SC_MANAGER_CONNECT).context("open Windows service manager")?
+    });
+    let service = OwnedServiceHandle(unsafe {
+        OpenServiceW(manager.0, w!("vmcompute"), SERVICE_QUERY_STATUS)
+            .context("open Host Compute Service")?
+    });
+    let mut status = SERVICE_STATUS::default();
+    unsafe { QueryServiceStatus(service.0, &mut status) }.context("query Host Compute Service")?;
+    Ok(status.dwCurrentState == SERVICE_RUNNING)
 }
 
 pub(crate) fn authenticate_runtime_pipe_server(stream: &NamedPipeClient) -> Result<()> {
@@ -138,6 +162,16 @@ impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+struct OwnedServiceHandle(SC_HANDLE);
+
+impl Drop for OwnedServiceHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            let _ = unsafe { CloseServiceHandle(self.0) };
         }
     }
 }

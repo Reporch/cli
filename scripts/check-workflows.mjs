@@ -147,13 +147,25 @@ assert.doesNotMatch(
 const publishedE2e = readFileSync(".github/workflows/published-artifact-e2e.yml", "utf8");
 const appleVmQualification = readFileSync(".github/workflows/apple-vm-qualification.yml", "utf8");
 const linuxVmQualificationScript = readFileSync("scripts/qualify-linux-vm.sh", "utf8");
+const windowsVmQualificationScript = readFileSync("scripts/qualify-windows-vm.ps1", "utf8");
 const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
+const runtimeCandidates = readFileSync("scripts/build-runtime-candidates.sh", "utf8");
 const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml", "utf8");
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates"/);
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
-assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq13/);
+assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq14/);
+assert.match(
+  runtimeCandidates,
+  /"\$target" 14 1\.0\.0-rc\.8 "\$minimum_os"/,
+  "the signed runtime manifest sequence must match the immutable release tag"
+);
+assert.match(
+  runtimeCandidates,
+  /reporch-runtime-v1-seq14/,
+  "runtime manifest asset URLs must match the immutable release tag"
+);
 assert.match(runtimeRelease, /immutable runtime release already exists/);
 assert.doesNotMatch(runtimeRelease, /release upload[^\n]+--clobber/);
 assert.match(toolchainRelease, /materialize-toolchain-sources\.sh/);
@@ -184,6 +196,11 @@ for (const target of [
 assert.match(publishedE2e, /gh attestation verify/);
 assert.match(
   appleVmQualification,
+  /\.sequence == 14/,
+  "Apple qualification must reject a stale signed runtime sequence"
+);
+assert.match(
+  appleVmQualification,
   /while \[ "\$attempt" -le 4 \][\s\S]*gh release download[\s\S]*attempt=\$\(\(attempt \+ 1\)\)/,
   "Apple VM qualification must retry bounded public release downloads"
 );
@@ -196,6 +213,16 @@ assert.match(
   appleVmQualification,
   /append_unique_checksum[\s\S]*"\$assets\/TOOLCHAIN-SHA256SUMS" "\.\/\$name"/,
   "Apple VM qualification must select canonical ./-prefixed toolchain checksum paths"
+);
+assert.match(
+  linuxVmQualificationScript,
+  /\.data\.installed_sequence == 14/,
+  "Linux qualification must reject a stale signed runtime sequence"
+);
+assert.match(
+  windowsVmQualificationScript,
+  /installed_sequence -eq 14/,
+  "Windows qualification must reject a stale signed runtime sequence"
 );
 assert.match(
   linuxVmQualificationScript,
