@@ -51,6 +51,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $evidence = Join-Path $env:RUNNER_TEMP "windows-vm-evidence"
+          New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+          $installStarted = Get-Date
           cargo build --locked --release -p reporch-cli --target $env:RUST_TARGET
           $binary = (Resolve-Path "target/$env:RUST_TARGET/release/reporch.exe").Path
           $bundle = Join-Path $env:RUNNER_TEMP "runtime-bundle-$env:RUNTIME_TARGET"
@@ -66,11 +69,22 @@ jobs:
           node scripts/pack-system-installer.mjs $env:RUST_TARGET $binary $tree $output
           $package = @(Get-ChildItem -LiteralPath $output -Filter *.msi)
           if ($package.Count -ne 1) { throw "expected exactly one MSI" }
-          $process = Start-Process msiexec.exe -ArgumentList @('/i', $package[0].FullName, '/qn', '/norestart') -Wait -PassThru
+          $msiLog = Join-Path $evidence "msi-install.log"
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $package[0].FullName, '/qn', '/norestart', '/L*V', $msiLog) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "MSI installation failed with $($process.ExitCode)" }
           "QUALIFICATION_MSI=$($package[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $service = Get-Service ReporchRuntime
-          if ($service.Status -ne 'Running') { throw "ReporchRuntime service is not running" }
+          if ($service.Status -ne 'Running') {
+            $service | Format-List * | Out-File (Join-Path $evidence "service-status.txt")
+            & sc.exe queryex ReporchRuntime 2>&1 | Out-File (Join-Path $evidence "sc-query.txt")
+            & reg.exe query 'HKLM\SYSTEM\CurrentControlSet\Services\ReporchRuntime' /s 2>&1 |
+              Out-File (Join-Path $evidence "service-registry.txt")
+            Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $installStarted } -ErrorAction SilentlyContinue |
+              Where-Object ProviderName -eq 'Service Control Manager' |
+              Select-Object -First 100 TimeCreated, Id, LevelDisplayName, Message |
+              Format-List | Out-File (Join-Path $evidence "service-events.txt")
+            throw "ReporchRuntime service is not running"
+          }
       - name: Boot, execute, and clean up 100 HCS VMs
         shell: pwsh
         run: |
