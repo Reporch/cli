@@ -613,15 +613,22 @@ fn prepare_service_spool(allowed_sid: &str) -> Result<()> {
 fn required_allowed_sid() -> Result<String> {
     let value = std::env::var("REPORCH_RUNTIME_ALLOWED_SID")
         .context("REPORCH_RUNTIME_ALLOWED_SID is required for the Windows broker")?;
+    validate_allowed_sid(&value)?;
+    Ok(value)
+}
+
+fn validate_allowed_sid(value: &str) -> Result<()> {
+    let remainder = value
+        .strip_prefix("S-1-")
+        .context("runtime allowed SID has an unsupported revision")?;
     ensure!(
         (5..=184).contains(&value.len())
-            && value.starts_with("S-1-")
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'-'),
+            && !remainder.is_empty()
+            && remainder.split('-').all(|component| !component.is_empty()
+                && component.bytes().all(|byte| byte.is_ascii_digit())),
         "runtime allowed SID is invalid"
     );
-    Ok(value)
+    Ok(())
 }
 
 fn pipe_client_sid(stream: &NamedPipeServer) -> Result<String> {
@@ -732,7 +739,21 @@ mod cancellation_tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use super::{HcsJobLifecycle, await_job_or_client_disconnect};
+    use super::{HcsJobLifecycle, await_job_or_client_disconnect, validate_allowed_sid};
+
+    #[test]
+    fn installer_user_sid_is_accepted_without_relaxing_the_grammar() {
+        validate_allowed_sid("S-1-5-21-1456194669-2875347699-3862154473-500").unwrap();
+        for invalid in [
+            "s-1-5-21-1",
+            "S-2-5-21-1",
+            "S-1-5--21-1",
+            "S-1-5-21-user",
+            "S-1-",
+        ] {
+            assert!(validate_allowed_sid(invalid).is_err(), "accepted {invalid}");
+        }
+    }
 
     struct DropSignal(Arc<AtomicBool>);
 
