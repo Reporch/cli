@@ -15,7 +15,7 @@ concurrency:
 jobs:
   finalize:
     if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
-    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
       GH_TOKEN: ${{ github.token }}
