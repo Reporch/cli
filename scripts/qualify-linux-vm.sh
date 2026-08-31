@@ -73,7 +73,7 @@ jq -e --arg target "$EXPECTED_TARGET" '
   .schema == "reporch.cli-result.v1"
   and .command == "runtime status"
   and .data.target == $target
-  and .data.installed_sequence == 14
+  and .data.installed_sequence == 15
   and .data.backend == "firecracker"
   and .data.availability == "ready"
   and .data.virtualization_available

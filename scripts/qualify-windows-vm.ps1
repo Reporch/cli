@@ -45,13 +45,13 @@ if ($LASTEXITCODE -ne 0) { throw "runtime status failed: $statusText" }
 $statusText | Set-Content -LiteralPath (Join-Path $evidence "status.json") -Encoding utf8NoBOM
 $status = $statusText | ConvertFrom-Json
 Assert-True ($status.schema -eq "reporch.cli-result.v1" -and $status.command -eq "runtime status") "runtime status envelope is invalid"
-Assert-True ($status.data.installed_sequence -eq 14) "runtime status selected the wrong signed runtime sequence"
+Assert-True ($status.data.installed_sequence -eq 15) "runtime status selected the wrong signed runtime sequence"
 Assert-True ($status.data.target -eq "windows-x64-msvc" -and $status.data.backend -eq "hyper_v_hcs") "runtime status selected the wrong Windows backend"
 Assert-True ($status.data.availability -eq "ready" -and $status.data.virtualization_available -and $status.data.service_available) "Windows native runtime is not ready"
 
 $qualificationText = & $binary --format json runtime qualification --iterations 100 --toolchain bash-5.3 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) { throw "runtime qualification failed: $qualificationText" }
 $qualificationText | Set-Content -LiteralPath (Join-Path $evidence "qualification.json") -Encoding utf8NoBOM
+if ($LASTEXITCODE -ne 0) { throw "runtime qualification failed: $qualificationText" }
 $qualification = $qualificationText | ConvertFrom-Json
 Assert-True ($qualification.schema -eq "reporch.cli-result.v1" -and $qualification.command -eq "runtime qualification") "runtime qualification envelope is invalid"
 $result = $qualification.data
