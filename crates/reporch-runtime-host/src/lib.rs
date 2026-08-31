@@ -50,7 +50,7 @@ const MAX_TOOLCHAIN_INDEX_BYTES: usize = 512 * 1024;
 const GUEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_CHANNEL_BASE: &str =
-    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq14";
+    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq15";
 const TOOLCHAIN_CHANNEL_BASE: &str =
     "https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8";
 const RUNTIME_PUBLIC_KEY: &str = include_str!("../../../artifacts/runtime-v1.minisign.pub");
@@ -3056,7 +3056,7 @@ mod tests {
             parse_channel_url(RUNTIME_CHANNEL_BASE, "runtime")
                 .unwrap()
                 .as_str(),
-            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq14/"
+            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq15/"
         );
         assert_eq!(
             parse_channel_url(TOOLCHAIN_CHANNEL_BASE, "toolchain")

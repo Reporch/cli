@@ -83,8 +83,8 @@ impl HcsVmConfigV1 {
                 },
                 "ComputeTopology": {
                     "Memory": {
-                        "Backing": "Virtual",
-                        "SizeInMB": self.memory_mib
+                        "SizeInMB": self.memory_mib,
+                        "AllowOvercommit": true
                     },
                     "Processor": { "Count": self.processor_count }
                 },
@@ -198,6 +198,15 @@ mod tests {
             HCS_KERNEL_COMMAND_LINE
         );
         assert_eq!(value["VirtualMachine"]["StopOnReset"], true);
+        assert_eq!(
+            value["VirtualMachine"]["ComputeTopology"]["Memory"]["AllowOvercommit"],
+            true
+        );
+        assert!(
+            value["VirtualMachine"]["ComputeTopology"]["Memory"]
+                .get("Backing")
+                .is_none()
+        );
         assert!(
             devices["HvSocket"]["HvSocketConfig"]["ServiceTable"]
                 .get(hyperv_vsock_service_id(HYPERV_VSOCK_PORT))
