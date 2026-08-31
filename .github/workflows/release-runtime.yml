@@ -9,7 +9,7 @@ permissions:
   attestations: write
 
 concurrency:
-  group: release-runtime-v1
+  group: release-runtime-v1-seq9
   cancel-in-progress: false
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RUNTIME_TAG: reporch-runtime-v1
+      RUNTIME_TAG: reporch-runtime-v1-seq9
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -97,24 +97,18 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: ${{ runner.temp }}/runtime-release/*
-      - name: Create or replace the draft runtime channel
+      - name: Create the immutable draft runtime release
         shell: bash
         run: |
           set -euo pipefail
           if gh release view "$RUNTIME_TAG" >/dev/null 2>&1; then
-            state=$(gh release view "$RUNTIME_TAG" --json isDraft,isPrerelease)
-            test "$(jq -r '.isDraft or .isPrerelease' <<<"$state")" = true
-            if [ "$(jq -r .isDraft <<<"$state")" != true ]; then
-              gh release edit "$RUNTIME_TAG" --draft
-            fi
-            gh release edit "$RUNTIME_TAG" --target "$GITHUB_SHA" \
-              --title "Reporch Runtime v1 sequence 9"
-          else
-            gh release create "$RUNTIME_TAG" --draft --target "$GITHUB_SHA" \
-              --title "Reporch Runtime v1 sequence 9" \
-              --notes "Signed Docker-free Reporch VM runtime channel. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
+            echo "immutable runtime release already exists: $RUNTIME_TAG" >&2
+            exit 1
           fi
-          gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/runtime-release"/* --clobber
+          gh release create "$RUNTIME_TAG" --draft --target "$GITHUB_SHA" \
+            --title "Reporch Runtime v1 sequence 9" \
+            --notes "Signed Docker-free Reporch VM runtime sequence 9. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
+          gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/runtime-release"/*
           mkdir "$RUNNER_TEMP/runtime-release-download"
           gh release download "$RUNTIME_TAG" --dir "$RUNNER_TEMP/runtime-release-download"
           cmp "$RUNNER_TEMP/runtime-release/SHA256SUMS" "$RUNNER_TEMP/runtime-release-download/SHA256SUMS"
@@ -141,7 +135,6 @@ jobs:
               "$tree" "$target"
           done
           if [ "$failed" -ne 0 ]; then
-            gh release edit "$RUNTIME_TAG" --draft
             exit 1
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
