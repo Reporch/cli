@@ -47,5 +47,10 @@ if [ -d /run/systemd/system ]; then
     if [ -S /run/reporch-runtime/service-v1.sock ]; then
       setfacl -m "u:${install_user}:rw" /run/reporch-runtime/service-v1.sock
     fi
+    if [ -d /var/lib/reporch-runtime ]; then
+      setfacl -R -m "u:${install_user}:r-X" /var/lib/reporch-runtime
+      find /var/lib/reporch-runtime -xdev -type d \
+        -exec setfacl -m "d:u:${install_user}:r-X" {} +
+    fi
   fi
 fi
