@@ -107,7 +107,7 @@ manifest() {
   minimum_os=$2
   target/release/reporch-runtime-bundle-builder \
     "$target" 10 1.0.0-rc.8 "$minimum_os" \
-    https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq10/ \
+    https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq11/ \
     "$staging/artifacts/$target" "$staging/manifests/runtime-$target-manifest.json"
 }
 manifest darwin-arm64 13.0

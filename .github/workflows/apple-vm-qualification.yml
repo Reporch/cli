@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
-      RUNTIME_TAG: reporch-runtime-v1-seq10
+      RUNTIME_TAG: reporch-runtime-v1-seq11
       TOOLCHAIN_TAG: reporch-toolchains-v2-seq8
       RUNTIME_TARGET: ${{ inputs.target }}
     steps:
