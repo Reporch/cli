@@ -153,7 +153,7 @@ assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runti
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
-assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq9/);
+assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq10/);
 assert.match(runtimeRelease, /immutable runtime release already exists/);
 assert.doesNotMatch(runtimeRelease, /release upload[^\n]+--clobber/);
 assert.match(toolchainRelease, /materialize-toolchain-sources\.sh/);
@@ -206,6 +206,11 @@ assert.match(
   linuxVmQualificationScript,
   /sudo --non-interactive find \/var\/lib\/reporch-runtime\/jailer/g,
   "Linux VM qualification must inspect root-owned jail directories before and after execution"
+);
+assert.match(
+  linuxVmQualificationScript,
+  /-name 'rp-\*'/,
+  "Linux VM qualification must track the shortened Firecracker jail IDs"
 );
 assert.match(
   publishedE2e,
