@@ -42,11 +42,26 @@ fi
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload
   systemctl enable --now reporch-runtime.service
+  # Type=simple reports the unit active as soon as the broker process starts,
+  # but the broker verifies/imports the packaged runtime seed before binding
+  # its socket.  Wait for that readiness boundary before granting the
+  # installing user an immediate ACL; otherwise the socket may not exist yet
+  # and the first CLI command incorrectly reports the active service broken
+  # until the user's next login refreshes supplementary groups.
+  runtime_socket=/run/reporch-runtime/service-v1.sock
+  runtime_socket_attempt=0
+  while [ ! -S "$runtime_socket" ] && [ "$runtime_socket_attempt" -lt 300 ]; do
+    sleep 0.1
+    runtime_socket_attempt=$((runtime_socket_attempt + 1))
+  done
+  if [ ! -S "$runtime_socket" ]; then
+    printf '%s\n' 'runtime service did not become ready within 30 seconds' >&2
+    systemctl status --no-pager reporch-runtime.service >&2 || true
+    exit 1
+  fi
   if [ -n "$install_user" ] && command -v setfacl >/dev/null 2>&1; then
     setfacl -m "u:${install_user}:r-x" -m "d:u:${install_user}:r-x" /run/reporch-runtime
-    if [ -S /run/reporch-runtime/service-v1.sock ]; then
-      setfacl -m "u:${install_user}:rw" /run/reporch-runtime/service-v1.sock
-    fi
+    setfacl -m "u:${install_user}:rw" "$runtime_socket"
     if [ -d /var/lib/reporch-runtime ]; then
       setfacl -R -m "u:${install_user}:r-X" /var/lib/reporch-runtime
       find /var/lib/reporch-runtime -xdev -type d \
