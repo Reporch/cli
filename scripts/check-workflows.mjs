@@ -153,7 +153,7 @@ assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runti
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
-assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq11/);
+assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq12/);
 assert.match(runtimeRelease, /immutable runtime release already exists/);
 assert.doesNotMatch(runtimeRelease, /release upload[^\n]+--clobber/);
 assert.match(toolchainRelease, /materialize-toolchain-sources\.sh/);

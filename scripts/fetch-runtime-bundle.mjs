@@ -13,7 +13,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const CHANNEL = "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq11/";
+const CHANNEL = "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq12/";
 const TARGETS = new Set([
   "darwin-arm64",
   "darwin-x64",
