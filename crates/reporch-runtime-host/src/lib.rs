@@ -50,7 +50,7 @@ const MAX_TOOLCHAIN_INDEX_BYTES: usize = 512 * 1024;
 const GUEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_CHANNEL_BASE: &str =
-    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq13";
+    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq14";
 const TOOLCHAIN_CHANNEL_BASE: &str =
     "https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8";
 const RUNTIME_PUBLIC_KEY: &str = include_str!("../../../artifacts/runtime-v1.minisign.pub");
@@ -1550,26 +1550,23 @@ async fn probe_virtualization(target: HostTarget) -> (bool, Option<String>) {
             )
         }
         HostTarget::WindowsX64Msvc => {
-            let program = std::env::var_os("SystemRoot")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .map(|path| {
-                    path.join("System32")
-                        .join("WindowsPowerShell")
-                        .join("v1.0")
-                        .join("powershell.exe")
-                });
-            let output = match program {
-                Some(program) => bounded_command(&program, &["-NoProfile", "-NonInteractive", "-Command", "if ((Get-CimInstance Win32_ComputerSystem).HypervisorPresent) { '1' } else { '0' }"]).await,
-                None => None,
-            };
-            let available = output.as_deref().is_some_and(|value| value.trim() == "1");
+            let available = windows_virtualization_available();
             (
                 available,
                 (!available).then(|| "Hyper-V is unavailable or disabled".into()),
             )
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_virtualization_available() -> bool {
+    windows_identity::hyper_v_available()
+}
+
+#[cfg(not(windows))]
+fn windows_virtualization_available() -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -3059,7 +3056,7 @@ mod tests {
             parse_channel_url(RUNTIME_CHANNEL_BASE, "runtime")
                 .unwrap()
                 .as_str(),
-            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq13/"
+            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq14/"
         );
         assert_eq!(
             parse_channel_url(TOOLCHAIN_CHANNEL_BASE, "toolchain")

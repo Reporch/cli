@@ -45,6 +45,7 @@ if ($LASTEXITCODE -ne 0) { throw "runtime status failed: $statusText" }
 $statusText | Set-Content -LiteralPath (Join-Path $evidence "status.json") -Encoding utf8NoBOM
 $status = $statusText | ConvertFrom-Json
 Assert-True ($status.schema -eq "reporch.cli-result.v1" -and $status.command -eq "runtime status") "runtime status envelope is invalid"
+Assert-True ($status.data.installed_sequence -eq 14) "runtime status selected the wrong signed runtime sequence"
 Assert-True ($status.data.target -eq "windows-x64-msvc" -and $status.data.backend -eq "hyper_v_hcs") "runtime status selected the wrong Windows backend"
 Assert-True ($status.data.availability -eq "ready" -and $status.data.virtualization_available -and $status.data.service_available) "Windows native runtime is not ready"
 

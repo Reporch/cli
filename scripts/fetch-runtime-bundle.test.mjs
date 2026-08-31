@@ -5,10 +5,10 @@ import { validateRuntimeManifest } from "./fetch-runtime-bundle.mjs";
 
 function fixture(target = "windows-x64-msvc") {
   const file = target.startsWith("windows") ? "kernel" : "vmlinux";
-  const prefix = `https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq13/runtime-${target}-${file}`;
+  const prefix = `https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq14/runtime-${target}-${file}`;
   return {
     schema: "reporch.runtime-bundle-manifest.v1",
-    sequence: 13,
+    sequence: 14,
     version: "1.0.0-rc.8",
     target,
     artifacts: ["kernel", "rootfs", "guest_agent"].map((kind, index) => ({

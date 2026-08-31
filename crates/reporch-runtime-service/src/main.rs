@@ -1,5 +1,8 @@
 #![deny(unsafe_code)]
 
+#[cfg(unix)]
+use anyhow::Context as _;
+
 #[cfg(target_os = "linux")]
 mod linux_backend;
 
@@ -617,12 +620,26 @@ mod unix_service {
 }
 
 #[cfg(unix)]
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() {
-    if let Err(error) = unix_service::run().await {
+fn main() {
+    if let Err(error) = run_unix_service() {
         eprintln!("reporch-runtime-service: {error:#}");
         std::process::exit(1);
     }
+}
+
+#[cfg(unix)]
+fn run_unix_service() -> anyhow::Result<()> {
+    // Move the single-threaded broker process into a leaf before Tokio creates
+    // worker threads. This leaves the delegated systemd unit cgroup empty so
+    // cgroup v2 can enforce CPU, memory, and PID limits on sibling VM leaves.
+    #[cfg(target_os = "linux")]
+    linux_backend::prepare_service_cgroup_delegation()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("create Unix runtime service executor")?;
+    runtime.block_on(unix_service::run())
 }
 
 #[cfg(windows)]

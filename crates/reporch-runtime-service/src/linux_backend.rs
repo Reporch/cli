@@ -23,6 +23,8 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 const VSOCK_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const BOOT_LOG_LIMIT_BYTES: u64 = 16 * 1024;
+const BROKER_CGROUP: &str = "broker";
+const REQUIRED_CGROUP_CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
 
 #[derive(Debug)]
 pub struct LinuxVmPlan {
@@ -39,6 +41,71 @@ pub struct LinuxVmPlan {
     config: FirecrackerConfig,
     vm_uid: u32,
     vm_gid: u32,
+}
+
+pub fn prepare_service_cgroup_delegation() -> Result<()> {
+    if !rustix::process::getuid().is_root() {
+        return Ok(());
+    }
+
+    let service_cgroup = current_service_cgroup()?;
+    ensure!(
+        !service_cgroup.is_empty(),
+        "installed runtime service is not inside a delegated cgroup"
+    );
+    let service_root = Path::new("/sys/fs/cgroup").join(&service_cgroup);
+    let metadata =
+        fs::symlink_metadata(&service_root).context("inspect delegated runtime service cgroup")?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "runtime service cgroup is not a real directory"
+    );
+
+    let controllers = read_cgroup_tokens(&service_root, "cgroup.controllers")?;
+    for controller in REQUIRED_CGROUP_CONTROLLERS {
+        ensure!(
+            controllers.iter().any(|available| available == controller),
+            "runtime service cgroup does not delegate the {controller} controller"
+        );
+    }
+
+    let broker = service_root.join(BROKER_CGROUP);
+    match fs::create_dir(&broker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata =
+                fs::symlink_metadata(&broker).context("inspect existing runtime broker cgroup")?;
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "runtime broker cgroup is not a real directory"
+            );
+        }
+        Err(error) => return Err(error).context("create runtime broker cgroup"),
+    }
+    write_cgroup_value(&broker, "cgroup.procs", &std::process::id().to_string())?;
+
+    let moved = current_service_cgroup()?;
+    ensure!(
+        moved == format!("{service_cgroup}/{BROKER_CGROUP}"),
+        "runtime service did not enter its broker cgroup"
+    );
+    write_cgroup_value(
+        &service_root,
+        "cgroup.subtree_control",
+        &REQUIRED_CGROUP_CONTROLLERS
+            .iter()
+            .map(|controller| format!("+{controller}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )?;
+    let enabled = read_cgroup_tokens(&service_root, "cgroup.subtree_control")?;
+    for controller in REQUIRED_CGROUP_CONTROLLERS {
+        ensure!(
+            enabled.iter().any(|active| active == controller),
+            "runtime service failed to enable the {controller} controller"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -117,7 +184,7 @@ pub fn build_plan(
         vsock_path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES,
         "Firecracker vsock path exceeds the host Unix socket limit"
     );
-    let service_cgroup = current_service_cgroup()?;
+    let service_cgroup = current_delegated_service_cgroup()?;
     let parent_cgroup = if service_cgroup.is_empty() {
         id.clone()
     } else {
@@ -209,6 +276,36 @@ fn current_service_cgroup() -> Result<String> {
     let membership = fs::read_to_string("/proc/self/cgroup")
         .context("read runtime service cgroup membership")?;
     parse_unified_service_cgroup(&membership)
+}
+
+fn current_delegated_service_cgroup() -> Result<String> {
+    let membership = current_service_cgroup()?;
+    delegated_service_cgroup(&membership)
+}
+
+fn delegated_service_cgroup(membership: &str) -> Result<String> {
+    let suffix = format!("/{BROKER_CGROUP}");
+    let service = membership
+        .strip_suffix(&suffix)
+        .context("runtime broker is not inside its reserved cgroup")?;
+    ensure!(
+        !service.is_empty(),
+        "runtime broker cgroup has no delegated service parent"
+    );
+    Ok(service.to_owned())
+}
+
+fn read_cgroup_tokens(directory: &Path, name: &str) -> Result<Vec<String>> {
+    let path = directory.join(name);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect delegated cgroup control {name}"))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "delegated cgroup control is not a real file: {name}"
+    );
+    let value = fs::read_to_string(&path)
+        .with_context(|| format!("read delegated cgroup control {name}"))?;
+    Ok(value.split_ascii_whitespace().map(str::to_owned).collect())
 }
 
 fn parse_unified_service_cgroup(membership: &str) -> Result<String> {
@@ -855,5 +952,11 @@ mod tests {
         assert_eq!(parse_unified_service_cgroup("0::/\n").unwrap(), "");
         assert!(parse_unified_service_cgroup("2:cpu:/legacy\n").is_err());
         assert!(parse_unified_service_cgroup("0::/safe/../escape\n").is_err());
+        assert_eq!(
+            delegated_service_cgroup("system.slice/reporch-runtime.service/broker").unwrap(),
+            "system.slice/reporch-runtime.service"
+        );
+        assert!(delegated_service_cgroup("system.slice/reporch-runtime.service").is_err());
+        assert!(delegated_service_cgroup("broker").is_err());
     }
 }
