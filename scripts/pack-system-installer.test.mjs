@@ -20,7 +20,10 @@ test("Windows installer XML binds the CLI, service, and runtime without a networ
     assert.match(first, /Version="1\.0\.8"/);
     assert.match(first, /Directory Id="BINDIR" Name="bin"/);
     assert.match(first, /ServiceInstall[^>]+Name="ReporchRuntime"/);
-    assert.match(first, /Name="REPORCH_RUNTIME_ALLOWED_SID" Value="\[UserSID\]"/);
+    assert.match(first, /RegistryValue[^>]+Name="Environment"[^>]+Type="multiString"/);
+    assert.match(first, /MultiString Value="REPORCH_RUNTIME_ALLOWED_SID=\[UserSID\]"/);
+    assert.match(first, /MultiString Value="REPORCH_RUNTIME_SERVICE_SCOPE=machine"/);
+    assert.doesNotMatch(first, /Environment[^>]+Name="REPORCH_RUNTIME_ALLOWED_SID"/);
     assert.match(first, /Environment[^>]+Name="PATH"[^>]+\[BINDIR\]/);
     assert.doesNotMatch(first, /CustomAction/);
   } finally {
@@ -44,6 +47,9 @@ test("Linux package scripts define the dedicated VM identity and constrained bro
   assert.match(postinstall, /runtime_vm_user=reporch-runtime-vm/);
   assert.match(postinstall, /REPORCH_RUNTIME_VM_UID/);
   assert.match(postinstall, /REPORCH_RUNTIME_VM_GID/);
+  assert.match(postinstall, /setfacl -R -m "u:\$\{install_user\}:r-X" \/var\/lib\/reporch-runtime/);
+  assert.match(postinstall, /find \/var\/lib\/reporch-runtime -xdev -type d/);
+  assert.match(postinstall, /"d:u:\$\{install_user\}:r-X"/);
 });
 
 test("RPM packaging preserves signed read-only runtime bytes", () => {
