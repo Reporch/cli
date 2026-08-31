@@ -628,6 +628,7 @@ async fn main() {
 #[cfg(windows)]
 fn main() {
     if let Err(error) = windows_entry::dispatch() {
+        windows_entry::persist_dispatch_failure(&error);
         eprintln!("reporch-runtime-service: {error}");
         std::process::exit(1);
     }
@@ -656,6 +657,12 @@ mod windows_entry {
         service_dispatcher::start(SERVICE_NAME, ffi_service_main)
     }
 
+    pub fn persist_dispatch_failure(error: &::windows_service::Error) {
+        persist_service_failure(&anyhow::anyhow!(
+            "start Windows service dispatcher: {error:?}"
+        ));
+    }
+
     fn service_main(_arguments: Vec<OsString>) {
         clear_service_failure();
         if let Err(error) = run_service() {
@@ -663,7 +670,9 @@ mod windows_entry {
         }
     }
 
-    fn run_service() -> ::windows_service::Result<()> {
+    fn run_service() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let event_handler = move |event| match event {
             ServiceControl::Stop => {
@@ -673,28 +682,38 @@ mod windows_entry {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         };
-        let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
-        status_handle.set_service_status(status(ServiceState::Running, true, 0))?;
+        let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
+            .context("register Windows service control handler")?;
+        status_handle
+            .set_service_status(status(ServiceState::Running, true, 0))
+            .context("report Windows runtime service ready")?;
 
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(::windows_service::Error::Winapi)
+            .context("create Windows runtime service executor")
             .and_then(|runtime| {
-                runtime
-                    .block_on(async {
-                        bootstrap_system_runtime_seed().await?;
-                        crate::windows_service::run(shutdown_rx).await
-                    })
-                    .map_err(|error| {
-                        ::windows_service::Error::Winapi(std::io::Error::other(format!(
-                            "{error:#}"
-                        )))
-                    })
+                runtime.block_on(async {
+                    bootstrap_system_runtime_seed()
+                        .await
+                        .context("bootstrap packaged Windows runtime")?;
+                    crate::windows_service::run(shutdown_rx)
+                        .await
+                        .context("run Windows runtime broker")
+                })
             });
         let exit_code = u32::from(result.is_err());
-        status_handle.set_service_status(status(ServiceState::Stopped, false, exit_code))?;
-        result
+        let stopped = status_handle
+            .set_service_status(status(ServiceState::Stopped, false, exit_code))
+            .context("report Windows runtime service stopped");
+        match (result, stopped) {
+            (Err(error), Err(status_error)) => Err(error.context(format!(
+                "also failed to report stopped state: {status_error:#}"
+            ))),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     fn service_failure_path() -> Option<PathBuf> {
@@ -712,7 +731,7 @@ mod windows_entry {
         }
     }
 
-    fn persist_service_failure(error: &::windows_service::Error) {
+    fn persist_service_failure(error: &anyhow::Error) {
         let Some(path) = service_failure_path() else {
             return;
         };
