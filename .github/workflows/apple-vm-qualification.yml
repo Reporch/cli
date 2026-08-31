@@ -102,13 +102,25 @@ jobs:
             --pattern toolchains-v2-index.json \
             --pattern toolchains-v2-index.json.minisig \
             --pattern "$toolchain_archive"
+          append_unique_checksum() {
+            manifest=$1
+            wanted=$2
+            output=$3
+            awk -v wanted="$wanted" '
+              $2 == wanted { line = $0; count += 1 }
+              END { if (count != 1) exit 1; print line }
+            ' "$manifest" >> "$output"
+          }
           : > "$assets/selected-runtime-SHA256SUMS"
           for name in "$runtime_manifest" "$runtime_signature_file" "$kernel" "$initramfs"; do
-            grep -F "  $name" "$assets/SHA256SUMS" >> "$assets/selected-runtime-SHA256SUMS"
+            append_unique_checksum \
+              "$assets/SHA256SUMS" "$name" "$assets/selected-runtime-SHA256SUMS"
           done
           : > "$assets/selected-toolchain-SHA256SUMS"
           for name in toolchains-v2-index.json toolchains-v2-index.json.minisig "$toolchain_archive"; do
-            grep -F "  ./$name" "$assets/TOOLCHAIN-SHA256SUMS" >> "$assets/selected-toolchain-SHA256SUMS"
+            append_unique_checksum \
+              "$assets/TOOLCHAIN-SHA256SUMS" "./$name" \
+              "$assets/selected-toolchain-SHA256SUMS"
           done
           test "$(wc -l < "$assets/selected-runtime-SHA256SUMS" | tr -d ' ')" = 4
           test "$(wc -l < "$assets/selected-toolchain-SHA256SUMS" | tr -d ' ')" = 3

@@ -186,8 +186,13 @@ assert.match(
 );
 assert.match(
   appleVmQualification,
-  /grep -F "  \.\/\$name" "\$assets\/TOOLCHAIN-SHA256SUMS"/,
-  "Apple VM qualification must select the canonical ./-prefixed toolchain checksum paths"
+  /\$2 == wanted \{ line = \$0; count \+= 1 \}[\s\S]*if \(count != 1\) exit 1/,
+  "Apple VM qualification must select exactly one checksum record by its filename field"
+);
+assert.match(
+  appleVmQualification,
+  /append_unique_checksum[\s\S]*"\$assets\/TOOLCHAIN-SHA256SUMS" "\.\/\$name"/,
+  "Apple VM qualification must select canonical ./-prefixed toolchain checksum paths"
 );
 assert.match(
   linuxVmQualificationScript,
