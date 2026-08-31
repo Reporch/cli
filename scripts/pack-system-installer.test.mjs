@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { windowsInstallerXml } from "./pack-system-installer.mjs";
+import { linuxRpmSpec, windowsInstallerXml } from "./pack-system-installer.mjs";
 
 test("Windows installer XML binds the CLI, service, and runtime without a network helper", () => {
   const root = mkdtempSync(join(tmpdir(), "reporch-installer-test-"));
@@ -44,6 +44,24 @@ test("Linux package scripts define the dedicated VM identity and constrained bro
   assert.match(postinstall, /runtime_vm_user=reporch-runtime-vm/);
   assert.match(postinstall, /REPORCH_RUNTIME_VM_UID/);
   assert.match(postinstall, /REPORCH_RUNTIME_VM_GID/);
+});
+
+test("RPM packaging preserves signed read-only runtime bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "reporch-rpm-spec-test-"));
+  try {
+    mkdirSync(join(root, "usr", "lib", "reporch"), { recursive: true });
+    writeFileSync(join(root, "usr", "lib", "reporch", "vmlinux"), "signed runtime bytes");
+    const spec = linuxRpmSpec(
+      root,
+      { target: "x86_64-unknown-linux-gnu" },
+      "1.0.0-rc.8"
+    );
+    assert.match(spec, /^%global __os_install_post %\{nil\}$/m);
+    assert.match(spec, /^\/usr\/lib\/reporch\/vmlinux$/m);
+    assert.doesNotMatch(spec, /\bstrip\b/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("macOS release entitlement grants virtualization and nothing broader", () => {

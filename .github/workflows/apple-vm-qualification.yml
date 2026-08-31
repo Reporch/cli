@@ -70,13 +70,34 @@ jobs:
           initramfs="runtime-$RUNTIME_TARGET-rootfs.cpio"
           toolchain_archive="bash-5.3-linux-$toolchain_arch.ext4.zst"
           toolchain_image="bash-5.3-linux-$toolchain_arch.ext4"
-          gh release download "$RUNTIME_TAG" --dir "$assets" \
+          download_release_assets() {
+            release=$1
+            shift
+            download=$(mktemp -d "$RUNNER_TEMP/reporch-release-download.XXXXXX")
+            attempt=1
+            while [ "$attempt" -le 4 ]; do
+              if gh release download "$release" --dir "$download" "$@"; then
+                cp "$download"/* "$assets"/
+                find "$download" -mindepth 1 -maxdepth 1 -type f -delete
+                rmdir "$download"
+                return 0
+              fi
+              find "$download" -mindepth 1 -maxdepth 1 -type f -delete
+              if [ "$attempt" -eq 4 ]; then
+                rmdir "$download" || true
+                return 1
+              fi
+              sleep $((attempt * 5))
+              attempt=$((attempt + 1))
+            done
+          }
+          download_release_assets "$RUNTIME_TAG" \
             --pattern SHA256SUMS \
             --pattern "$runtime_manifest" \
             --pattern "$runtime_signature_file" \
             --pattern "$kernel" \
             --pattern "$initramfs"
-          gh release download "$TOOLCHAIN_TAG" --dir "$assets" \
+          download_release_assets "$TOOLCHAIN_TAG" \
             --pattern TOOLCHAIN-SHA256SUMS \
             --pattern toolchains-v2-index.json \
             --pattern toolchains-v2-index.json.minisig \
