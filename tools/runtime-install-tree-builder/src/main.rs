@@ -19,6 +19,7 @@ const PUBLIC_KEY: &str = include_str!("../../../artifacts/runtime-v1.minisign.pu
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 4 * 1_073_741_824;
+const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct Arguments {
@@ -187,7 +188,10 @@ fn copy_verified_regular(
         .context("create installed runtime artifact")?;
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
+    // Windows executables have a smaller default main-thread stack than the
+    // Unix targets. Keep the bounded transfer buffer on the heap so copying a
+    // valid runtime bundle cannot exhaust that platform stack.
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     loop {
         let read = input.read(&mut buffer).context("read runtime artifact")?;
         if read == 0 {
@@ -317,11 +321,11 @@ fn make_tree_writable_for_cleanup(path: &Path) {
         visited.push((current, metadata.is_dir()));
     }
 
-    for (current, is_directory) in visited.into_iter().rev() {
+    for (current, _is_directory) in visited.into_iter().rev() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = if is_directory { 0o700 } else { 0o600 };
+            let mode = if _is_directory { 0o700 } else { 0o600 };
             let _ = fs::set_permissions(&current, fs::Permissions::from_mode(mode));
         }
         #[cfg(windows)]
