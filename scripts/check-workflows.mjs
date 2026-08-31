@@ -145,6 +145,7 @@ assert.doesNotMatch(
   "the npm dogfood process must not inherit an issue-write token"
 );
 const publishedE2e = readFileSync(".github/workflows/published-artifact-e2e.yml", "utf8");
+const appleVmQualification = readFileSync(".github/workflows/apple-vm-qualification.yml", "utf8");
 const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
 const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml", "utf8");
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates"/);
@@ -177,6 +178,11 @@ for (const target of [
   );
 }
 assert.match(publishedE2e, /gh attestation verify/);
+assert.match(
+  appleVmQualification,
+  /while \[ "\$attempt" -le 4 \][\s\S]*gh release download[\s\S]*attempt=\$\(\(attempt \+ 1\)\)/,
+  "Apple VM qualification must retry bounded public release downloads"
+);
 assert.match(
   publishedE2e,
   /if \[ "\$RUNNER_OS" = macOS \]; then\s+\(cd "\$assets" && printf '%s\\n' "\$checksum" \| shasum -a 256 --check\)/,

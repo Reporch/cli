@@ -297,30 +297,38 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 fn make_tree_writable_for_cleanup(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let child = entry.path();
-                if child.is_dir() {
-                    make_tree_writable_for_cleanup(&child);
-                }
-            }
+    // Cleanup runs on the error path, where masking the original failure with a
+    // stack overflow is particularly harmful. Runtime trees can contain many
+    // files, so walk them iteratively and restore permissions in post-order.
+    let mut pending = vec![path.to_path_buf()];
+    let mut visited = Vec::new();
+    while let Some(current) = pending.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
         }
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        if metadata.is_dir()
+            && let Ok(entries) = fs::read_dir(&current)
+        {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
+        }
+        visited.push((current, metadata.is_dir()));
     }
-    #[cfg(windows)]
-    {
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                make_tree_writable_for_cleanup(&entry.path());
-            }
+
+    for (current, is_directory) in visited.into_iter().rev() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = if is_directory { 0o700 } else { 0o600 };
+            let _ = fs::set_permissions(&current, fs::Permissions::from_mode(mode));
         }
-        if let Ok(metadata) = fs::metadata(path) {
+        #[cfg(windows)]
+        if let Ok(metadata) = fs::symlink_metadata(&current) {
             let mut permissions = metadata.permissions();
             permissions.set_readonly(false);
-            let _ = fs::set_permissions(path, permissions);
+            let _ = fs::set_permissions(&current, permissions);
         }
     }
 }
@@ -495,5 +503,23 @@ mod tests {
     #[test]
     fn arbitrary_signature_does_not_match_compiled_trust_root() {
         assert!(verify_signature(b"manifest", b"not a minisign signature").is_err());
+    }
+
+    #[test]
+    fn cleanup_permission_walk_handles_deep_runtime_trees_without_recursion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut directory = root.path().join("tree");
+        fs::create_dir(&directory).unwrap();
+        for _ in 0..128 {
+            directory = directory.join("d");
+            fs::create_dir(&directory).unwrap();
+        }
+        let artifact = directory.join("artifact");
+        fs::write(&artifact, b"runtime artifact").unwrap();
+        set_read_only_permissions(&artifact, false).unwrap();
+
+        make_tree_writable_for_cleanup(&root.path().join("tree"));
+
+        fs::remove_dir_all(root.path().join("tree")).unwrap();
     }
 }

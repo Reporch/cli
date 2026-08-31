@@ -182,9 +182,18 @@ function treeEntries(root, path = "") {
   return entries;
 }
 
-function packRpm(root, target, version, output, work) {
+export function linuxRpmSpec(root, target, version) {
   const architecture = target.target.startsWith("aarch64") ? "aarch64" : "x86_64";
   const identity = rpmIdentity(version);
+  const post = readFileSync("installers/linux/postinstall.sh", "utf8").replace(/^#!.*\n/, "");
+  const preun = readFileSync("installers/linux/preremove.sh", "utf8").replace(/^#!.*\n/, "");
+  const files = treeEntries(root).join("\n");
+  // The runtime payload is already signed, hashed, and deliberately read-only.
+  // RPM's build-root post-processing must never strip or rewrite those bytes.
+  return `%global __os_install_post %{nil}\nName: reporch-cli\nVersion: ${identity.version}\nRelease: ${identity.release}\nSummary: Reporch problem authoring CLI and isolated VM runtime\nLicense: Apache-2.0\nURL: https://github.com/Reporch/cli\nSource0: payload.tar.gz\nBuildArch: ${architecture}\nRequires: systemd, shadow-utils, acl\nAutoReqProv: no\n\n%description\nReporch problem authoring CLI and isolated VM runtime.\n\n%prep\nmkdir payload\ntar -xzf %{SOURCE0} -C payload\n\n%install\nmkdir -p %{buildroot}\ncp -a payload/. %{buildroot}/\n\n%post\n${post}\n\n%preun\n${preun}\n\n%files\n${files}\n`;
+}
+
+function packRpm(root, target, version, output, work) {
   const top = join(work, "rpmbuild");
   for (const directory of ["BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"]) {
     mkdirSync(join(top, directory), { recursive: true, mode: 0o755 });
@@ -197,10 +206,7 @@ function packRpm(root, target, version, output, work) {
     join(top, "SOURCES", "payload.tar.gz"),
     "."
   ]);
-  const post = readFileSync("installers/linux/postinstall.sh", "utf8").replace(/^#!.*\n/, "");
-  const preun = readFileSync("installers/linux/preremove.sh", "utf8").replace(/^#!.*\n/, "");
-  const files = treeEntries(root).join("\n");
-  const spec = `Name: reporch-cli\nVersion: ${identity.version}\nRelease: ${identity.release}\nSummary: Reporch problem authoring CLI and isolated VM runtime\nLicense: Apache-2.0\nURL: https://github.com/Reporch/cli\nSource0: payload.tar.gz\nBuildArch: ${architecture}\nRequires: systemd, shadow-utils, acl\nAutoReqProv: no\n\n%description\nReporch problem authoring CLI and isolated VM runtime.\n\n%prep\nmkdir payload\ntar -xzf %{SOURCE0} -C payload\n\n%install\nmkdir -p %{buildroot}\ncp -a payload/. %{buildroot}/\n\n%post\n${post}\n\n%preun\n${preun}\n\n%files\n${files}\n`;
+  const spec = linuxRpmSpec(root, target, version);
   const specPath = join(top, "SPECS", "reporch-cli.spec");
   writeFileSync(specPath, spec);
   run("rpmbuild", ["--define", `_topdir ${top}`, "-bb", specPath]);
