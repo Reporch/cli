@@ -124,6 +124,7 @@ pub fn build_plan(
     let cpu_quota = u64::from(job.limits.cpu_millis)
         .saturating_mul(100_000)
         .div_ceil(1_000);
+    let parent_cgroup = current_cgroup_parent()?;
     let arguments = vec![
         "--id".into(),
         id.clone(),
@@ -138,6 +139,8 @@ pub fn build_plan(
         "--new-pid-ns".into(),
         "--cgroup-version".into(),
         "2".into(),
+        "--parent-cgroup".into(),
+        parent_cgroup,
         "--cgroup".into(),
         format!("pids.max={}", job.limits.pids.saturating_add(16)),
         "--cgroup".into(),
@@ -206,6 +209,47 @@ pub fn build_plan(
         vm_uid,
         vm_gid,
     })
+}
+
+fn current_cgroup_parent() -> Result<String> {
+    let membership = fs::read_to_string("/proc/self/cgroup")
+        .context("read runtime service cgroup membership")?;
+    parse_unified_cgroup_parent(&membership)
+}
+
+fn parse_unified_cgroup_parent(membership: &str) -> Result<String> {
+    let mut unified = membership.lines().filter_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("0"), Some(""), Some(path)) => Some(path),
+            _ => None,
+        }
+    });
+    let path = unified
+        .next()
+        .context("runtime host has no unified cgroup v2 membership")?;
+    ensure!(
+        unified.next().is_none(),
+        "runtime host has ambiguous unified cgroup membership"
+    );
+    ensure!(path.starts_with('/'), "runtime cgroup path is not absolute");
+    let mut components = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(value) => {
+                components.push(value.to_str().context("runtime cgroup path is not UTF-8")?)
+            }
+            _ => anyhow::bail!("runtime cgroup path is not normalized"),
+        }
+    }
+    components.push("reporch-vms");
+    let parent = components.join("/");
+    ensure!(
+        parent.len() <= 240,
+        "runtime delegated cgroup path is too long"
+    );
+    Ok(parent)
 }
 
 pub async fn execute(
@@ -750,5 +794,19 @@ mod tests {
         assert!(!diagnostic.contains('\0'));
         assert!(!diagnostic.contains('\x07'));
         assert!(diagnostic.ends_with("tail��\n"));
+    }
+
+    #[test]
+    fn firecracker_cgroups_stay_inside_the_service_delegation() {
+        assert_eq!(
+            parse_unified_cgroup_parent("0::/system.slice/reporch-runtime.service\n").unwrap(),
+            "system.slice/reporch-runtime.service/reporch-vms"
+        );
+        assert_eq!(
+            parse_unified_cgroup_parent("0::/\n").unwrap(),
+            "reporch-vms"
+        );
+        assert!(parse_unified_cgroup_parent("2:cpu:/legacy\n").is_err());
+        assert!(parse_unified_cgroup_parent("0::/safe/../escape\n").is_err());
     }
 }

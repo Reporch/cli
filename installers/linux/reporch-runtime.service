@@ -25,7 +25,11 @@ ProtectHome=yes
 ProtectSystem=strict
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectControlGroups=yes
+# Firecracker's jailer writes CPU, memory, and PID limits only below this
+# service's delegated cgroup subtree. The host filesystem remains protected by
+# ProtectSystem=strict and the broker never accepts an arbitrary cgroup path.
+ProtectControlGroups=no
+Delegate=yes
 ProtectClock=yes
 ProtectHostname=yes
 RestrictRealtime=yes
