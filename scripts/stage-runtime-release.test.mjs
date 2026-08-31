@@ -60,7 +60,7 @@ function fixture(root) {
       join(manifests, name),
       `${JSON.stringify({
         schema: "reporch.runtime-bundle-manifest.v1",
-        sequence: 8,
+        sequence: 9,
         version: "1.0.0-rc.8",
         target,
         artifacts: manifestArtifacts
