@@ -70,9 +70,22 @@ jobs:
           $package = @(Get-ChildItem -LiteralPath $output -Filter *.msi)
           if ($package.Count -ne 1) { throw "expected exactly one MSI" }
           $msiLog = Join-Path $evidence "msi-install.log"
-          $process = Start-Process msiexec.exe -ArgumentList @('/i', $package[0].FullName, '/qn', '/norestart', '/L*V', $msiLog) -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "MSI installation failed with $($process.ExitCode)" }
           "QUALIFICATION_MSI=$($package[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $package[0].FullName, '/qn', '/norestart', '/L*V', $msiLog) -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            & sc.exe queryex ReporchRuntime 2>&1 | Out-File (Join-Path $evidence "sc-query.txt")
+            & reg.exe query 'HKLM\SYSTEM\CurrentControlSet\Services\ReporchRuntime' /s 2>&1 |
+              Out-File (Join-Path $evidence "service-registry.txt")
+            Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $installStarted } -ErrorAction SilentlyContinue |
+              Where-Object ProviderName -eq 'Service Control Manager' |
+              Select-Object -First 100 TimeCreated, Id, LevelDisplayName, Message |
+              Format-List | Out-File (Join-Path $evidence "service-events.txt")
+            $serviceError = Join-Path $env:ProgramData "Reporch\Runtime\last-service-error.txt"
+            if (Test-Path $serviceError -PathType Leaf) {
+              Copy-Item -LiteralPath $serviceError -Destination (Join-Path $evidence "last-service-error.txt")
+            }
+            throw "MSI installation failed with $($process.ExitCode)"
+          }
           $service = Get-Service ReporchRuntime
           if ($service.Status -ne 'Running') {
             $service | Format-List * | Out-File (Join-Path $evidence "service-status.txt")
