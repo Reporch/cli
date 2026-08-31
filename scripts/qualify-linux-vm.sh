@@ -44,6 +44,8 @@ chmod 0700 "$EVIDENCE"
 systemctl is-active --quiet reporch-runtime.service
 SERVICE_PID="$(systemctl show --property MainPID --value reporch-runtime.service)"
 [[ "$SERVICE_PID" =~ ^[1-9][0-9]*$ && -d "/proc/$SERVICE_PID" ]]
+SERVICE_CGROUP="$(systemctl show --property ControlGroup --value reporch-runtime.service)"
+[[ "$SERVICE_CGROUP" == /* && -d "/sys/fs/cgroup$SERVICE_CGROUP" ]]
 
 snapshot_backend() {
   local prefix="$1"
@@ -58,6 +60,8 @@ snapshot_backend() {
   else
     : > "$EVIDENCE/$prefix-jails.txt"
   fi
+  find "/sys/fs/cgroup$SERVICE_CGROUP" -mindepth 1 -maxdepth 1 \
+    -type d -name 'rp-*' -print | sort > "$EVIDENCE/$prefix-cgroups.txt"
   sudo --non-interactive find "/proc/$SERVICE_PID/fd" \
     -mindepth 1 -maxdepth 1 -print \
     | wc -l | tr -d ' ' > "$EVIDENCE/$prefix-service-fds.txt"
@@ -102,6 +106,7 @@ done
 snapshot_backend after
 cmp "$EVIDENCE/before-processes.txt" "$EVIDENCE/after-processes.txt"
 cmp "$EVIDENCE/before-jails.txt" "$EVIDENCE/after-jails.txt"
+cmp "$EVIDENCE/before-cgroups.txt" "$EVIDENCE/after-cgroups.txt"
 BEFORE_FDS="$(<"$EVIDENCE/before-service-fds.txt")"
 AFTER_FDS="$(<"$EVIDENCE/after-service-fds.txt")"
 (( AFTER_FDS <= BEFORE_FDS + 2 ))

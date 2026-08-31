@@ -34,6 +34,7 @@ pub struct LinuxVmPlan {
     pub config_path: PathBuf,
     pub input_view: PathBuf,
     pub vsock_path: PathBuf,
+    pub cgroup_path: PathBuf,
     pub arguments: Vec<String>,
     config: FirecrackerConfig,
     vm_uid: u32,
@@ -116,15 +117,13 @@ pub fn build_plan(
         vsock_path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES,
         "Firecracker vsock path exceeds the host Unix socket limit"
     );
-    let memory_max = job
-        .limits
-        .memory_mib
-        .saturating_add(128)
-        .saturating_mul(1_048_576);
-    let cpu_quota = u64::from(job.limits.cpu_millis)
-        .saturating_mul(100_000)
-        .div_ceil(1_000);
-    let parent_cgroup = current_cgroup_parent()?;
+    let service_cgroup = current_service_cgroup()?;
+    let parent_cgroup = if service_cgroup.is_empty() {
+        id.clone()
+    } else {
+        format!("{service_cgroup}/{id}")
+    };
+    let cgroup_path = Path::new("/sys/fs/cgroup").join(&parent_cgroup);
     let arguments = vec![
         "--id".into(),
         id.clone(),
@@ -141,12 +140,6 @@ pub fn build_plan(
         "2".into(),
         "--parent-cgroup".into(),
         parent_cgroup,
-        "--cgroup".into(),
-        format!("pids.max={}", job.limits.pids.saturating_add(16)),
-        "--cgroup".into(),
-        format!("memory.max={memory_max}"),
-        "--cgroup".into(),
-        format!("cpu.max={cpu_quota} 100000"),
         "--resource-limit".into(),
         "no-file=256".into(),
         "--".into(),
@@ -204,6 +197,7 @@ pub fn build_plan(
         config_path,
         input_view,
         vsock_path,
+        cgroup_path,
         arguments,
         config,
         vm_uid,
@@ -211,13 +205,13 @@ pub fn build_plan(
     })
 }
 
-fn current_cgroup_parent() -> Result<String> {
+fn current_service_cgroup() -> Result<String> {
     let membership = fs::read_to_string("/proc/self/cgroup")
         .context("read runtime service cgroup membership")?;
-    parse_unified_cgroup_parent(&membership)
+    parse_unified_service_cgroup(&membership)
 }
 
-fn parse_unified_cgroup_parent(membership: &str) -> Result<String> {
+fn parse_unified_service_cgroup(membership: &str) -> Result<String> {
     let mut unified = membership.lines().filter_map(|line| {
         let mut fields = line.splitn(3, ':');
         match (fields.next(), fields.next(), fields.next()) {
@@ -243,7 +237,6 @@ fn parse_unified_cgroup_parent(membership: &str) -> Result<String> {
             _ => anyhow::bail!("runtime cgroup path is not normalized"),
         }
     }
-    components.push("reporch-vms");
     let parent = components.join("/");
     ensure!(
         parent.len() <= 240,
@@ -267,6 +260,7 @@ pub async fn execute(
         plan.chroot_base.clone(),
         plan.id.clone(),
         plan.firecracker.clone(),
+        plan.cgroup_path.clone(),
     );
     prepare_plan(&plan, bundle, toolchain, job, peer_spool)?;
     let mut child = launch_jailer(&plan)?;
@@ -356,7 +350,58 @@ fn prepare_plan(
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         chown(directory, plan.vm_uid, plan.vm_gid)?;
     }
+    prepare_job_cgroup(plan, job)?;
     Ok(())
+}
+
+fn prepare_job_cgroup(plan: &LinuxVmPlan, job: &GuestJobV1) -> Result<()> {
+    ensure!(
+        !plan.cgroup_path.exists(),
+        "runtime job cgroup already exists"
+    );
+    let parent = plan
+        .cgroup_path
+        .parent()
+        .context("runtime job cgroup has no parent")?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).context("inspect delegated runtime service cgroup")?;
+    ensure!(
+        parent_metadata.is_dir() && !parent_metadata.file_type().is_symlink(),
+        "runtime service cgroup is not a real directory"
+    );
+    fs::create_dir(&plan.cgroup_path).context("create delegated runtime job cgroup")?;
+    let memory_max = job
+        .limits
+        .memory_mib
+        .saturating_add(128)
+        .saturating_mul(1_048_576);
+    let cpu_quota = u64::from(job.limits.cpu_millis)
+        .saturating_mul(100_000)
+        .div_ceil(1_000);
+    write_cgroup_value(
+        &plan.cgroup_path,
+        "pids.max",
+        &job.limits.pids.saturating_add(16).to_string(),
+    )?;
+    write_cgroup_value(&plan.cgroup_path, "memory.max", &memory_max.to_string())?;
+    write_cgroup_value(&plan.cgroup_path, "cpu.max", &format!("{cpu_quota} 100000"))?;
+    Ok(())
+}
+
+fn write_cgroup_value(directory: &Path, name: &str, value: &str) -> Result<()> {
+    let path = directory.join(name);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect delegated cgroup control {name}"))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "delegated cgroup control is not a real file: {name}"
+    );
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open delegated cgroup control {name}"))?;
+    file.write_all(value.as_bytes())
+        .with_context(|| format!("write delegated cgroup control {name}"))
 }
 
 fn materialize_input_view(view: &Path, spool: &Path, job: &GuestJobV1) -> Result<()> {
@@ -728,7 +773,7 @@ fn required_non_root_id(name: &str) -> Result<u32> {
     Ok(value)
 }
 
-struct JobCleanup(PathBuf, String, PathBuf);
+struct JobCleanup(PathBuf, String, PathBuf, PathBuf);
 
 impl Drop for JobCleanup {
     fn drop(&mut self) {
@@ -736,6 +781,11 @@ impl Drop for JobCleanup {
             let path = self.0.join(name).join(&self.1);
             let _ = fs::remove_dir_all(path);
         }
+        let kill = self.3.join("cgroup.kill");
+        if kill.is_file() {
+            let _ = fs::write(kill, b"1");
+        }
+        let _ = fs::remove_dir(&self.3);
     }
 }
 
@@ -799,14 +849,11 @@ mod tests {
     #[test]
     fn firecracker_cgroups_stay_inside_the_service_delegation() {
         assert_eq!(
-            parse_unified_cgroup_parent("0::/system.slice/reporch-runtime.service\n").unwrap(),
-            "system.slice/reporch-runtime.service/reporch-vms"
+            parse_unified_service_cgroup("0::/system.slice/reporch-runtime.service\n").unwrap(),
+            "system.slice/reporch-runtime.service"
         );
-        assert_eq!(
-            parse_unified_cgroup_parent("0::/\n").unwrap(),
-            "reporch-vms"
-        );
-        assert!(parse_unified_cgroup_parent("2:cpu:/legacy\n").is_err());
-        assert!(parse_unified_cgroup_parent("0::/safe/../escape\n").is_err());
+        assert_eq!(parse_unified_service_cgroup("0::/\n").unwrap(), "");
+        assert!(parse_unified_service_cgroup("2:cpu:/legacy\n").is_err());
+        assert!(parse_unified_service_cgroup("0::/safe/../escape\n").is_err());
     }
 }
