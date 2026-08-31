@@ -308,7 +308,7 @@ mod tests {
             version: "1.0.0-rc.8".into(),
             minimum_os_version: "15.0".into(),
             base_url: Url::parse(
-                "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq10/",
+                "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq11/",
             )
             .unwrap(),
             artifact_directory: artifacts,

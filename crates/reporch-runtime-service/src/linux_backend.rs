@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,7 @@ const VSOCK_PORT: u32 = 7000;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 const VSOCK_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const BOOT_LOG_LIMIT_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug)]
 pub struct LinuxVmPlan {
@@ -228,8 +229,10 @@ pub async fn execute(
     let mut stream = match connect_guest(&plan.vsock_path).await {
         Ok(stream) => stream,
         Err(error) => {
+            let early_status = child.try_wait().ok().flatten();
             kill_process_tree(&mut child).await;
-            return Err(error);
+            let diagnostics = boot_failure_diagnostics(&plan, early_status.as_ref());
+            return Err(error).context(diagnostics);
         }
     };
     let result = exchange_with_guest(
@@ -555,16 +558,71 @@ fn ensure_root_owned_directory(path: &Path) -> Result<()> {
 }
 
 fn launch_jailer(plan: &LinuxVmPlan) -> Result<Child> {
+    let stdout = private_boot_log(&plan.jail_root.join("jailer.stdout.log"))?;
+    let stderr = private_boot_log(&plan.jail_root.join("jailer.stderr.log"))?;
     let mut command = Command::new(&plan.jailer);
     command
         .args(&plan.arguments)
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .kill_on_drop(true)
         .process_group(0);
     command.spawn().context("launch Firecracker jailer")
+}
+
+fn private_boot_log(path: &Path) -> Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create private runtime boot log {}", path.display()))?;
+    Ok(file)
+}
+
+fn boot_failure_diagnostics(
+    plan: &LinuxVmPlan,
+    early_status: Option<&std::process::ExitStatus>,
+) -> String {
+    let status = early_status
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "still running before forced cleanup".into());
+    let stderr = bounded_boot_log(&plan.jail_root.join("jailer.stderr.log"));
+    let stdout = bounded_boot_log(&plan.jail_root.join("jailer.stdout.log"));
+    format!("Firecracker jailer status: {status}; stderr: {stderr}; stdout: {stdout}")
+}
+
+fn bounded_boot_log(path: &Path) -> String {
+    let result = (|| -> Result<Vec<u8>> {
+        let mut file = fs::File::open(path)?;
+        let length = file.metadata()?.len();
+        if length > BOOT_LOG_LIMIT_BYTES {
+            file.seek(SeekFrom::Start(length - BOOT_LOG_LIMIT_BYTES))?;
+        }
+        let mut output = Vec::with_capacity(length.min(BOOT_LOG_LIMIT_BYTES) as usize);
+        file.take(BOOT_LOG_LIMIT_BYTES).read_to_end(&mut output)?;
+        Ok(output)
+    })();
+    match result {
+        Ok(bytes) if bytes.is_empty() => "<empty>".into(),
+        Ok(bytes) => String::from_utf8_lossy(&bytes)
+            .chars()
+            .map(|character| {
+                if character == '\n'
+                    || character == '\r'
+                    || character == '\t'
+                    || !character.is_control()
+                {
+                    character
+                } else {
+                    '\u{fffd}'
+                }
+            })
+            .collect(),
+        Err(error) => format!("<unavailable: {error}>"),
+    }
 }
 
 async fn connect_guest(path: &Path) -> Result<UnixStream> {
@@ -676,5 +734,21 @@ mod tests {
             .join(id)
             .join("root/run/v.sock");
         assert!(path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+    }
+
+    #[test]
+    fn boot_diagnostics_are_bounded_and_strip_control_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("boot.log");
+        let mut contents = vec![b'a'; BOOT_LOG_LIMIT_BYTES as usize + 32];
+        contents.extend_from_slice(b"tail\0\x07\n");
+        fs::write(&path, contents).unwrap();
+
+        let diagnostic = bounded_boot_log(&path);
+
+        assert!(diagnostic.len() <= BOOT_LOG_LIMIT_BYTES as usize + 8);
+        assert!(!diagnostic.contains('\0'));
+        assert!(!diagnostic.contains('\x07'));
+        assert!(diagnostic.ends_with("tail��\n"));
     }
 }
