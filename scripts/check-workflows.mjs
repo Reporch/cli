@@ -146,6 +146,7 @@ assert.doesNotMatch(
 );
 const publishedE2e = readFileSync(".github/workflows/published-artifact-e2e.yml", "utf8");
 const appleVmQualification = readFileSync(".github/workflows/apple-vm-qualification.yml", "utf8");
+const linuxVmQualificationScript = readFileSync("scripts/qualify-linux-vm.sh", "utf8");
 const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
 const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml", "utf8");
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates"/);
@@ -182,6 +183,21 @@ assert.match(
   appleVmQualification,
   /while \[ "\$attempt" -le 4 \][\s\S]*gh release download[\s\S]*attempt=\$\(\(attempt \+ 1\)\)/,
   "Apple VM qualification must retry bounded public release downloads"
+);
+assert.match(
+  appleVmQualification,
+  /grep -F "  \.\/\$name" "\$assets\/TOOLCHAIN-SHA256SUMS"/,
+  "Apple VM qualification must select the canonical ./-prefixed toolchain checksum paths"
+);
+assert.match(
+  linuxVmQualificationScript,
+  /sudo --non-interactive find "\/proc\/\$SERVICE_PID\/fd"/,
+  "Linux VM qualification must inspect the dedicated service descriptors without permission blind spots"
+);
+assert.match(
+  linuxVmQualificationScript,
+  /sudo --non-interactive find \/var\/lib\/reporch-runtime\/jailer/g,
+  "Linux VM qualification must inspect root-owned jail directories before and after execution"
 );
 assert.match(
   publishedE2e,

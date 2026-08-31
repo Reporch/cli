@@ -108,7 +108,7 @@ jobs:
           done
           : > "$assets/selected-toolchain-SHA256SUMS"
           for name in toolchains-v2-index.json toolchains-v2-index.json.minisig "$toolchain_archive"; do
-            grep -F "  $name" "$assets/TOOLCHAIN-SHA256SUMS" >> "$assets/selected-toolchain-SHA256SUMS"
+            grep -F "  ./$name" "$assets/TOOLCHAIN-SHA256SUMS" >> "$assets/selected-toolchain-SHA256SUMS"
           done
           test "$(wc -l < "$assets/selected-runtime-SHA256SUMS" | tr -d ' ')" = 4
           test "$(wc -l < "$assets/selected-toolchain-SHA256SUMS" | tr -d ' ')" = 3

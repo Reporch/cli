@@ -21,7 +21,7 @@ case "$(uname -m)" in
   aarch64|arm64) EXPECTED_TARGET=linux-arm64-gnu ;;
   *) echo "unsupported Linux qualification architecture: $(uname -m)" >&2; exit 2 ;;
 esac
-for command_name in find jq pgrep sha256sum stat systemctl; do
+for command_name in find jq pgrep sha256sum stat sudo systemctl; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "required command is unavailable: $command_name" >&2
     exit 2
@@ -52,12 +52,14 @@ snapshot_backend() {
     pgrep -x jailer || true
   } | sort -n -u > "$EVIDENCE/$prefix-processes.txt"
   if [[ -d /var/lib/reporch-runtime/jailer ]]; then
-    find /var/lib/reporch-runtime/jailer -type d -name 'reporch-*' -print \
+    sudo --non-interactive find /var/lib/reporch-runtime/jailer \
+      -type d -name 'reporch-*' -print \
       | sort > "$EVIDENCE/$prefix-jails.txt"
   else
     : > "$EVIDENCE/$prefix-jails.txt"
   fi
-  find "/proc/$SERVICE_PID/fd" -mindepth 1 -maxdepth 1 -print \
+  sudo --non-interactive find "/proc/$SERVICE_PID/fd" \
+    -mindepth 1 -maxdepth 1 -print \
     | wc -l | tr -d ' ' > "$EVIDENCE/$prefix-service-fds.txt"
 }
 
@@ -93,7 +95,7 @@ jq -e --arg target "$EXPECTED_TARGET" '
 
 for _ in $(seq 1 50); do
   current_processes="$(pgrep -x firecracker || true)$(pgrep -x jailer || true)"
-  current_jails="$(find /var/lib/reporch-runtime/jailer -type d -name 'reporch-*' -print 2>/dev/null || true)"
+  current_jails="$(sudo --non-interactive find /var/lib/reporch-runtime/jailer -type d -name 'reporch-*' -print 2>/dev/null || true)"
   [[ -z "$current_processes$current_jails" ]] && break
   sleep 0.1
 done
