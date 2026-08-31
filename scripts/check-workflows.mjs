@@ -153,6 +153,8 @@ assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runti
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
+assert.match(runtimeRelease, /--json isDraft,isPrerelease/);
+assert.match(runtimeRelease, /gh release edit "\$RUNTIME_TAG" --draft/);
 assert.match(toolchainRelease, /materialize-toolchain-sources\.sh/);
 assert.match(toolchainRelease, /syft[\s\S]*1\.51\.0/i);
 assert.match(toolchainRelease, /build-toolchain-release-resumable\.sh/);

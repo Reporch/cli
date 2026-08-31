@@ -102,11 +102,16 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$RUNTIME_TAG" >/dev/null 2>&1; then
-            test "$(gh release view "$RUNTIME_TAG" --json isDraft --jq .isDraft)" = true
-            gh release edit "$RUNTIME_TAG" --target "$GITHUB_SHA"
+            state=$(gh release view "$RUNTIME_TAG" --json isDraft,isPrerelease)
+            test "$(jq -r '.isDraft or .isPrerelease' <<<"$state")" = true
+            if [ "$(jq -r .isDraft <<<"$state")" != true ]; then
+              gh release edit "$RUNTIME_TAG" --draft
+            fi
+            gh release edit "$RUNTIME_TAG" --target "$GITHUB_SHA" \
+              --title "Reporch Runtime v1 sequence 9"
           else
             gh release create "$RUNTIME_TAG" --draft --target "$GITHUB_SHA" \
-              --title "Reporch Runtime v1" \
+              --title "Reporch Runtime v1 sequence 9" \
               --notes "Signed Docker-free Reporch VM runtime channel. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
           fi
           gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/runtime-release"/* --clobber
