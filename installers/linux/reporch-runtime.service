@@ -38,11 +38,11 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 SystemCallArchitectures=native
 DevicePolicy=closed
-DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/kvm rwm
 # Firecracker's jailer always materializes this exact character device before
 # dropping privileges, even when the VM config has no network interface. The
 # unprivileged VMM receives neither CAP_NET_ADMIN nor a configured NIC.
-DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/net/tun rwm
 ReadWritePaths=/var/lib/reporch-runtime /run/reporch-runtime /run/user
 
 [Install]

@@ -47,8 +47,8 @@ test("Linux package scripts define the dedicated VM identity and constrained bro
   assert.match(unit, /^ProtectControlGroups=no$/m);
   assert.doesNotMatch(unit, /^ProtectControlGroups=yes$/m);
   assert.match(unit, /^DevicePolicy=closed$/m);
-  assert.match(unit, /^DeviceAllow=\/dev\/kvm rw$/m);
-  assert.match(unit, /^DeviceAllow=\/dev\/net\/tun rw$/m);
+  assert.match(unit, /^DeviceAllow=\/dev\/kvm rwm$/m);
+  assert.match(unit, /^DeviceAllow=\/dev\/net\/tun rwm$/m);
   const postinstall = readFileSync("installers/linux/postinstall.sh", "utf8");
   assert.match(postinstall, /runtime_vm_user=reporch-runtime-vm/);
   assert.match(postinstall, /REPORCH_RUNTIME_VM_UID/);
