@@ -30,6 +30,10 @@ const HCS_OPERATION_TIMEOUT_MS: u32 = 15_000;
 const HCS_TERMINATE_TIMEOUT_MS: u32 = 5_000;
 const HVSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HCS_RESULT_CHARS: usize = 8 * 1024;
+// RuntimeId is part of the default compute-system properties returned by HCS.
+// It is not itself a valid PropertyType enum value, so requesting it by name
+// causes HCS to reject the whole property query.
+const HCS_DEFAULT_PROPERTIES_QUERY: &str = r#"{}"#;
 
 pub struct HcsVirtualMachine {
     system: HCS_SYSTEM,
@@ -87,7 +91,7 @@ impl HcsVirtualMachine {
             HcsGetComputeSystemProperties(
                 system,
                 operation.0,
-                &HSTRING::from(r#"{"PropertyTypes":["RuntimeId"]}"#),
+                &HSTRING::from(HCS_DEFAULT_PROPERTIES_QUERY),
             )
         }
         .context("HcsGetComputeSystemProperties")?;
@@ -413,6 +417,14 @@ fn parse_runtime_id(document: &str) -> Result<GUID> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_id_uses_the_default_hcs_property_query() {
+        let query: serde_json::Value =
+            serde_json::from_str(HCS_DEFAULT_PROPERTIES_QUERY).expect("valid HCS property query");
+        assert_eq!(query, serde_json::json!({}));
+        assert!(query.get("PropertyTypes").is_none());
+    }
 
     #[test]
     fn hcs_error_documents_are_bounded_and_sanitized() {
