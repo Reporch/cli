@@ -193,7 +193,13 @@ mod unix_service {
                 })
             }
             RuntimeServiceCommandV1::ValidateSpool { objects } => {
-                validate_peer_spool_directory(spool, peer_uid)?;
+                validate_peer_spool_for_objects(spool, peer_uid, objects)?;
+                if objects.is_empty() {
+                    return Ok(RuntimeServiceResultV1::SpoolValid {
+                        object_count: 0,
+                        total_bytes: 0,
+                    });
+                }
                 let objects = objects.clone();
                 let spool = spool.to_owned();
                 let (count, total) = tokio::time::timeout(
@@ -218,7 +224,7 @@ mod unix_service {
                     .acquire_owned()
                     .await
                     .context("runtime service job limiter closed")?;
-                validate_peer_spool_directory(spool, peer_uid)?;
+                validate_peer_spool_for_objects(spool, peer_uid, &job.inputs)?;
                 #[cfg(target_os = "linux")]
                 {
                     ensure_system_runtime_root()?;
@@ -487,6 +493,17 @@ mod unix_service {
         Ok(())
     }
 
+    fn validate_peer_spool_for_objects(
+        path: &Path,
+        peer_uid: u32,
+        objects: &[reporch_runtime_protocol::ContentObjectV1],
+    ) -> Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        validate_peer_spool_directory(path, peer_uid)
+    }
+
     fn prepare_private_directory(path: &Path) -> Result<()> {
         fs::create_dir_all(path)
             .with_context(|| format!("create private runtime directory {}", path.display()))?;
@@ -590,6 +607,12 @@ mod unix_service {
             };
             assert!(verify_spool(root.path(), &[object]).is_err());
         }
+
+        #[test]
+        fn empty_jobs_do_not_require_a_peer_spool_directory() {
+            let missing = tempfile::tempdir().unwrap().path().join("missing-spool");
+            validate_peer_spool_for_objects(&missing, 1234, &[]).unwrap();
+        }
     }
 }
 
@@ -613,6 +636,7 @@ fn main() {
 #[cfg(windows)]
 mod windows_entry {
     use std::ffi::OsString;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use ::windows_service::define_windows_service;
@@ -633,7 +657,10 @@ mod windows_entry {
     }
 
     fn service_main(_arguments: Vec<OsString>) {
-        let _ = run_service();
+        clear_service_failure();
+        if let Err(error) = run_service() {
+            persist_service_failure(&error);
+        }
     }
 
     fn run_service() -> ::windows_service::Result<()> {
@@ -668,6 +695,34 @@ mod windows_entry {
         let exit_code = u32::from(result.is_err());
         status_handle.set_service_status(status(ServiceState::Stopped, false, exit_code))?;
         result
+    }
+
+    fn service_failure_path() -> Option<PathBuf> {
+        std::env::var_os("PROGRAMDATA").map(|root| {
+            PathBuf::from(root)
+                .join("Reporch")
+                .join("Runtime")
+                .join("last-service-error.txt")
+        })
+    }
+
+    fn clear_service_failure() {
+        if let Some(path) = service_failure_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn persist_service_failure(error: &::windows_service::Error) {
+        let Some(path) = service_failure_path() else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(parent);
+        let mut message: String = format!("{error:#}").chars().take(8_192).collect();
+        message.push('\n');
+        let _ = std::fs::write(path, message);
     }
 
     async fn bootstrap_system_runtime_seed() -> anyhow::Result<()> {
@@ -706,7 +761,11 @@ mod windows_entry {
             } else {
                 ServiceControlAccept::empty()
             },
-            exit_code: ServiceExitCode::Win32(exit_code),
+            exit_code: if exit_code == 0 {
+                ServiceExitCode::Win32(0)
+            } else {
+                ServiceExitCode::ServiceSpecific(exit_code)
+            },
             checkpoint: 0,
             wait_hint: Duration::ZERO,
             process_id: None,

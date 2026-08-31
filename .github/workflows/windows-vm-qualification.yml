@@ -83,6 +83,10 @@ jobs:
               Where-Object ProviderName -eq 'Service Control Manager' |
               Select-Object -First 100 TimeCreated, Id, LevelDisplayName, Message |
               Format-List | Out-File (Join-Path $evidence "service-events.txt")
+            $serviceError = Join-Path $env:ProgramData "Reporch\Runtime\last-service-error.txt"
+            if (Test-Path $serviceError -PathType Leaf) {
+              Copy-Item -LiteralPath $serviceError -Destination (Join-Path $evidence "last-service-error.txt")
+            }
             throw "ReporchRuntime service is not running"
           }
       - name: Boot, execute, and clean up 100 HCS VMs
