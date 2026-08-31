@@ -1,0 +1,121 @@
+name: Finalize RC8 VM toolchains
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: read
+
+concurrency:
+  group: release-toolchains-v2
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: github.repository == 'Reporch/cli' && github.ref == 'refs/heads/main' && github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
+    runs-on: [self-hosted, macOS, ARM64, cli-zero-cost, cli-macos-arm64]
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TOOLCHAIN_TAG: reporch-toolchains-v2-seq8
+      SOURCE_SHA: 93f01828b1afc0a2b01e9e600f241adb662245fd
+      RELEASE_ID: "379490942"
+      EXPECTED_ASSET_COUNT: "149"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: 93f01828b1afc0a2b01e9e600f241adb662245fd
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 2026-08-11
+        with:
+          toolchain: 1.96.0
+      - name: Verify the fixed draft release boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          release="$RUNNER_TEMP/toolchain-release.json"
+          gh api "repos/$GH_REPO/releases/$RELEASE_ID" > "$release"
+          jq -e --arg tag "$TOOLCHAIN_TAG" --arg source "$SOURCE_SHA" \
+            --argjson count "$EXPECTED_ASSET_COUNT" '
+              .tag_name == $tag
+              and .draft
+              and (.prerelease | not)
+              and .target_commitish == $source
+              and (.assets | length) == $count
+              and ([.assets[].name] | unique | length) == $count
+              and ([.assets[] | select(.state != "uploaded")] | length) == 0
+            ' "$release" >/dev/null
+      - name: Download and verify every immutable asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          verification="$RUNNER_TEMP/toolchain-release-verification"
+          mkdir "$verification"
+          completed=false
+          for attempt in 1 2 3 4 5; do
+            if gh release download "$TOOLCHAIN_TAG" --dir "$verification" --skip-existing; then
+              completed=true
+              break
+            fi
+            sleep "$((attempt * 15))"
+          done
+          test "$completed" = true
+          test "$(find "$verification" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = \
+            "$EXPECTED_ASSET_COUNT"
+          (cd "$verification" && shasum -a 256 --check TOOLCHAIN-SHA256SUMS)
+
+          encoded_signature=$(base64 < "$verification/toolchains-v2-index.json.minisig" | tr -d '\r\n')
+          encoded_key=$(base64 < artifacts/runtime-v1.minisign.pub | tr -d '\r\n')
+          cargo run --locked -p reporch-cli -- artifact verify-minisign \
+            --artifact "$verification/toolchains-v2-index.json" \
+            --signature "$encoded_signature" --public-key "$encoded_key"
+
+          while read -r _ asset; do
+            gh attestation verify "$verification/$asset" --repo "$GH_REPO" >/dev/null
+          done < "$verification/TOOLCHAIN-SHA256SUMS"
+          gh attestation verify "$verification/TOOLCHAIN-SHA256SUMS" \
+            --repo "$GH_REPO" >/dev/null
+      - name: Publish the verified immutable prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$TOOLCHAIN_TAG" --draft=false --prerelease
+          release="$RUNNER_TEMP/published-toolchain-release.json"
+          gh api "repos/$GH_REPO/releases/tags/$TOOLCHAIN_TAG" > "$release"
+          jq -e --arg source "$SOURCE_SHA" --argjson count "$EXPECTED_ASSET_COUNT" '
+            (.draft | not)
+            and .prerelease
+            and .immutable
+            and .target_commitish == $source
+            and (.assets | length) == $count
+            and ([.assets[] | select(.state != "uploaded")] | length) == 0
+          ' "$release" >/dev/null
+      - name: Fetch through the public updater without Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          export REPORCH_RUNTIME_HOME="$RUNNER_TEMP/public-toolchain-runtime"
+          export REPORCH_TOOLCHAIN_CHANNEL_URL="https://github.com/Reporch/cli/releases/download/$TOOLCHAIN_TAG"
+          unset DOCKER_HOST CONTAINER_HOST
+          cargo build --locked --release -p reporch-cli
+          target/release/reporch --format json toolchain prefetch bash-5.3 \
+            > "$RUNNER_TEMP/toolchain-prefetch.json"
+          jq -e '.schema == "reporch.cli-result.v1"' "$RUNNER_TEMP/toolchain-prefetch.json"
+          test -f "$REPORCH_RUNTIME_HOME/toolchains/installed/bash-5.3.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rc8-toolchain-finalization-evidence
+          path: |
+            ${{ runner.temp }}/toolchain-release-verification/TOOLCHAIN-SHA256SUMS
+            ${{ runner.temp }}/toolchain-release-verification/toolchains-v2-index.json
+            ${{ runner.temp }}/toolchain-release-verification/toolchains-v2-index.json.minisig
+            ${{ runner.temp }}/toolchain-release-verification/toolchain-reproducibility.json
+            ${{ runner.temp }}/published-toolchain-release.json
+            ${{ runner.temp }}/toolchain-prefetch.json
+          if-no-files-found: error
+          retention-days: 90
