@@ -47,6 +47,9 @@ test("Linux package scripts define the dedicated VM identity and constrained bro
   assert.match(postinstall, /runtime_vm_user=reporch-runtime-vm/);
   assert.match(postinstall, /REPORCH_RUNTIME_VM_UID/);
   assert.match(postinstall, /REPORCH_RUNTIME_VM_GID/);
+  assert.match(postinstall, /while \[ ! -S "\$runtime_socket" \]/);
+  assert.match(postinstall, /runtime service did not become ready within 30 seconds/);
+  assert.match(postinstall, /setfacl -m "u:\$\{install_user\}:rw" "\$runtime_socket"/);
   assert.match(postinstall, /setfacl -R -m "u:\$\{install_user\}:r-X" \/var\/lib\/reporch-runtime/);
   assert.match(postinstall, /find \/var\/lib\/reporch-runtime -xdev -type d/);
   assert.match(postinstall, /"d:u:\$\{install_user\}:r-X"/);
