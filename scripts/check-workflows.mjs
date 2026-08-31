@@ -184,6 +184,11 @@ assert.match(
   "Apple VM qualification must retry bounded public release downloads"
 );
 assert.match(
+  appleVmQualification,
+  /grep -F "  \.\/\$name" "\$assets\/TOOLCHAIN-SHA256SUMS"/,
+  "Apple VM qualification must select the canonical ./-prefixed toolchain checksum paths"
+);
+assert.match(
   publishedE2e,
   /if \[ "\$RUNNER_OS" = macOS \]; then\s+\(cd "\$assets" && printf '%s\\n' "\$checksum" \| shasum -a 256 --check\)/,
   "published macOS qualification must use the native shasum verifier"
