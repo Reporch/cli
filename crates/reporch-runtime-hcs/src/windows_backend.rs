@@ -29,6 +29,7 @@ use super::{HcsVmConfigV1, hyperv_vsock_service_id};
 const HCS_OPERATION_TIMEOUT_MS: u32 = 15_000;
 const HCS_TERMINATE_TIMEOUT_MS: u32 = 5_000;
 const HVSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HCS_RESULT_CHARS: usize = 8 * 1024;
 
 pub struct HcsVirtualMachine {
     system: HCS_SYSTEM,
@@ -172,16 +173,14 @@ impl Operation {
     }
 
     fn wait(&self, timeout_ms: u32) -> Result<()> {
-        match unsafe { HcsWaitForOperationResult(self.0, timeout_ms, None) } {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let _ = unsafe { HcsCancelOperation(self.0) };
-                Err(error.into())
-            }
-        }
+        self.wait_result(timeout_ms).map(|_| ())
     }
 
     fn wait_document(&self, timeout_ms: u32) -> Result<Option<String>> {
+        self.wait_result(timeout_ms)
+    }
+
+    fn wait_result(&self, timeout_ms: u32) -> Result<Option<String>> {
         let mut document = PWSTR::null();
         match unsafe { HcsWaitForOperationResult(self.0, timeout_ms, Some(&mut document)) } {
             Ok(()) if document.is_null() => Ok(None),
@@ -191,10 +190,37 @@ impl Operation {
             }
             Err(error) => {
                 let _ = unsafe { HcsCancelOperation(self.0) };
-                Err(error.into())
+                let detail = if document.is_null() {
+                    None
+                } else {
+                    let guard = LocalString(document);
+                    unsafe { guard.0.to_string() }
+                        .ok()
+                        .map(|value| bounded_hcs_result(&value))
+                };
+                match detail {
+                    Some(detail) if !detail.is_empty() => {
+                        Err(anyhow::anyhow!("{error}; HCS result: {detail}"))
+                    }
+                    _ => Err(error.into()),
+                }
             }
         }
     }
+}
+
+fn bounded_hcs_result(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .take(MAX_HCS_RESULT_CHARS)
+        .collect()
 }
 
 impl Drop for Operation {
@@ -382,4 +408,18 @@ fn parse_runtime_id(document: &str) -> Result<GUID> {
         .and_then(serde_json::Value::as_str)
         .context("HCS runtime properties omitted RuntimeId")?;
     GUID::try_from(runtime_id).context("parse HCS RuntimeId")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hcs_error_documents_are_bounded_and_sanitized() {
+        let input = format!("prefix\0{}tail", "x".repeat(MAX_HCS_RESULT_CHARS + 32));
+        let output = bounded_hcs_result(&input);
+        assert_eq!(output.chars().count(), MAX_HCS_RESULT_CHARS);
+        assert!(!output.contains('\0'));
+        assert!(output.starts_with("prefix�"));
+    }
 }

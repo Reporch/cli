@@ -50,8 +50,8 @@ Assert-True ($status.data.target -eq "windows-x64-msvc" -and $status.data.backen
 Assert-True ($status.data.availability -eq "ready" -and $status.data.virtualization_available -and $status.data.service_available) "Windows native runtime is not ready"
 
 $qualificationText = & $binary --format json runtime qualification --iterations 100 --toolchain bash-5.3 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) { throw "runtime qualification failed: $qualificationText" }
 $qualificationText | Set-Content -LiteralPath (Join-Path $evidence "qualification.json") -Encoding utf8NoBOM
+if ($LASTEXITCODE -ne 0) { throw "runtime qualification failed: $qualificationText" }
 $qualification = $qualificationText | ConvertFrom-Json
 Assert-True ($qualification.schema -eq "reporch.cli-result.v1" -and $qualification.command -eq "runtime qualification") "runtime qualification envelope is invalid"
 $result = $qualification.data
