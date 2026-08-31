@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -18,6 +19,7 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
 const VSOCK_PORT: u32 = 7000;
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 const VSOCK_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -104,11 +106,15 @@ pub fn build_plan(
         .file_name()
         .and_then(|value| value.to_str())
         .context("Firecracker artifact name is not UTF-8")?;
-    let id = format!("reporch-{}", job.id.simple());
+    let id = format!("rp-{}", job.id.simple());
     let jail_root = chroot_base.join(firecracker_name).join(&id).join("root");
     let config_path = jail_root.join("vm-config.json");
     let input_view = jail_root.join("input-view");
-    let vsock_path = jail_root.join("run/reporch-vsock.sock");
+    let vsock_path = jail_root.join("run/v.sock");
+    ensure!(
+        vsock_path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES,
+        "Firecracker vsock path exceeds the host Unix socket limit"
+    );
     let memory_max = job
         .limits
         .memory_mib
@@ -178,7 +184,7 @@ pub fn build_plan(
         },
         vsock: Vsock {
             guest_cid,
-            uds_path: "/run/reporch-vsock.sock",
+            uds_path: "/run/v.sock",
         },
     };
     ensure!(
@@ -652,7 +658,7 @@ mod tests {
             },
             vsock: Vsock {
                 guest_cid: 3,
-                uds_path: "/run/reporch-vsock.sock",
+                uds_path: "/run/v.sock",
             },
         };
         let value = serde_json::to_value(config).unwrap();
@@ -660,5 +666,15 @@ mod tests {
         assert_eq!(value["drives"].as_array().unwrap().len(), 0);
         assert_eq!(value["boot-source"]["initrd_path"], "/rootfs.cpio");
         assert_eq!(value["machine-config"]["smt"], false);
+    }
+
+    #[test]
+    fn installed_jail_vsock_path_fits_the_unix_socket_limit() {
+        let id = format!("rp-{}", uuid::Uuid::nil().simple());
+        let path = Path::new("/var/lib/reporch-runtime/jailer")
+            .join("firecracker")
+            .join(id)
+            .join("root/run/v.sock");
+        assert!(path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
     }
 }

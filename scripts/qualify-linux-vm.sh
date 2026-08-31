@@ -53,7 +53,7 @@ snapshot_backend() {
   } | sort -n -u > "$EVIDENCE/$prefix-processes.txt"
   if [[ -d /var/lib/reporch-runtime/jailer ]]; then
     sudo --non-interactive find /var/lib/reporch-runtime/jailer \
-      -type d -name 'reporch-*' -print \
+      -type d -name 'rp-*' -print \
       | sort > "$EVIDENCE/$prefix-jails.txt"
   else
     : > "$EVIDENCE/$prefix-jails.txt"
@@ -95,7 +95,7 @@ jq -e --arg target "$EXPECTED_TARGET" '
 
 for _ in $(seq 1 50); do
   current_processes="$(pgrep -x firecracker || true)$(pgrep -x jailer || true)"
-  current_jails="$(sudo --non-interactive find /var/lib/reporch-runtime/jailer -type d -name 'reporch-*' -print 2>/dev/null || true)"
+  current_jails="$(sudo --non-interactive find /var/lib/reporch-runtime/jailer -type d -name 'rp-*' -print 2>/dev/null || true)"
   [[ -z "$current_processes$current_jails" ]] && break
   sleep 0.1
 done

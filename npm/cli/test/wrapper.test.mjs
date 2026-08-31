@@ -72,7 +72,7 @@ function runtimePayloadEntries(binaryContents, target = "linux-x64-gnu") {
   const manifest = Buffer.from(
     `${JSON.stringify({
       schema: "reporch.runtime-bundle-manifest.v1",
-      sequence: 9,
+      sequence: 10,
       version: "1.0.0-rc.8",
       target,
       backend: "firecracker",
@@ -86,14 +86,14 @@ function runtimePayloadEntries(binaryContents, target = "linux-x64-gnu") {
     })}\n`
   );
   const manifestDigest = digest(manifest);
-  const bundle = `package/bin/runtime/${target}/bundles/9-1.0.0-rc.8`;
+  const bundle = `package/bin/runtime/${target}/bundles/10-1.0.0-rc.8`;
   return [
     { path: "package/bin/reporch", contents: binaryContents, mode: 0o755 },
     {
       path: `package/bin/runtime/${target}/current.json`,
       contents: Buffer.from(`${JSON.stringify({
         schema: "reporch.runtime-installation.v1",
-        sequence: 9,
+        sequence: 10,
         version: "1.0.0-rc.8",
         target,
         bundle_sha256: manifestDigest,
