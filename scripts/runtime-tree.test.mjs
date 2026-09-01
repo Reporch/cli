@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { assertRuntimeInstallTree, copyRuntimeInstallTree } from "./release-lib.mjs";
+import {
+  assertRuntimeInstallTree,
+  copyRuntimeInstallTree,
+  restoreTransferredRuntimePermissions
+} from "./release-lib.mjs";
 import { createRuntimeTreeFixture } from "./runtime-tree-fixture.mjs";
 
 test("runtime release trees are target and digest bound", () => {
@@ -36,6 +48,32 @@ test("runtime release trees never accept symlink artifacts", { skip: process.pla
     writeFileSync(join(root, "outside"), "kernel linux-x64-gnu\n");
     symlinkSync(join(root, "outside"), artifact);
     assert.throws(() => assertRuntimeInstallTree(source, "linux-x64-gnu"), /regular file/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("verified runtime trees recover permissions lost during artifact transfer", {
+  skip: process.platform === "win32"
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "reporch-runtime-tree-permissions-"));
+  try {
+    const source = createRuntimeTreeFixture(join(root, "source"), "linux-x64-gnu");
+    const artifact = join(source, "bundles/23-1.0.0-rc.8/vmlinux");
+    chmodSync(artifact, 0o644);
+    assert.throws(() => assertRuntimeInstallTree(source, "linux-x64-gnu"), /read-only/);
+
+    restoreTransferredRuntimePermissions(source, "linux-x64-gnu");
+    assert.equal(lstatSync(artifact).mode & 0o222, 0);
+    assertRuntimeInstallTree(source, "linux-x64-gnu");
+
+    chmodSync(artifact, 0o644);
+    writeFileSync(artifact, Buffer.concat([readFileSync(artifact), Buffer.from("changed")]));
+    assert.throws(
+      () => restoreTransferredRuntimePermissions(source, "linux-x64-gnu"),
+      /size|hash/
+    );
+    assert.notEqual(lstatSync(artifact).mode & 0o222, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
