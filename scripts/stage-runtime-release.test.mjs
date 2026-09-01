@@ -44,7 +44,7 @@ function fixture(root) {
       writeFileSync(join(directory, file), bytes);
       writeFileSync(join(directory, `${file}.spdx.json`), "{}\n");
       writeFileSync(join(directory, `${file}.intoto.jsonl`), "{}\n");
-      const prefix = `https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq19/runtime-${target}-${file}`;
+      const prefix = `https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq20/runtime-${target}-${file}`;
       return {
         kind,
         file_name: file,
@@ -60,7 +60,7 @@ function fixture(root) {
       join(manifests, name),
       `${JSON.stringify({
         schema: "reporch.runtime-bundle-manifest.v1",
-        sequence: 19,
+        sequence: 20,
         version: "1.0.0-rc.8",
         target,
         artifacts: manifestArtifacts

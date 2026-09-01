@@ -812,7 +812,7 @@ fn bounded_boot_log(path: &Path) -> String {
     }
 }
 
-async fn connect_guest(path: &Path) -> Result<UnixStream> {
+async fn connect_guest(path: &Path) -> Result<BufReader<UnixStream>> {
     let deadline = Instant::now() + BOOT_TIMEOUT;
     let mut last_error = "Firecracker vsock backend was not ready".to_owned();
     loop {
@@ -835,7 +835,7 @@ async fn connect_guest(path: &Path) -> Result<UnixStream> {
     }
 }
 
-async fn connect_guest_once(path: &Path) -> Result<UnixStream> {
+async fn connect_guest_once(path: &Path) -> Result<BufReader<UnixStream>> {
     let mut stream = UnixStream::connect(path)
         .await
         .context("connect to Firecracker vsock backend")?;
@@ -857,7 +857,10 @@ async fn connect_guest_once(path: &Path) -> Result<UnixStream> {
             && acknowledgement.len() <= VSOCK_ACK_MAX_BYTES,
         "Firecracker rejected the guest vsock connection"
     );
-    Ok(reader.into_inner())
+    // Firecracker may return the proxy acknowledgement and bytes from the
+    // guest's handshake in the same socket read. Keep the BufReader alive so
+    // bytes read ahead of the acknowledgement are not discarded.
+    Ok(reader)
 }
 
 async fn kill_process_tree(child: &mut Child) {
@@ -915,7 +918,7 @@ mod tests {
         let path = directory.path().join("v.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
-            for acknowledgement in [b"ERR 111\n".as_slice(), b"OK 7000\n".as_slice()] {
+            for acknowledgement in [b"ERR 111\n".as_slice(), b"OK 7000\nhello".as_slice()] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(stream);
                 let mut request = String::new();
@@ -925,7 +928,10 @@ mod tests {
             }
         });
 
-        let stream = connect_guest(&path).await.unwrap();
+        let mut stream = connect_guest(&path).await.unwrap();
+        let mut guest_bytes = [0_u8; 5];
+        stream.read_exact(&mut guest_bytes).await.unwrap();
+        assert_eq!(&guest_bytes, b"hello");
         drop(stream);
         server.await.unwrap();
     }

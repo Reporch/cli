@@ -36,6 +36,8 @@ use windows::core::{BOOL, HSTRING, PWSTR};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const HCS_GUEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const HCS_GUEST_HANDSHAKE_ATTEMPTS: usize = 8;
 const MAX_CONNECTIONS: usize = 16;
 const MAX_RUNNING_JOBS: usize = 1;
 
@@ -403,13 +405,39 @@ fn execute_hcs_job(
     }
     let io_timeout =
         Duration::from_millis(job.limits.timeout_ms).saturating_add(Duration::from_secs(5));
-    let mut stream = vm.connect(io_timeout)?;
-    let result = reporch_runtime_host::exchange_with_guest_sync_challenged(
-        &mut stream,
-        &input_view,
-        job,
-        &bundle.installation.bundle_sha256,
-    );
+    let mut stream = None;
+    let mut last_handshake_error = None;
+    for attempt in 1..=HCS_GUEST_HANDSHAKE_ATTEMPTS {
+        let mut candidate = vm.connect(HCS_GUEST_HANDSHAKE_TIMEOUT)?;
+        match reporch_runtime_host::establish_guest_session_sync_challenged(
+            &mut candidate,
+            job,
+            &bundle.installation.bundle_sha256,
+        ) {
+            Ok(()) => {
+                candidate.set_io_timeout(io_timeout)?;
+                stream = Some(candidate);
+                break;
+            }
+            Err(error) if attempt < HCS_GUEST_HANDSHAKE_ATTEMPTS => {
+                last_handshake_error = Some(format!("{error:#}"));
+                drop(candidate);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(error).context(format!(
+                    "authenticate HCS guest after {HCS_GUEST_HANDSHAKE_ATTEMPTS} attempts"
+                ));
+            }
+        }
+    }
+    let mut stream = stream.with_context(|| {
+        format!(
+            "authenticate HCS guest: {}",
+            last_handshake_error.as_deref().unwrap_or("no handshake")
+        )
+    })?;
+    let result = reporch_runtime_host::exchange_job_with_guest_sync(&mut stream, &input_view, job);
     drop(stream);
     let cleanup = vm.terminate();
     match (result, cleanup) {

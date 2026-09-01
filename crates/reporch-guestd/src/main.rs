@@ -427,22 +427,41 @@ async fn run_vsock(nonce: String, bundle_digest: String, host_challenge: bool) -
 
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, GUEST_VSOCK_PORT))
         .context("bind guest vsock listener")?;
-    let (stream, _) = listener
-        .accept()
-        .await
-        .context("accept host vsock session")?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (nonce, bundle_digest) = if host_challenge {
-        let challenge = match read_wire_message(&mut reader).await? {
-            WireMessageV1::HostChallenge(challenge) => challenge,
-            _ => bail!("guest expected a host challenge before its handshake"),
+    if !host_challenge {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("accept host vsock session")?;
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        return run_session(&mut reader, &mut writer, nonce, bundle_digest).await;
+    }
+
+    // HCS may expose a transient connection while the Hyper-V guest listener
+    // is becoming ready. Accept a bounded number of pre-authentication
+    // disconnects, but never retry after a valid challenge and handshake have
+    // allowed the host to send executable job content.
+    const HCS_HANDSHAKE_ATTEMPTS: usize = 8;
+    for _ in 0..HCS_HANDSHAKE_ATTEMPTS {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("accept challenged host vsock session")?;
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let challenge = match read_wire_message(&mut reader).await {
+            Ok(WireMessageV1::HostChallenge(challenge)) if challenge.validate().is_ok() => {
+                challenge
+            }
+            _ => continue,
         };
-        challenge.validate()?;
-        (challenge.nonce, challenge.runtime_bundle_digest)
-    } else {
-        (nonce, bundle_digest)
-    };
-    run_session(&mut reader, &mut writer, nonce, bundle_digest).await
+        return run_session(
+            &mut reader,
+            &mut writer,
+            challenge.nonce,
+            challenge.runtime_bundle_digest,
+        )
+        .await;
+    }
+    bail!("guest did not receive a valid host challenge")
 }
 
 async fn run_session(
