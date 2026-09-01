@@ -7,7 +7,7 @@ function digest(bytes) {
 }
 
 export function createRuntimeTreeFixture(root, target, version = "1.0.0-rc.8") {
-  const sequence = 18;
+  const sequence = 19;
   const bundle = join(root, "bundles", `${sequence}-${version}`);
   mkdirSync(bundle, { recursive: true });
   const definitions = [

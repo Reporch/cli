@@ -14,7 +14,7 @@ use reporch_runtime_host::{
 use reporch_runtime_protocol::{GuestJobV1, GuestResultV1};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
@@ -22,6 +22,7 @@ const VSOCK_PORT: u32 = 7000;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 const VSOCK_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const VSOCK_ACK_MAX_BYTES: usize = 64;
 const BOOT_LOG_LIMIT_BYTES: u64 = 16 * 1024;
 const BROKER_CGROUP: &str = "broker";
 const REQUIRED_CGROUP_CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
@@ -813,29 +814,47 @@ fn bounded_boot_log(path: &Path) -> String {
 
 async fn connect_guest(path: &Path) -> Result<UnixStream> {
     let deadline = Instant::now() + BOOT_TIMEOUT;
-    let mut stream = loop {
-        match UnixStream::connect(path).await {
-            Ok(stream) => break stream,
-            Err(error) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                let _ = error;
-            }
-            Err(error) => return Err(error).context("connect to Firecracker vsock backend"),
+    let mut last_error = "Firecracker vsock backend was not ready".to_owned();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("connect to Firecracker guest vsock: {last_error}");
         }
-    };
+        match tokio::time::timeout(remaining.min(VSOCK_ACK_TIMEOUT), connect_guest_once(path)).await
+        {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => {
+                last_error = format!("{error:#}").chars().take(256).collect();
+            }
+            Err(_) => last_error = "Firecracker vsock acknowledgement timed out".into(),
+        }
+        tokio::time::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
+}
+
+async fn connect_guest_once(path: &Path) -> Result<UnixStream> {
+    let mut stream = UnixStream::connect(path)
+        .await
+        .context("connect to Firecracker vsock backend")?;
     stream
         .write_all(format!("CONNECT {VSOCK_PORT}\n").as_bytes())
         .await
         .context("request Firecracker guest vsock connection")?;
     let mut reader = BufReader::new(stream);
-    let mut acknowledgement = String::new();
-    tokio::time::timeout(VSOCK_ACK_TIMEOUT, reader.read_line(&mut acknowledgement))
+    let mut acknowledgement = String::with_capacity(VSOCK_ACK_MAX_BYTES);
+    let read = (&mut reader)
+        .take(u64::try_from(VSOCK_ACK_MAX_BYTES + 1)?)
+        .read_line(&mut acknowledgement)
         .await
-        .context("Firecracker vsock acknowledgement timed out")??;
+        .context("read Firecracker vsock acknowledgement")?;
+    ensure!(read > 0, "Firecracker closed the vsock connection");
     ensure!(
         acknowledgement.starts_with("OK ")
             && acknowledgement.ends_with('\n')
-            && acknowledgement.len() <= 64,
+            && acknowledgement.len() <= VSOCK_ACK_MAX_BYTES,
         "Firecracker rejected the guest vsock connection"
     );
     Ok(reader.into_inner())
@@ -889,6 +908,45 @@ impl Drop for JobCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn firecracker_vsock_connect_retries_until_the_guest_listener_is_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            for acknowledgement in [b"ERR 111\n".as_slice(), b"OK 7000\n".as_slice()] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                assert_eq!(request, "CONNECT 7000\n");
+                reader.get_mut().write_all(acknowledgement).await.unwrap();
+            }
+        });
+
+        let stream = connect_guest(&path).await.unwrap();
+        drop(stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn firecracker_vsock_acknowledgements_are_strictly_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(&vec![b'x'; VSOCK_ACK_MAX_BYTES + 1])
+                .await
+                .unwrap();
+        });
+
+        let error = connect_guest_once(&path).await.unwrap_err();
+        assert!(error.to_string().contains("rejected"));
+        server.await.unwrap();
+    }
 
     #[test]
     fn config_serialization_has_no_network_and_all_drives_are_read_only() {

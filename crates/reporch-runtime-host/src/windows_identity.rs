@@ -17,8 +17,8 @@ use windows::Win32::System::Services::{
 };
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
-    IsProcessorFeaturePresent, OpenProcess, OpenProcessToken, PF_VIRT_FIRMWARE_ENABLED,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
 use windows::core::{PWSTR, w};
 
@@ -42,9 +42,11 @@ pub(crate) fn hyper_v_available() -> bool {
 }
 
 fn hyper_v_available_inner() -> Result<bool> {
-    if !unsafe { IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED) }.as_bool() {
-        return Ok(false);
-    }
+    // PF_VIRT_FIRMWARE_ENABLED reports whether firmware virtualization is
+    // exposed to this Windows instance. It may be false inside a Hyper-V VM
+    // even while the host hypervisor and HCS are available. HCS is the
+    // capability this runtime actually requires, so probe its service
+    // directly instead of rejecting supported nested hosts early.
     let manager = OwnedServiceHandle(unsafe {
         OpenSCManagerW(None, None, SC_MANAGER_CONNECT).context("open Windows service manager")?
     });

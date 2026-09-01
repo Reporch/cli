@@ -9,7 +9,7 @@ permissions:
   attestations: write
 
 concurrency:
-  group: release-runtime-v1-seq18
+  group: release-runtime-v1-seq19
   cancel-in-progress: false
 
 jobs:
@@ -20,9 +20,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RUNTIME_SEQUENCE: "18"
+      RUNTIME_SEQUENCE: "19"
       RUNTIME_VERSION: 1.0.0-rc.8
-      RUNTIME_TAG: reporch-runtime-v1-seq18
+      RUNTIME_TAG: reporch-runtime-v1-seq19
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -117,8 +117,8 @@ jobs:
             exit 1
           fi
           gh release create "$RUNTIME_TAG" --draft --target "$GITHUB_SHA" \
-            --title "Reporch Runtime v1 sequence 18" \
-            --notes "Signed Docker-free Reporch VM runtime sequence 18. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
+            --title "Reporch Runtime v1 sequence 19" \
+            --notes "Signed Docker-free Reporch VM runtime sequence 19. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
           gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/runtime-release"/*
           mkdir "$RUNNER_TEMP/runtime-release-download"
           gh release download "$RUNTIME_TAG" --dir "$RUNNER_TEMP/runtime-release-download"
