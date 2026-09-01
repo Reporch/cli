@@ -3,7 +3,7 @@
 use std::fs;
 use std::future::Future;
 use std::io::{BufReader, Read as _, Write as _};
-use std::os::windows::io::AsRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle as ProcessHandle};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,8 +21,7 @@ use reporch_runtime_protocol::{
 use sha2::{Digest, Sha256};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL,
-    LocalFree, WIN32_ERROR,
+    CloseHandle, HANDLE, HLOCAL, LocalFree, WAIT_EVENT, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -32,8 +31,10 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES, SetFileSecurityW, TOKEN_QUERY,
     TOKEN_USER, TokenUser,
 };
-use windows::Win32::System::Pipes::{ImpersonateNamedPipeClient, PeekNamedPipe};
-use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, OpenProcess, OpenThreadToken, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
 use windows::core::{BOOL, HSTRING, PWSTR};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -205,6 +206,7 @@ async fn handle_connection(
         pipe_client_sid(&stream)? == allowed_sid,
         "runtime service client SID is not authorized"
     );
+    let client_process = ClientProcessWatch::open(&stream)?;
     let request = tokio::time::timeout(REQUEST_TIMEOUT, read_service_request(&mut stream))
         .await
         .context("runtime service request timed out")??;
@@ -214,7 +216,7 @@ async fn handle_connection(
                 .then(|| Arc::new(HcsJobLifecycle::new()));
             let execution = execute_request(&request, job_semaphore, lifecycle.as_ref());
             let completed = if lifecycle.is_some() {
-                await_job_or_client_disconnect(&stream, execution).await
+                await_job_or_client_disconnect(&client_process, execution).await
             } else {
                 Some(execution.await)
             };
@@ -254,11 +256,14 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn await_job_or_client_disconnect<F, T>(stream: &NamedPipeServer, operation: F) -> Option<T>
+async fn await_job_or_client_disconnect<F, T>(
+    client: &ClientProcessWatch,
+    operation: F,
+) -> Option<T>
 where
     F: Future<Output = T>,
 {
-    await_operation_or_disconnect(operation, || !pipe_client_connected(stream)).await
+    await_operation_or_disconnect(operation, || client.disconnected()).await
 }
 
 async fn await_operation_or_disconnect<F, T, D>(operation: F, mut disconnected: D) -> Option<T>
@@ -279,23 +284,35 @@ where
     }
 }
 
-fn pipe_client_connected(stream: &NamedPipeServer) -> bool {
-    let handle = HANDLE(stream.as_raw_handle());
-    // Reading from a duplex named pipe solely to detect disconnects is not a
-    // reliable liveness probe: an otherwise healthy idle client can complete
-    // that read with a transient pipe error. PeekNamedPipe is non-consuming
-    // and reports a broken connection without racing the response channel.
-    match unsafe { PeekNamedPipe(handle, None, 0, None, None, None) } {
-        Ok(()) => true,
-        Err(error) => !named_pipe_error_is_disconnect(&error),
+struct ClientProcessWatch(ProcessHandle);
+
+impl ClientProcessWatch {
+    fn open(stream: &NamedPipeServer) -> Result<Self> {
+        let pipe = HANDLE(stream.as_raw_handle());
+        let mut process_id = 0_u32;
+        unsafe { GetNamedPipeClientProcessId(pipe, &mut process_id) }
+            .context("resolve runtime pipe client process")?;
+        ensure!(process_id != 0, "runtime pipe client process ID is invalid");
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, process_id) }
+            .context("open runtime pipe client process for liveness")?;
+        ensure!(
+            !process.is_invalid(),
+            "runtime pipe client process handle is invalid"
+        );
+        // `OpenProcess` transfers one owned kernel-handle reference. The
+        // standard library wrapper supplies the correct Send/Sync and Drop
+        // semantics for liveness polling from a spawned Tokio task.
+        Ok(Self(unsafe { ProcessHandle::from_raw_handle(process.0) }))
+    }
+
+    fn disconnected(&self) -> bool {
+        let process = HANDLE(self.0.as_raw_handle());
+        process_wait_result_is_disconnect(unsafe { WaitForSingleObject(process, 0) })
     }
 }
 
-fn named_pipe_error_is_disconnect(error: &windows::core::Error) -> bool {
-    let Some(error) = WIN32_ERROR::from_error(error) else {
-        return false;
-    };
-    error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA || error == ERROR_PIPE_NOT_CONNECTED
+fn process_wait_result_is_disconnect(result: WAIT_EVENT) -> bool {
+    result == WAIT_OBJECT_0
 }
 
 async fn execute_request(
@@ -800,12 +817,10 @@ mod cancellation_tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use windows::Win32::Foundation::{
-        ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
-    };
+    use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 
     use super::{
-        HcsJobLifecycle, await_operation_or_disconnect, named_pipe_error_is_disconnect,
+        HcsJobLifecycle, await_operation_or_disconnect, process_wait_result_is_disconnect,
         validate_allowed_sid,
     };
 
@@ -824,14 +839,10 @@ mod cancellation_tests {
     }
 
     #[test]
-    fn only_terminal_named_pipe_errors_are_disconnects() {
-        for error in [ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED] {
-            assert!(named_pipe_error_is_disconnect(&error.into()));
-        }
-        assert!(!named_pipe_error_is_disconnect(&ERROR_IO_PENDING.into()));
-        assert!(!named_pipe_error_is_disconnect(
-            &windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)),
-        ));
+    fn only_a_signaled_client_process_is_a_disconnect() {
+        assert!(process_wait_result_is_disconnect(WAIT_OBJECT_0));
+        assert!(!process_wait_result_is_disconnect(WAIT_TIMEOUT));
+        assert!(!process_wait_result_is_disconnect(WAIT_FAILED));
     }
 
     struct DropSignal(Arc<AtomicBool>);
