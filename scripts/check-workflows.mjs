@@ -105,6 +105,21 @@ assert.match(
   /subject-path: dist\/release-assets\/\*/,
   "every immutable release asset must receive provenance"
 );
+assert.match(
+  release,
+  /REPORCH_RELEASE_SIGNING_REQUIRED: \$\{\{ needs\.verify-source\.outputs\.prerelease == 'true' && '0' \|\| '1' \}\}/,
+  "stable releases must continue to require native OS signatures"
+);
+assert.match(
+  release,
+  /elif \[ "\$IS_PRERELEASE" = true \]; then\s+codesign --force --options runtime --sign -/,
+  "unsigned Apple prereleases must retain the virtualization entitlement through ad-hoc signing"
+);
+assert.match(
+  release,
+  /Windows code-signing certificate is required for a stable release/,
+  "stable Windows releases must fail closed without a code-signing certificate"
+);
 const ci = readFileSync(".github/workflows/ci.yml", "utf8");
 assert.match(ci, /actionlint_1\.7\.12_darwin_arm64\.tar\.gz/);
 assert.match(ci, /ACTIONLINT_SHA256:\s*[a-f0-9]{64}/);

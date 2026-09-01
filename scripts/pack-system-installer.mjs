@@ -341,9 +341,7 @@ export function packSystemInstaller(targetName, binary, runtimeTree, outputArgum
   assert.ok(target, `unsupported installer target ${targetName}`);
   assertReleaseBinary(binary);
   assertRuntimeInstallTree(runtimeTree, target.runtimeTarget);
-  const output = validateOutputArgument(outputArgument);
-  assert.ok(!existsSync(output), `installer output already exists: ${output}`);
-  mkdirSync(output, { mode: 0o755 });
+  const output = createInstallerOutput(outputArgument);
   const version = JSON.parse(readFileSync("npm/cli/package.json", "utf8")).version;
   const work = mkdtempSync(join(tmpdir(), "reporch-system-installer-"));
   const root = join(work, "root");
@@ -376,6 +374,13 @@ export function packSystemInstaller(targetName, binary, runtimeTree, outputArgum
     `${JSON.stringify({ schema: "reporch.cli-system-installer.v1", version, target: targetName, installers: records }, null, 2)}\n`
   );
   return records;
+}
+
+export function createInstallerOutput(outputArgument) {
+  const output = validateOutputArgument(outputArgument);
+  assert.ok(!existsSync(output), `installer output already exists: ${output}`);
+  mkdirSync(output, { recursive: true, mode: 0o755 });
+  return output;
 }
 
 function main() {
