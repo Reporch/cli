@@ -645,29 +645,32 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
             title,
         } => {
             let relative = relative_string(&path)?;
-            let spec = reporch_cli::local_project::update_authoring_spec(
-                Path::new("."),
-                |root, spec| {
-                    reporch_cli::local_project::declare_project_file(
-                        root,
-                        spec,
-                        &relative,
-                        "text/markdown",
-                        false,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "create {relative} first, then rerun `reporch statement add --locale {locale} --path {relative}`"
-                        )
-                    })?;
-                    spec.statements.insert(locale.clone(), relative.clone());
-                    if let Some(title) = &title {
-                        ensure!(!title.trim().is_empty(), "title cannot be empty");
-                        spec.title.insert(locale.clone(), title.trim().to_owned());
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let created = materialize_statement_file(&root, &relative, title.as_deref(), &locale)?;
+            let updated = reporch_cli::local_project::update_authoring_spec(&root, |root, spec| {
+                reporch_cli::local_project::declare_project_file(
+                    root,
+                    spec,
+                    &relative,
+                    "text/markdown",
+                    false,
+                )?;
+                spec.statements.insert(locale.clone(), relative.clone());
+                if let Some(title) = &title {
+                    ensure!(!title.trim().is_empty(), "title cannot be empty");
+                    spec.title.insert(locale.clone(), title.trim().to_owned());
+                }
+                Ok(())
+            });
+            let spec = match updated {
+                Ok(spec) => spec,
+                Err(error) => {
+                    if let Some(path) = created {
+                        let _ = fs::remove_file(path);
                     }
-                    Ok(())
-                },
-            )?;
+                    return Err(error);
+                }
+            };
             output.emit(
                 "statement add",
                 &spec.statements,
@@ -2760,6 +2763,36 @@ fn write_project_bytes_atomic(root: &Path, path: &str, bytes: &[u8]) -> Result<(
         .map_err(|error| error.error)
         .with_context(|| format!("atomically create output {normalized}"))?;
     Ok(())
+}
+
+fn materialize_statement_file(
+    root: &Path,
+    relative: &str,
+    title: Option<&str>,
+    locale: &str,
+) -> Result<Option<PathBuf>> {
+    let destination = root.join(relative);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "statement path must be a regular non-symlink file: {relative}"
+            );
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let heading = title
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Problem statement");
+            let starter = format!(
+                "# {heading}\n\n<!-- Locale: {locale} -->\n\n## Description\n\nWrite the problem description here.\n\n## Input\n\nDescribe the input format.\n\n## Output\n\nDescribe the output format.\n"
+            );
+            write_project_bytes_atomic(root, relative, starter.as_bytes())?;
+            Ok(Some(destination))
+        }
+        Err(error) => Err(error).with_context(|| format!("inspect statement path {relative}")),
+    }
 }
 
 fn ensure_no_symlink_parents(root: &Path, path: &Path) -> Result<()> {
