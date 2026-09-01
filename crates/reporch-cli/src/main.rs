@@ -130,7 +130,7 @@ enum Command {
         #[command(subcommand)]
         command: MemberCommand,
     },
-    /// Inspect Studio API compatibility and the active account's quota.
+    /// Inspect authenticated Studio API compatibility and quota; use `runtime doctor` for the local VM.
     Doctor(studio_remote::RemoteConnectionOptions),
     /// Inspect and maintain the mandatory Reporch virtual-machine runtime.
     Runtime {

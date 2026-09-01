@@ -56,6 +56,9 @@ enum StatementRenderFormat {
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  reporch test case add --name sample-1 --input-text '1 2' --answer-text '3' --group samples\n  reporch test group add samples --points 0\n  reporch test group add full-score --points 100 --depends-on samples"
+)]
 pub struct TestOptions {
     #[command(subcommand)]
     command: Option<TestCommand>,
@@ -156,6 +159,9 @@ struct TestGroupUpdateOptions {
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  reporch generator add --id random --source generators/random.py --language python3\n  reporch generator run random --seed 1 --output tests/generated/01.in --name random-1 --group full-score\n  reporch generator recipe random --name-prefix random --count 20 --seed-start 1 --group full-score"
+)]
 pub struct GeneratorOptions {
     #[command(subcommand)]
     command: GeneratorCommand,
@@ -172,6 +178,7 @@ enum GeneratorCommand {
 
 #[derive(Debug, ClapArgs)]
 struct GeneratorRunOptions {
+    /// Generator ID declared by `generator add`.
     id: String,
     #[arg(long)]
     output: PathBuf,
@@ -189,7 +196,9 @@ struct GeneratorRunOptions {
 
 #[derive(Debug, ClapArgs)]
 struct GeneratorRecipeOptions {
+    /// Generator ID declared by `generator add`.
     id: String,
+    /// Prefix for generated test names.
     #[arg(long)]
     name_prefix: String,
     #[arg(long, default_value = "tests/generated")]
@@ -208,17 +217,24 @@ struct GeneratorRecipeOptions {
 
 #[derive(Debug, ClapArgs)]
 struct ProgramAddOptions {
+    /// Stable generator ID used by run and recipe commands.
     #[arg(long)]
     id: String,
+    /// Generator source path inside this project.
     #[arg(long)]
     source: PathBuf,
+    /// Toolchain language, for example python3, cpp20, or rust.
     #[arg(long)]
     language: String,
+    /// Fixed argument passed before seed and recipe arguments; repeat as needed.
     #[arg(long = "argument")]
     arguments: Vec<String>,
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  reporch validator set --source validators/input.py --language python3\n  reporch validator unit-add --name accepts-sample --input-text '1 2' --expected valid\n  reporch validator unit-add --name rejects-text --input-text 'x' --expected invalid\n  reporch validator run"
+)]
 pub struct ValidatorOptions {
     #[command(subcommand)]
     command: ValidatorCommand,
@@ -269,6 +285,9 @@ enum ValidityExpectation {
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  reporch checker set --kind token\n  reporch checker set --kind floating --absolute-error 1e-6 --relative-error 1e-6\n  reporch checker unit-add --name rejects-wrong --input tests/01.in --answer tests/01.ans --output checker-tests/wrong.out --expected reject\n  reporch checker test"
+)]
 pub struct CheckerOptions {
     #[command(subcommand)]
     command: CheckerCommand,
