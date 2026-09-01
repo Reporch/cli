@@ -1,6 +1,6 @@
 {
   "name": "@reporch/cli-win32-x64-msvc",
-  "version": "1.0.0-rc.8",
+  "version": "1.0.0-rc.9",
   "description": "Reporch CLI native binary for Windows x64",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/Reporch/cli.git" },
