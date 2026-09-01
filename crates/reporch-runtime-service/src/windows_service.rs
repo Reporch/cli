@@ -20,7 +20,10 @@ use reporch_runtime_protocol::{
 };
 use sha2::{Digest, Sha256};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL,
+    LocalFree, WIN32_ERROR,
+};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -211,7 +214,7 @@ async fn handle_connection(
                 .then(|| Arc::new(HcsJobLifecycle::new()));
             let execution = execute_request(&request, job_semaphore, lifecycle.as_ref());
             let completed = if lifecycle.is_some() {
-                await_job_or_client_disconnect(&mut stream, execution).await
+                await_job_or_client_disconnect(&stream, execution).await
             } else {
                 Some(execution.await)
             };
@@ -282,7 +285,17 @@ fn pipe_client_connected(stream: &NamedPipeServer) -> bool {
     // reliable liveness probe: an otherwise healthy idle client can complete
     // that read with a transient pipe error. PeekNamedPipe is non-consuming
     // and reports a broken connection without racing the response channel.
-    unsafe { PeekNamedPipe(handle, None, 0, None, None, None) }.is_ok()
+    match unsafe { PeekNamedPipe(handle, None, 0, None, None, None) } {
+        Ok(()) => true,
+        Err(error) => !named_pipe_error_is_disconnect(&error),
+    }
+}
+
+fn named_pipe_error_is_disconnect(error: &windows::core::Error) -> bool {
+    let Some(error) = WIN32_ERROR::from_error(error) else {
+        return false;
+    };
+    error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA || error == ERROR_PIPE_NOT_CONNECTED
 }
 
 async fn execute_request(
@@ -787,7 +800,14 @@ mod cancellation_tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use super::{HcsJobLifecycle, await_operation_or_disconnect, validate_allowed_sid};
+    use windows::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    };
+
+    use super::{
+        HcsJobLifecycle, await_operation_or_disconnect, named_pipe_error_is_disconnect,
+        validate_allowed_sid,
+    };
 
     #[test]
     fn installer_user_sid_is_accepted_without_relaxing_the_grammar() {
@@ -801,6 +821,17 @@ mod cancellation_tests {
         ] {
             assert!(validate_allowed_sid(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn only_terminal_named_pipe_errors_are_disconnects() {
+        for error in [ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED] {
+            assert!(named_pipe_error_is_disconnect(&error.into()));
+        }
+        assert!(!named_pipe_error_is_disconnect(&ERROR_IO_PENDING.into()));
+        assert!(!named_pipe_error_is_disconnect(
+            &windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)),
+        ));
     }
 
     struct DropSignal(Arc<AtomicBool>);

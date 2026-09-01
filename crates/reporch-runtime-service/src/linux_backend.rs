@@ -24,6 +24,8 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 const VSOCK_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const VSOCK_ACK_MAX_BYTES: usize = 64;
 const BOOT_LOG_LIMIT_BYTES: u64 = 16 * 1024;
+const CGROUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+const CGROUP_CLEANUP_POLL: Duration = Duration::from_millis(10);
 const BROKER_CGROUP: &str = "broker";
 const REQUIRED_CGROUP_CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
 
@@ -354,12 +356,7 @@ pub async fn execute(
         "Firecracker jailer execution requires the installed root broker"
     );
     let plan = build_plan(bundle, toolchain, job, peer_spool)?;
-    let cleanup = JobCleanup(
-        plan.chroot_base.clone(),
-        plan.id.clone(),
-        plan.firecracker.clone(),
-        plan.cgroup_path.clone(),
-    );
+    let mut cleanup = JobCleanup::new(&plan);
     prepare_plan(&plan, bundle, toolchain, job, peer_spool)?;
     let mut child = launch_jailer(&plan)?;
     let mut stream = match connect_guest(&plan.vsock_path).await {
@@ -368,6 +365,11 @@ pub async fn execute(
             let early_status = child.try_wait().ok().flatten();
             kill_process_tree(&mut child).await;
             let diagnostics = boot_failure_diagnostics(&plan, early_status.as_ref());
+            if let Err(cleanup_error) = cleanup.cleanup() {
+                return Err(cleanup_error).context(format!(
+                    "clean up Firecracker after boot failure ({error:#}; {diagnostics})"
+                ));
+            }
             return Err(error).context(diagnostics);
         }
     };
@@ -379,8 +381,15 @@ pub async fn execute(
     )
     .await;
     kill_process_tree(&mut child).await;
-    drop(cleanup);
-    result
+    let cleanup_result = cleanup.cleanup();
+    match (result, cleanup_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("clean up Firecracker job"),
+        (Err(job_error), Err(cleanup_error)) => {
+            Err(cleanup_error).context(format!("clean up failed Firecracker job ({job_error:#})"))
+        }
+    }
 }
 
 fn prepare_plan(
@@ -892,19 +901,87 @@ fn required_non_root_id(name: &str) -> Result<u32> {
     Ok(value)
 }
 
-struct JobCleanup(PathBuf, String, PathBuf, PathBuf);
+struct JobCleanup {
+    chroot_base: PathBuf,
+    id: String,
+    firecracker: PathBuf,
+    cgroup_path: PathBuf,
+    cleaned: bool,
+}
+
+impl JobCleanup {
+    fn new(plan: &LinuxVmPlan) -> Self {
+        Self {
+            chroot_base: plan.chroot_base.clone(),
+            id: plan.id.clone(),
+            firecracker: plan.firecracker.clone(),
+            cgroup_path: plan.cgroup_path.clone(),
+            cleaned: false,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        let jail_result = self
+            .firecracker
+            .file_name()
+            .map(|name| self.chroot_base.join(name).join(&self.id))
+            .map_or(Ok(()), |path| match fs::remove_dir_all(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error).with_context(|| {
+                    format!("remove Firecracker jail directory {}", path.display())
+                }),
+            });
+        let cgroup_result = cleanup_job_cgroup(&self.cgroup_path);
+        match (jail_result, cgroup_result) {
+            (Ok(()), Ok(())) => {
+                self.cleaned = true;
+                Ok(())
+            }
+            (Err(jail), Ok(())) => Err(jail),
+            (Ok(()), Err(cgroup)) => Err(cgroup),
+            (Err(jail), Err(cgroup)) => {
+                Err(cgroup).context(format!("Firecracker jail cleanup also failed ({jail:#})"))
+            }
+        }
+    }
+}
+
+fn cleanup_job_cgroup(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let kill = path.join("cgroup.kill");
+    if kill.is_file() {
+        fs::write(&kill, b"1").context("kill remaining runtime job cgroup processes")?;
+    }
+    let deadline = Instant::now() + CGROUP_CLEANUP_TIMEOUT;
+    loop {
+        match fs::remove_dir(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if Instant::now() < deadline
+                    && (error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                        || error.raw_os_error()
+                            == Some(rustix::io::Errno::BUSY.raw_os_error())) =>
+            {
+                std::thread::sleep(CGROUP_CLEANUP_POLL);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove runtime job cgroup {}", path.display()));
+            }
+        }
+    }
+}
 
 impl Drop for JobCleanup {
     fn drop(&mut self) {
-        if let Some(name) = self.2.file_name() {
-            let path = self.0.join(name).join(&self.1);
-            let _ = fs::remove_dir_all(path);
-        }
-        let kill = self.3.join("cgroup.kill");
-        if kill.is_file() {
-            let _ = fs::write(kill, b"1");
-        }
-        let _ = fs::remove_dir(&self.3);
+        let _ = self.cleanup();
     }
 }
 
@@ -1022,5 +1099,23 @@ mod tests {
         );
         assert!(delegated_service_cgroup("system.slice/reporch-runtime.service").is_err());
         assert!(delegated_service_cgroup("broker").is_err());
+    }
+
+    #[test]
+    fn cgroup_cleanup_waits_for_a_transient_nonempty_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let cgroup = root.path().join("rp-test");
+        fs::create_dir(&cgroup).unwrap();
+        let task = cgroup.join("transient-task");
+        fs::write(&task, b"busy").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            fs::remove_file(task).unwrap();
+        });
+
+        cleanup_job_cgroup(&cgroup).unwrap();
+
+        release.join().unwrap();
+        assert!(!cgroup.exists());
     }
 }
