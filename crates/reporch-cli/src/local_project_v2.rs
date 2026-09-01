@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use reporch_format::{
@@ -11,12 +12,14 @@ use studio_core::{ManifestFile, ReleaseManifestV1, ReleaseManifestV2};
 use uuid::Uuid;
 
 use crate::local_project::{
-    AUTHORING_FILE_NAME, LEGACY_BACKUP_FILE_NAME, LEGACY_MANIFEST_FILE_NAME, ProjectDiffV1,
-    ProjectStatusV1, RemoteLinkV1, atomic_create_new, atomic_replace, ensure_real_directory,
-    hash_regular_project_file, read_bounded_regular_file, reject_non_regular_destination,
+    AUTHORING_FILE_NAME, LEGACY_MANIFEST_FILE_NAME, ProjectDiffV1, ProjectStatusV1, RemoteLinkV1,
+    atomic_create_new, atomic_replace, ensure_real_directory, hash_regular_project_file,
+    read_bounded_regular_file, reject_non_regular_destination,
 };
 
 pub const AUTHORING_V1_BACKUP_FILE_NAME: &str = "reporch.pre-v2.yaml";
+const AUTHORING_LOCK_FILE_NAME: &str = "authoring.lock";
+const AUTHORING_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MigrationOutcomeV2 {
@@ -33,8 +36,17 @@ enum GeneratedManifest {
     V2(Box<ReleaseManifestV2>),
 }
 
+struct AuthoringLock(fs::File);
+
+impl Drop for AuthoringLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 pub fn is_v2_project(directory: &Path) -> Result<bool> {
     let root = crate::local_project::discover_project(directory)?;
+    let _lock = acquire_authoring_lock(&root)?;
     let bytes = read_bounded_regular_file(
         &root.join(AUTHORING_FILE_NAME),
         MAX_AUTHORING_SPEC_BYTES as u64,
@@ -76,12 +88,119 @@ where
     F: FnOnce(&Path, &mut AuthoringSpecV2) -> Result<()>,
 {
     let root = crate::local_project::discover_project(directory)?;
+    let _lock = acquire_authoring_lock(&root)?;
     let mut spec = read_authoring_spec(&root)?;
     update(&root, &mut spec)?;
     spec.validate_references()
         .context("updated v2 authoring spec contains invalid references")?;
     write_authoring_spec_atomic(&root, &spec)?;
     Ok(spec)
+}
+
+fn acquire_authoring_lock(root: &Path) -> Result<AuthoringLock> {
+    let state_directory = root.join(crate::local_project::LOCAL_STATE_DIRECTORY);
+    ensure_private_lock_directory(&state_directory)?;
+    let path = state_directory.join(AUTHORING_LOCK_FILE_NAME);
+    let deadline = Instant::now() + AUTHORING_LOCK_TIMEOUT;
+    loop {
+        let file = open_authoring_lock(&path)?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(AuthoringLock(file)),
+            Err(error) if lock_is_contended(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) if lock_is_contended(&error) => {
+                bail!("another local authoring update is still in progress")
+            }
+            Err(error) => return Err(error).context("lock local authoring project"),
+        }
+    }
+}
+
+fn ensure_private_lock_directory(path: &Path) -> Result<()> {
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+                    "local authoring lock path must be a real directory"
+                );
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(path) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("create local authoring lock directory {}", path.display())
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect local authoring lock {}", path.display()));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        return matches!(error.raw_os_error(), Some(32 | 33));
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn open_authoring_lock(path: &Path) -> Result<fs::File> {
+    use rustix::fs::{Mode, OFlags, open};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let file = open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .context("open local authoring lock without following symlinks")?;
+    let file = fs::File::from(file);
+    ensure!(file.metadata()?.is_file(), "authoring lock is not a file");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_authoring_lock(path: &Path) -> Result<fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .context("open local authoring lock")?;
+    ensure!(
+        file.metadata()?.is_file() && !fs::symlink_metadata(path)?.file_type().is_symlink(),
+        "authoring lock is not a regular file"
+    );
+    Ok(file)
 }
 
 pub fn declare_project_file(
@@ -370,10 +489,14 @@ pub fn migrate_project(directory: &Path) -> Result<MigrationOutcomeV2> {
         if schema == studio_core::RELEASE_MANIFEST_SCHEMA_V2 {
             let manifest: ReleaseManifestV2 = serde_json::from_slice(&legacy_bytes)?;
             manifest.validate_references()?;
-            let backup = root.join(LEGACY_BACKUP_FILE_NAME);
-            atomic_create_new(&backup, &legacy_bytes)?;
-            backup_files.push(backup);
-            write_authoring_spec_create_new(&root, &AuthoringSpecV2::from_manifest(&manifest))?;
+            return Ok(MigrationOutcomeV2 {
+                schema: "reporch.migration-result.v2",
+                directory: root,
+                authoring_file: authoring_path,
+                backup_files,
+                project_id: manifest.project_id,
+                migrated: false,
+            });
         } else {
             let outcome = crate::local_project::migrate_legacy_project(&root)?;
             if let Some(backup) = outcome.backup_file {

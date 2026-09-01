@@ -409,18 +409,13 @@ fn check_is_networkless_and_finds_the_project_from_a_child_directory() {
 #[test]
 fn migrate_requires_yes_in_ci_and_is_idempotent() {
     let temporary = tempfile::tempdir().unwrap();
-    reporch()
-        .args([
-            "--quiet",
-            "project",
-            "init",
-            "--title",
-            "Legacy",
-            "--directory",
-            temporary.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    reporch_cli::init_legacy_v1_project_template(
+        temporary.path(),
+        "Legacy",
+        uuid::Uuid::now_v7(),
+        studio_core::ProblemType::Standard,
+    )
+    .unwrap();
     fs::remove_file(temporary.path().join("reporch.yaml")).unwrap();
 
     let refused = reporch()
