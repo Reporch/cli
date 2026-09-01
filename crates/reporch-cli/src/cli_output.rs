@@ -65,6 +65,16 @@ pub struct DetailedCliError {
     details: Value,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct ExplicitCliError {
+    message: String,
+    error_code: String,
+    exit_code: ExitCode,
+    retryable: bool,
+    details: Value,
+}
+
 pub fn detailed_error(message: impl Into<String>, details: impl Serialize) -> Error {
     let details = serde_json::to_value(details).unwrap_or_else(|serialization_error| {
         serde_json::json!({
@@ -74,6 +84,26 @@ pub fn detailed_error(message: impl Into<String>, details: impl Serialize) -> Er
     });
     Error::new(DetailedCliError {
         message: message.into(),
+        details,
+    })
+}
+
+pub fn domain_error(
+    error_code: impl Into<String>,
+    message: impl Into<String>,
+    details: impl Serialize,
+) -> Error {
+    let details = serde_json::to_value(details).unwrap_or_else(|serialization_error| {
+        serde_json::json!({
+            "schema": "reporch.error-details-serialization.v1",
+            "message": serialization_error.to_string(),
+        })
+    });
+    Error::new(ExplicitCliError {
+        message: message.into(),
+        error_code: error_code.into(),
+        exit_code: ExitCode::DomainFailure,
+        retryable: false,
         details,
     })
 }
@@ -159,6 +189,11 @@ impl CliOutput {
                 cause
                     .downcast_ref::<DetailedCliError>()
                     .map(|error| &error.details)
+                    .or_else(|| {
+                        cause
+                            .downcast_ref::<ExplicitCliError>()
+                            .map(|error| &error.details)
+                    })
             }),
         };
         match self.format {
@@ -210,6 +245,17 @@ struct ClassifiedError {
 }
 
 fn classify_error(error: &Error) -> ClassifiedError {
+    if let Some(explicit) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ExplicitCliError>())
+    {
+        return ClassifiedError {
+            exit_code: explicit.exit_code,
+            error_code: explicit.error_code.clone(),
+            retryable: explicit.retryable,
+            trace_id: None,
+        };
+    }
     if let Some(remote) = crate::studio_remote::remote_error_metadata(error) {
         let exit_code = classify_remote_error(
             &remote.error_code,

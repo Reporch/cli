@@ -994,6 +994,13 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     report = reporch_runtime_host::doctor().await?;
                 }
                 let passed = report.checks.iter().filter(|check| check.passed).count();
+                if passed != report.checks.len() {
+                    return Err(cli_output::domain_error(
+                        "runtime.doctor_failed",
+                        format!("{passed}/{} runtime checks passed", report.checks.len()),
+                        &report,
+                    ));
+                }
                 output.emit(
                     "runtime doctor",
                     &report,
