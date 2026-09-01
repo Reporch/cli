@@ -109,6 +109,22 @@ jobs:
         with:
           node-version: "24.2.0"
           package-manager-cache: false
+      - name: Install Linux system packaging tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends rpm zstd
+      - name: Install pinned Windows packaging tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toolPath = Join-Path $env:RUNNER_TEMP "wix-tools"
+          dotnet tool install wix --version 6.0.2 --tool-path $toolPath
+          $toolPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $toolPath "wix.exe") --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test --locked --workspace --all-targets
       - run: cargo build --locked --release -p reporch-cli --target ${{ matrix.target }}
@@ -133,23 +149,36 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          IS_PRERELEASE: ${{ needs.verify-source.outputs.prerelease }}
           MAC_APPLICATION_IDENTITY: ${{ secrets.REPORCH_MAC_APPLICATION_IDENTITY }}
           WINDOWS_CERT_SHA1: ${{ secrets.REPORCH_WINDOWS_CERT_SHA1 }}
         run: |
           set -euo pipefail
           case "$TARGET" in
             *-apple-darwin)
-              test -n "$MAC_APPLICATION_IDENTITY"
-              codesign --force --options runtime --timestamp \
-                --entitlements installers/macos/reporch.entitlements \
-                --sign "$MAC_APPLICATION_IDENTITY" "${{ matrix.binary }}"
+              if [ -n "$MAC_APPLICATION_IDENTITY" ]; then
+                codesign --force --options runtime --timestamp \
+                  --entitlements installers/macos/reporch.entitlements \
+                  --sign "$MAC_APPLICATION_IDENTITY" "${{ matrix.binary }}"
+              elif [ "$IS_PRERELEASE" = true ]; then
+                codesign --force --options runtime --sign - \
+                  --entitlements installers/macos/reporch.entitlements \
+                  "${{ matrix.binary }}"
+              else
+                echo "Developer ID application identity is required for a stable release" >&2
+                exit 1
+              fi
               codesign --verify --strict --verbose=2 "${{ matrix.binary }}"
               ;;
             *-pc-windows-msvc)
-              test -n "$WINDOWS_CERT_SHA1"
-              signtool sign /sha1 "$WINDOWS_CERT_SHA1" /fd SHA256 \
-                /tr http://timestamp.acs.microsoft.com /td SHA256 "${{ matrix.binary }}"
-              signtool verify /pa /all "${{ matrix.binary }}"
+              if [ -n "$WINDOWS_CERT_SHA1" ]; then
+                signtool sign /sha1 "$WINDOWS_CERT_SHA1" /fd SHA256 \
+                  /tr http://timestamp.acs.microsoft.com /td SHA256 "${{ matrix.binary }}"
+                signtool verify /pa /all "${{ matrix.binary }}"
+              elif [ "$IS_PRERELEASE" != true ]; then
+                echo "Windows code-signing certificate is required for a stable release" >&2
+                exit 1
+              fi
               ;;
           esac
       - shell: bash
@@ -157,7 +186,8 @@ jobs:
           VERSION: ${{ needs.verify-source.outputs.version }}
           TARGET: ${{ matrix.target }}
           RUNTIME_TARGET: ${{ matrix.runtime_target }}
-          REPORCH_RELEASE_SIGNING_REQUIRED: "1"
+          IS_PRERELEASE: ${{ needs.verify-source.outputs.prerelease }}
+          REPORCH_RELEASE_SIGNING_REQUIRED: ${{ needs.verify-source.outputs.prerelease == 'true' && '0' || '1' }}
           REPORCH_MAC_INSTALLER_IDENTITY: ${{ secrets.REPORCH_MAC_INSTALLER_IDENTITY }}
           REPORCH_WINDOWS_CERT_SHA1: ${{ secrets.REPORCH_WINDOWS_CERT_SHA1 }}
           REPORCH_MAC_NOTARY_PROFILE: ${{ secrets.REPORCH_MAC_NOTARY_PROFILE }}
@@ -172,12 +202,16 @@ jobs:
             "release-output/system-installers/$TARGET"
           case "$TARGET" in
             *-apple-darwin)
-              test -n "$REPORCH_MAC_NOTARY_PROFILE"
               package=$(find "release-output/system-installers/$TARGET" -maxdepth 1 -type f -name '*.pkg' -print)
               test -n "$package"
-              xcrun notarytool submit "$package" --keychain-profile "$REPORCH_MAC_NOTARY_PROFILE" --wait
-              xcrun stapler staple "$package"
-              xcrun stapler validate "$package"
+              if [ -n "$REPORCH_MAC_NOTARY_PROFILE" ]; then
+                xcrun notarytool submit "$package" --keychain-profile "$REPORCH_MAC_NOTARY_PROFILE" --wait
+                xcrun stapler staple "$package"
+                xcrun stapler validate "$package"
+              elif [ "$IS_PRERELEASE" != true ]; then
+                echo "Apple notarization profile is required for a stable release" >&2
+                exit 1
+              fi
               ;;
           esac
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -279,12 +313,14 @@ jobs:
             gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA"
           else
             release_flags=()
+            release_notes=$'Official Apache-2.0 Reporch CLI release.\n\nInstall with `npm install --global @reporch/cli`, or download the standalone archive for your target and verify it with `SHA256SUMS`. Every release asset has GitHub artifact provenance; manifests and an SPDX SBOM are included.'
             if [ "$IS_PRERELEASE" = true ]; then
               release_flags+=(--prerelease)
+              release_notes+=$'\n\nRC notice: native OS distribution certificates are not configured yet. macOS binaries are ad-hoc signed to preserve the virtualization entitlement; Windows binaries and OS installers are not publisher-signed. Verify SHA-256 and GitHub artifact provenance before installing. Stable 1.0 remains blocked until Developer ID/notarization and Authenticode credentials are configured.'
             fi
             gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" "${release_flags[@]}" \
               --title "Reporch CLI $VERSION" \
-              --notes $'Official Apache-2.0 Reporch CLI release.\n\nInstall with `npm install --global @reporch/cli`, or download the standalone archive for your target and verify it with `SHA256SUMS`. Every release asset has GitHub artifact provenance; manifests and an SPDX SBOM are included.'
+              --notes "$release_notes"
           fi
           gh release upload "$RELEASE_TAG" dist/release-assets/* dist/SHA256SUMS --clobber
       - name: Publish exact npm tarballs with OIDC and provenance

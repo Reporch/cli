@@ -5,7 +5,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { linuxRpmSpec, windowsInstallerXml } from "./pack-system-installer.mjs";
+import {
+  createInstallerOutput,
+  linuxRpmSpec,
+  windowsInstallerXml
+} from "./pack-system-installer.mjs";
+
+test("installer output creation accepts a new nested release directory only once", () => {
+  const root = mkdtempSync(join(tmpdir(), "reporch-installer-output-test-"));
+  try {
+    const output = join(root, "release-output", "system-installers", "target");
+    assert.equal(createInstallerOutput(output), output);
+    assert.throws(() => createInstallerOutput(output), /installer output already exists/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("Windows installer XML binds the CLI, service, and runtime without a network helper", () => {
   const root = mkdtempSync(join(tmpdir(), "reporch-installer-test-"));
