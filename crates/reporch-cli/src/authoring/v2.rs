@@ -589,7 +589,7 @@ pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> 
             let path = relative_string(&options.output)?;
             let name = normalize_name(options.name.as_deref().unwrap_or(&options.id))?;
             ensure_unique_test_name(&spec, &name, None)?;
-            let run_options = options.runtime.into_run_options();
+            let run_options = options.runtime.into_run_options(output);
             let program = legacy_program(&generator.program);
             let bytes = materialize_generator(
                 &root,
@@ -673,7 +673,7 @@ pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> 
             let generator = find_generator(&spec, &options.id)?.clone();
             let prefix = normalize_name(&options.name_prefix)?;
             let directory = relative_string(&options.output_directory)?;
-            let run_options = options.runtime.into_run_options();
+            let run_options = options.runtime.into_run_options(output);
             let program = legacy_program(&generator.program);
             let recipe_id = Uuid::now_v7();
             let mut materialized = Vec::with_capacity(options.count as usize);
@@ -909,7 +909,7 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                 |unit| unit.name.as_str(),
             )?;
             ensure!(!units.is_empty(), "no validator unit tests are configured");
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for validator in validators {
                 for unit in &units {
@@ -1048,7 +1048,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                     unit.name.as_str()
                 })?;
             ensure!(!units.is_empty(), "no checker unit tests are configured");
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for unit in units {
                 let (actual_accepted, exit_code, duration_ms, stderr) =
@@ -1405,7 +1405,7 @@ pub(super) async fn answer(options: AnswerOptions, output: &CliOutput) -> Result
         .cloned()
         .collect::<Vec<_>>();
     ensure!(!selected.is_empty(), "no matching test case was found");
-    let run_options = runtime.into_run_options();
+    let run_options = runtime.into_run_options(output);
     let mut generated = Vec::new();
     for test in selected {
         if test.answer_file.is_some() {
@@ -1639,7 +1639,7 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
                 .context("stress candidate is missing")
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut run_options = runtime.into_run_options();
+    let mut run_options = runtime.into_run_options(output);
     run_options.timeout = std::time::Duration::from_millis(suite.timeout_ms);
     let scratch_parent = root.join(".reporch").join("stress-tmp");
     fs::create_dir_all(&scratch_parent)?;
@@ -2010,7 +2010,7 @@ async fn run_interactor(
         .context("no interactor is configured")?;
     let solution = find_runtime_solution(&spec, &options.solution)?;
     let test = find_test(&spec, &options.test)?;
-    let run_options = options.runtime.into_run_options();
+    let run_options = options.runtime.into_run_options(output);
     let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
         run_options.toolchain_id.as_deref(),
         &interactive.interactor.language,
@@ -2353,7 +2353,7 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         .answer_file
         .as_deref()
         .context("grader test has no answer file")?;
-    let run_options = options.runtime.into_run_options();
+    let run_options = options.runtime.into_run_options(output);
     let result = reporch_cli::authoring_runtime::run_linked_pair(
         &reporch_cli::authoring_runtime::LinkedPairRequest {
             project_directory: &root,
@@ -2520,7 +2520,7 @@ pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput
                 !submissions.is_empty(),
                 "no output submissions are configured"
             );
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut reports = Vec::new();
             for submission in submissions {
                 let mut cases = Vec::new();

@@ -702,7 +702,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         no_input,
         profile.as_deref(),
     );
-    ensure_mandatory_runtime(&command).await?;
+    ensure_mandatory_runtime(&command, output).await?;
     let _configuration = (profile.clone(), no_input, verbose, output.colors_enabled());
     let package_profile = profile_config::package_profile_argument()
         .map(|value| {
@@ -1393,6 +1393,12 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 output.emit("toolchain inspect", &inspected, &human)
             }
             ToolchainCommand::Install { id, runtime } => {
+                output.progress(
+                    "toolchain install",
+                    &format!(
+                        "Preparing signed toolchain {id}; the first install may take a few minutes"
+                    ),
+                );
                 let installed = reporch_cli::toolchain::install(&id, runtime.into_oci()).await?;
                 output.emit(
                     "toolchain install",
@@ -1412,6 +1418,10 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 };
                 let mut installed = Vec::with_capacity(ids.len());
                 for id in ids {
+                    output.progress(
+                        "toolchain prefetch",
+                        &format!("Preparing signed toolchain {id}"),
+                    );
                     installed.push(reporch_cli::toolchain::install(&id, runtime.into_oci()).await?);
                 }
                 output.emit(
@@ -1433,7 +1443,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
     }
 }
 
-async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
+async fn ensure_mandatory_runtime(command: &Command, output: &CliOutput) -> Result<()> {
     if command_skips_runtime_bootstrap(command) {
         return Ok(());
     }
@@ -1450,6 +1460,10 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
         .context("import the packaged Reporch Runtime")?;
     let status = reporch_runtime_host::status().await?;
     if status.installed_version.is_none() {
+        output.progress(
+            "runtime bootstrap",
+            "Installing the signed Reporch VM Runtime; this is required once per machine",
+        );
         reporch_runtime_host::update()
             .await
             .context("complete mandatory Reporch Runtime bootstrap")?;
@@ -1463,6 +1477,10 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
         return Ok(());
     }
     if reporch_runtime_host::verify_installed().await.is_err() {
+        output.progress(
+            "runtime repair",
+            "Repairing the signed Reporch VM Runtime while preserving projects and credentials",
+        );
         reporch_runtime_host::repair()
             .await
             .context("repair mandatory Reporch Runtime assets")?;

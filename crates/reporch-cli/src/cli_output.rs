@@ -51,6 +51,13 @@ struct ErrorEnvelope<'a> {
     details: Option<&'a Value>,
 }
 
+#[derive(Debug, Serialize)]
+struct ProgressEnvelope<'a> {
+    schema: &'static str,
+    command: &'a str,
+    message: &'a str,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct DetailedCliError {
@@ -112,6 +119,28 @@ impl CliOutput {
             ),
         }
         Ok(())
+    }
+
+    /// Report bounded work without contaminating the command's stdout result.
+    pub fn progress(&self, command: &str, message: &str) {
+        if self.quiet {
+            return;
+        }
+        match self.format {
+            OutputFormat::Human => eprintln!("{message}"),
+            OutputFormat::Json | OutputFormat::Jsonl => {
+                let envelope = ProgressEnvelope {
+                    schema: "reporch.cli-progress.v1",
+                    command,
+                    message,
+                };
+                eprintln!(
+                    "{}",
+                    serde_json::to_string(&envelope)
+                        .unwrap_or_else(|_| { "{\"schema\":\"reporch.cli-progress.v1\"}".into() })
+                );
+            }
+        }
     }
 
     pub fn emit_error(&self, command: &str, error: &Error) -> ExitCode {

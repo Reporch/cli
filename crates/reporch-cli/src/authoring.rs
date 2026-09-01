@@ -524,7 +524,14 @@ enum RuntimeKind {
 }
 
 impl RuntimeOptions {
-    fn into_run_options(self) -> reporch_cli::authoring_runtime::AuthoringRunOptions {
+    fn into_run_options(
+        self,
+        output: &CliOutput,
+    ) -> reporch_cli::authoring_runtime::AuthoringRunOptions {
+        output.progress(
+            "local execution",
+            "Preparing the Reporch VM and signed toolchain; first use may download and verify assets",
+        );
         let runtime = match self.runtime {
             RuntimeKind::Auto => reporch_cli::local_sandbox::OciRuntime::Auto,
             RuntimeKind::Podman => reporch_cli::local_sandbox::OciRuntime::Podman,
@@ -1169,7 +1176,7 @@ pub async fn generator(options: GeneratorOptions, output: &CliOutput) -> Result<
             let path = relative_string(&options.output)?;
             let name = normalize_name(options.name.as_deref().unwrap_or(&options.id))?;
             ensure_unique_test_name(&spec, &name, None)?;
-            let run_options = options.runtime.into_run_options();
+            let run_options = options.runtime.into_run_options(output);
             let bytes = materialize_generator(
                 &root,
                 &generator,
@@ -1236,7 +1243,7 @@ pub async fn generator(options: GeneratorOptions, output: &CliOutput) -> Result<
                 .clone();
             let prefix = normalize_name(&options.name_prefix)?;
             let directory = relative_string(&options.output_directory)?;
-            let run_options = options.runtime.into_run_options();
+            let run_options = options.runtime.into_run_options(output);
             let mut materialized = Vec::with_capacity(options.count as usize);
             for index in 0..options.count {
                 let seed = options
@@ -1472,7 +1479,7 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                 unit.name.as_str()
             })?;
             ensure!(!units.is_empty(), "no validator unit tests are configured");
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for validator in &validators {
                 for unit in &units {
@@ -1599,7 +1606,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                 unit.name.as_str()
             })?;
             ensure!(!units.is_empty(), "no checker unit tests are configured");
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for unit in units {
                 let (actual_accepted, exit_code, duration_ms, stderr) =
@@ -1849,7 +1856,7 @@ async fn run_interactor(
         .context("configured interactor has no language")?;
     let solution = find_legacy_solution(&spec, &options.solution)?;
     let test = find_legacy_test(&spec, &options.test)?;
-    let run_options = options.runtime.into_run_options();
+    let run_options = options.runtime.into_run_options(output);
     let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
         run_options.toolchain_id.as_deref(),
         interactor_language,
@@ -1943,7 +1950,7 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         .answer_file
         .as_deref()
         .context("grader test has no answer file")?;
-    let run_options = options.runtime.into_run_options();
+    let run_options = options.runtime.into_run_options(output);
     let result = reporch_cli::authoring_runtime::run_linked_pair(
         &reporch_cli::authoring_runtime::LinkedPairRequest {
             project_directory: &root,
@@ -2165,7 +2172,7 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                 !submissions.is_empty(),
                 "no output submissions are configured"
             );
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut reports = Vec::new();
             for submission in submissions {
                 let mut cases = Vec::new();
