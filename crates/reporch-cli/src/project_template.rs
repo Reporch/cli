@@ -57,6 +57,14 @@ enum InitRecoveryOutcome {
     Committed,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TemplateOptions {
+    emit_v2: bool,
+    allow_non_empty: bool,
+    required_project_id: Option<Uuid>,
+    portable: bool,
+}
+
 struct TemplateFile {
     path: &'static str,
     content: Vec<u8>,
@@ -119,10 +127,12 @@ pub fn init_project_template_with_options(
         title,
         project_id,
         problem_type,
-        true,
-        allow_non_empty,
-        Some(project_id),
-        false,
+        TemplateOptions {
+            emit_v2: true,
+            allow_non_empty,
+            required_project_id: Some(project_id),
+            portable: false,
+        },
     )
 }
 
@@ -139,10 +149,12 @@ pub fn init_project_template_with_optional_id(
         title,
         generated_project_id,
         problem_type,
-        true,
-        allow_non_empty,
-        project_id,
-        false,
+        TemplateOptions {
+            emit_v2: true,
+            allow_non_empty,
+            required_project_id: project_id,
+            portable: false,
+        },
     )
 }
 
@@ -159,10 +171,12 @@ pub fn init_portable_project_template_with_optional_id(
         title,
         generated_project_id,
         problem_type,
-        true,
-        allow_non_empty,
-        project_id,
-        true,
+        TemplateOptions {
+            emit_v2: true,
+            allow_non_empty,
+            required_project_id: project_id,
+            portable: true,
+        },
     )
 }
 
@@ -178,10 +192,12 @@ pub fn init_legacy_v1_project_template(
         title,
         project_id,
         problem_type,
-        false,
-        false,
-        Some(project_id),
-        false,
+        TemplateOptions {
+            emit_v2: false,
+            allow_non_empty: false,
+            required_project_id: Some(project_id),
+            portable: false,
+        },
     )
 }
 
@@ -190,11 +206,14 @@ fn init_project_template_versioned(
     title: &str,
     project_id: Uuid,
     problem_type: ProblemType,
-    emit_v2: bool,
-    allow_non_empty: bool,
-    required_project_id: Option<Uuid>,
-    portable: bool,
+    options: TemplateOptions,
 ) -> Result<()> {
+    let TemplateOptions {
+        emit_v2,
+        allow_non_empty,
+        required_project_id,
+        portable,
+    } = options;
     let title = title.trim();
     if title.is_empty() {
         bail!("title is required");
