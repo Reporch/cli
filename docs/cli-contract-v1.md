@@ -19,7 +19,9 @@ resolved in this order:
 
 `--no-input` prohibits prompts. A command that needs confirmation must instead
 receive `--yes` or fail with exit code 2. Progress and explanatory text never
-appear on stdout when `--format json` or `--format jsonl` is selected.
+appear on stdout when `--format json` or `--format jsonl` is selected. One-shot
+JSON keeps stderr to one final error envelope. JSONL may emit
+`reporch.cli-progress.v1` envelopes on stderr before the final result or error.
 
 `--profile NAME` (or `REPORCH_PROFILE`) selects a named user profile from
 `config.toml`. A direct CLI option overrides its matching `REPORCH_*`
@@ -33,7 +35,7 @@ connection metadata and never tokens.
 
 The 1.x command families are:
 
-- `new`, `migrate`, `check`, `doctor`, `completion`, `verify`, `submit`, and the
+- `new`, `migrate`, `check`, `status`, `diff`, `doctor`, `completion`, `verify`, `submit`, and the
   `publish` shorthand;
 - `auth login|status|logout`;
 - `project init|create|link|list|show|status|diff|pull|push|open|validate|package`;
@@ -73,6 +75,11 @@ internal V2 identity. Supplying `--minimum-score` and `--maximum-score` to
 Interactive and grader runtime commands accept a solution name, UUID, or source
 path and a test name, UUID, or input path. These readable selectors are aliases
 for the same stable project entities and do not change JSON result fields.
+`status` and `diff` are aliases for `project status` and `project diff`.
+`checker test` is an alias for `checker run`. `statement add --create` safely
+creates a missing Markdown starter without changing the legacy no-overwrite
+behavior when the flag is absent. `reporch new` includes a portable validator
+starter; `project init --portable` opts into the same files.
 
 ## JSON success and error envelopes
 
@@ -139,5 +146,6 @@ only after bounded digest and V1/V2 semantic validation. It never deletes a
 user-visible final path during crash recovery, and changed files fail closed.
 Removing an output submission may prune declarations that are no longer
 referenced, but never deletes the corresponding local files. Local author-code
-execution is opt-in, requires a rootless OCI runtime, never falls back to direct
-host execution, and cannot create official release evidence.
+execution defaults to the mandatory signed Reporch VM Runtime, never falls back
+to direct host execution, and cannot create official release evidence. Explicit
+`podman` and `docker` runtime selectors are deprecated 1.x compatibility paths.
