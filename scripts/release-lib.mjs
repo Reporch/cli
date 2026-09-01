@@ -82,7 +82,7 @@ function assertRegular(path, label, maximum = 4 * 1024 * 1024 * 1024) {
   return stat;
 }
 
-export function assertRuntimeInstallTree(path, expectedTarget) {
+function inspectRuntimeInstallTree(path, expectedTarget, requireReadOnly) {
   const root = resolve(path);
   const rootStat = lstatSync(root);
   assert.ok(rootStat.isDirectory() && !rootStat.isSymbolicLink(), "runtime tree must be a directory");
@@ -133,7 +133,7 @@ export function assertRuntimeInstallTree(path, expectedTarget) {
       artifact.sha256,
       `runtime artifact ${artifact.file_name} hash mismatch`
     );
-    if (process.platform !== "win32") {
+    if (requireReadOnly && process.platform !== "win32") {
       assert.equal(stat.mode & 0o222, 0, `runtime artifact ${artifact.file_name} must be read-only`);
     }
   }
@@ -144,6 +144,27 @@ export function assertRuntimeInstallTree(path, expectedTarget) {
     version: current.version,
     manifestSha256: current.bundle_sha256
   };
+}
+
+export function assertRuntimeInstallTree(path, expectedTarget) {
+  return inspectRuntimeInstallTree(path, expectedTarget, true);
+}
+
+export function restoreTransferredRuntimePermissions(path, expectedTarget) {
+  // GitHub artifact transport preserves bytes but normalizes POSIX modes. Verify the
+  // complete digest-bound tree before restoring only the manifest-declared files.
+  const verified = inspectRuntimeInstallTree(path, expectedTarget, false);
+  const bundle = join(
+    verified.root,
+    "bundles",
+    `${verified.sequence}-${safeRuntimeVersion(verified.version)}`
+  );
+  const manifest = JSON.parse(readFileSync(join(bundle, "manifest.json"), "utf8"));
+  for (const artifact of manifest.artifacts) {
+    const artifactPath = join(bundle, artifact.file_name);
+    chmodSync(artifactPath, lstatSync(artifactPath).mode & ~0o222);
+  }
+  return assertRuntimeInstallTree(verified.root, expectedTarget);
 }
 
 export function copyRuntimeInstallTree(runtimeTree, destination, expectedTarget) {

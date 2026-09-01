@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 
 import {
   TARGETS,
+  restoreTransferredRuntimePermissions,
   stagePlatformPackage,
   stageRootPackage,
   validateOutputArgument
@@ -23,6 +24,7 @@ const manifestTargets = [];
 for (const target of TARGETS) {
   const binary = join(artifacts, target.target, target.binaryName);
   const runtimeTree = join(artifacts, "runtime", target.runtimeTarget);
+  restoreTransferredRuntimePermissions(runtimeTree, target.runtimeTarget);
   const staged = stagePlatformPackage(target, binary, runtimeTree, output);
   checksums[target.packageName] = staged.sha256;
   manifestTargets.push({
