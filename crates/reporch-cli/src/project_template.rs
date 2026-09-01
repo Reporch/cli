@@ -13,7 +13,7 @@ use studio_core::{
     JudgingSpec, ManifestFile, OutputSubmissionSpec, PackageProfile, ProblemType,
     PublicationSampleV1, PublicationSpecV1, RELEASE_MANIFEST_SCHEMA_V1, ReleaseManifestV1,
     ResourceLimits, ScoreAggregation, SolutionSpec, StatementSectionsV1, TestCaseSpec,
-    TestGroupSpec,
+    TestGroupSpec, ValidatorTestSpec,
 };
 use uuid::Uuid;
 
@@ -186,6 +186,16 @@ fn init_project_template_versioned(
         TemplateFile::text("statements/ko.md", statement, "text/markdown"),
         TemplateFile::text("tests/1.in", sample_input, "text/plain"),
         TemplateFile::text("tests/1.ans", sample_answer, "text/plain"),
+        TemplateFile::text(
+            "validators/input.py",
+            starter_validator(problem_type),
+            "text/x-python",
+        ),
+        TemplateFile::text(
+            "validator-tests/invalid.in",
+            "not-an-integer\n",
+            "text/plain",
+        ),
     ];
 
     match problem_type {
@@ -294,11 +304,22 @@ fn init_project_template_versioned(
             tests,
             groups: scoring_groups(problem_type),
             generators: vec![],
-            validator_path: None,
-            validator_language: None,
+            validator_path: Some("validators/input.py".into()),
+            validator_language: Some("python3".into()),
             extra_validator_paths: vec![],
             extra_validators: vec![],
-            validator_tests: vec![],
+            validator_tests: vec![
+                ValidatorTestSpec {
+                    name: "accepts-sample".into(),
+                    input_file: "tests/1.in".into(),
+                    expected_valid: true,
+                },
+                ValidatorTestSpec {
+                    name: "rejects-malformed".into(),
+                    input_file: "validator-tests/invalid.in".into(),
+                    expected_valid: false,
+                },
+            ],
             checker_tests: vec![],
             interactor_path,
             interactor_language,
@@ -478,6 +499,14 @@ fn preflight_init_before_lock(
         return Ok(());
     }
     preflight_template_destinations(directory, files, allow_non_empty)
+}
+
+fn starter_validator(problem_type: ProblemType) -> &'static str {
+    if problem_type == ProblemType::Interactive {
+        "import sys\n\ndef main():\n    tokens = sys.stdin.read().split()\n    if len(tokens) != 1:\n        return 1\n    try:\n        value = int(tokens[0])\n    except ValueError:\n        return 1\n    return 0 if abs(value) <= 10**9 else 1\n\nraise SystemExit(main())\n"
+    } else {
+        "import sys\n\ndef main():\n    tokens = sys.stdin.read().split()\n    if len(tokens) != 2:\n        return 1\n    try:\n        values = [int(token) for token in tokens]\n    except ValueError:\n        return 1\n    return 0 if all(abs(value) <= 10**9 for value in values) else 1\n\nraise SystemExit(main())\n"
+    }
 }
 
 fn add_python_solutions(files: &mut Vec<TemplateFile>) {
