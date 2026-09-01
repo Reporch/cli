@@ -26,7 +26,7 @@ if (Test-Path -LiteralPath $evidence) {
 $service = Get-CimInstance Win32_Service -Filter "Name='ReporchRuntime'"
 Assert-True ($null -ne $service -and $service.State -eq "Running") "ReporchRuntime service is not running"
 $serviceProcess = Get-Process -Id ([int]$service.ProcessId)
-$beforeHandles = $serviceProcess.HandleCount
+$coldHandles = $serviceProcess.HandleCount
 $hcsdiag = Join-Path $env:SystemRoot "System32\hcsdiag.exe"
 Assert-True (Test-Path -LiteralPath $hcsdiag -PathType Leaf) "hcsdiag.exe is required for exact HCS orphan detection"
 
@@ -37,9 +37,6 @@ function Get-HcsSystems {
     ForEach-Object { $_.Value.ToLowerInvariant() } | Sort-Object -Unique
 }
 
-$beforeSystems = @(Get-HcsSystems)
-$beforeSystems | Set-Content -LiteralPath (Join-Path $evidence "before-hcs-systems.txt") -Encoding utf8NoBOM
-
 $statusText = & $binary --format json runtime status 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { throw "runtime status failed: $statusText" }
 $statusText | Set-Content -LiteralPath (Join-Path $evidence "status.json") -Encoding utf8NoBOM
@@ -48,6 +45,23 @@ Assert-True ($status.schema -eq "reporch.cli-result.v1" -and $status.command -eq
 Assert-True ($status.data.installed_sequence -eq 23) "runtime status selected the wrong signed runtime sequence"
 Assert-True ($status.data.target -eq "windows-x64-msvc" -and $status.data.backend -eq "hyper_v_hcs") "runtime status selected the wrong Windows backend"
 Assert-True ($status.data.availability -eq "ready" -and $status.data.virtualization_available -and $status.data.service_available) "Windows native runtime is not ready"
+
+# HCS, Winsock, and the signed toolchain verifier intentionally retain a
+# bounded set of process-wide initialization handles. Establish the leak
+# baseline after one complete lifecycle so the 100-iteration gate measures
+# sustained growth instead of cold-start initialization.
+$warmupText = & $binary --format json runtime qualification --iterations 1 --toolchain bash-5.3 2>&1 | Out-String
+$warmupText | Set-Content -LiteralPath (Join-Path $evidence "warmup.json") -Encoding utf8NoBOM
+if ($LASTEXITCODE -ne 0) { throw "runtime qualification warmup failed: $warmupText" }
+$warmup = $warmupText | ConvertFrom-Json
+Assert-True ($warmup.schema -eq "reporch.cli-result.v1" -and $warmup.command -eq "runtime qualification") "runtime qualification warmup envelope is invalid"
+Assert-True ($warmup.data.iterations -eq 1 -and $warmup.data.passed) "runtime qualification warmup was incomplete"
+
+$warmedService = Get-CimInstance Win32_Service -Filter "Name='ReporchRuntime'"
+Assert-True ($null -ne $warmedService -and $warmedService.State -eq "Running" -and [int]$warmedService.ProcessId -eq [int]$service.ProcessId) "runtime service restarted during warmup"
+$beforeHandles = (Get-Process -Id ([int]$service.ProcessId)).HandleCount
+$beforeSystems = @(Get-HcsSystems)
+$beforeSystems | Set-Content -LiteralPath (Join-Path $evidence "before-hcs-systems.txt") -Encoding utf8NoBOM
 
 $qualificationText = & $binary --format json runtime qualification --iterations 100 --toolchain bash-5.3 2>&1 | Out-String
 $qualificationText | Set-Content -LiteralPath (Join-Path $evidence "qualification.json") -Encoding utf8NoBOM
@@ -70,6 +84,14 @@ if (Test-Path -LiteralPath $jobsRoot) {
   Assert-True ($leakedJobs.Count -eq 0) "a Windows runtime job directory was leaked"
 }
 $afterHandles = (Get-Process -Id ([int]$service.ProcessId)).HandleCount
+$handleCounts = [ordered]@{
+  schema = "reporch.windows-service-handle-counts.v1"
+  cold = $coldHandles
+  baseline_after_warmup = $beforeHandles
+  after_100_iterations = $afterHandles
+  sustained_growth = $afterHandles - $beforeHandles
+}
+$handleCounts | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence "handle-counts.json") -Encoding utf8NoBOM
 Assert-True ($afterHandles -le $beforeHandles + 16) "runtime service handle count grew unexpectedly"
 
 $hostResult = [ordered]@{
@@ -78,6 +100,7 @@ $hostResult = [ordered]@{
   target = "windows-x64-msvc"
   backend = "hyper_v_hcs"
   service_pid = [int]$service.ProcessId
+  cold_service_handles = $coldHandles
   before_service_handles = $beforeHandles
   after_service_handles = $afterHandles
   orphan_hcs_systems = 0
