@@ -975,11 +975,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Runtime { command } => match command {
             RuntimeCommand::Status => {
                 let status = reporch_runtime_host::status().await?;
-                let human = format!(
-                    "Reporch Runtime: {:?} · {:?}",
-                    status.availability, status.backend
-                );
-                output.emit("runtime status", &status, &human)
+                let data = runtime_status_output(&status)?;
+                output.emit("runtime status", &data, &runtime_status_human(&status))
             }
             RuntimeCommand::Doctor { fix } => {
                 let mut report = reporch_runtime_host::doctor().await?;
@@ -1490,6 +1487,49 @@ async fn ensure_mandatory_runtime(command: &Command, output: &CliOutput) -> Resu
             .context("repair mandatory Reporch Runtime assets")?;
     }
     Ok(())
+}
+
+fn runtime_status_output(
+    status: &reporch_runtime_core::RuntimeStatusV1,
+) -> Result<serde_json::Value> {
+    let mut data = serde_json::to_value(status).context("serialize runtime status")?;
+    let fields = data
+        .as_object_mut()
+        .context("runtime status must serialize as an object")?;
+    fields.insert(
+        "cli_version".into(),
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").into()),
+    );
+    fields.insert(
+        "runtime_version_is_independent".into(),
+        serde_json::Value::Bool(true),
+    );
+    fields.insert(
+        "compatibility_basis".into(),
+        serde_json::Value::String("protocol_version".into()),
+    );
+    fields.insert(
+        "protocol_compatible".into(),
+        serde_json::Value::Bool(status.protocol_version == reporch_runtime_core::PROTOCOL_VERSION),
+    );
+    Ok(data)
+}
+
+fn runtime_status_human(status: &reporch_runtime_core::RuntimeStatusV1) -> String {
+    let runtime_version = status
+        .installed_version
+        .as_deref()
+        .unwrap_or("not installed");
+    let sequence = status
+        .installed_sequence
+        .map_or_else(|| "none".into(), |value| value.to_string());
+    format!(
+        "Reporch Runtime {runtime_version} · sequence {sequence} · protocol {} · {:?} · {:?}. Runtime versions are independent from CLI {}; protocol compatibility governs execution.",
+        status.protocol_version,
+        status.availability,
+        status.backend,
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 fn command_skips_runtime_bootstrap(command: &Command) -> bool {
