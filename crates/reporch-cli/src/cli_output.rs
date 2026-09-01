@@ -128,7 +128,8 @@ impl CliOutput {
         }
         match self.format {
             OutputFormat::Human => eprintln!("{message}"),
-            OutputFormat::Json | OutputFormat::Jsonl => {
+            OutputFormat::Json => {}
+            OutputFormat::Jsonl => {
                 let envelope = ProgressEnvelope {
                     schema: "reporch.cli-progress.v1",
                     command,
