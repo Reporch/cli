@@ -1367,18 +1367,16 @@ fn validate_init_journal_against_templates(
     journal: &InitTransactionJournal,
     expected_files: &[TemplateFile],
 ) -> Result<()> {
-    if journal.files.len() != expected_files.len() {
-        bail!(
-            "interrupted project initialization does not match this template; rerun with the same title and problem type or move the reserved recovery journal aside; no files were changed"
-        );
-    }
-    for (entry, expected) in journal.files.iter().zip(expected_files) {
-        if entry.path != expected.path {
-            bail!(
-                "interrupted project initialization does not match this template at {}; rerun with the same title and problem type or move the reserved recovery journal aside; no files were changed",
-                entry.path
-            );
-        }
+    for entry in &journal.files {
+        let expected = expected_files
+            .iter()
+            .find(|expected| entry.path == expected.path)
+            .with_context(|| {
+                format!(
+                    "interrupted project initialization does not match this template; it contains unknown path {}; move the reserved recovery journal aside; no files were changed",
+                    entry.path
+                )
+            })?;
         if !matches!(expected.path, "reporch.problem.json" | "reporch.yaml")
             && (entry.size_bytes != expected.content.len() as u64
                 || entry.sha256 != studio_core::Sha256Digest::from_bytes(&expected.content))
@@ -2163,3 +2161,6 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod project_template_recovery_regression;
