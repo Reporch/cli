@@ -838,6 +838,22 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                     if extra {
                         spec.testing.validators.extra.push(program);
                     } else {
+                        if source != "validators/input.py"
+                            && spec
+                                .testing
+                                .validators
+                                .primary
+                                .as_ref()
+                                .is_some_and(|primary| primary.source_path == "validators/input.py")
+                        {
+                            spec.testing.validators.unit_tests.retain(|unit| {
+                                !is_starter_validator_unit(
+                                    &unit.name,
+                                    &unit.input_file,
+                                    unit.expected_valid,
+                                )
+                            });
+                        }
                         spec.testing.validators.primary = Some(program);
                     }
                     Ok(())

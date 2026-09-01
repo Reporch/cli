@@ -1454,6 +1454,17 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                             arguments: vec![],
                         });
                     } else {
+                        if source != "validators/input.py"
+                            && spec.judging.validator_path.as_deref() == Some("validators/input.py")
+                        {
+                            spec.judging.validator_tests.retain(|unit| {
+                                !is_starter_validator_unit(
+                                    &unit.name,
+                                    &unit.input_file,
+                                    unit.expected_valid,
+                                )
+                            });
+                        }
                         spec.judging.validator_path = Some(source.clone());
                         spec.judging.validator_language = Some(language.clone());
                     }
@@ -2348,6 +2359,14 @@ fn materialize_validator_unit_input(
         created: Some(root.join(&path)),
         path,
     })
+}
+
+fn is_starter_validator_unit(name: &str, input_file: &str, expected_valid: bool) -> bool {
+    matches!(
+        (name, input_file, expected_valid),
+        ("accepts-sample", "tests/1.in", true)
+            | ("rejects-malformed", "validator-tests/invalid.in", false)
+    )
 }
 
 impl MaterializedManualCase {
