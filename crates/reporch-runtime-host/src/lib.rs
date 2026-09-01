@@ -50,7 +50,7 @@ const MAX_TOOLCHAIN_INDEX_BYTES: usize = 512 * 1024;
 const GUEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_CHANNEL_BASE: &str =
-    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq22";
+    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq23";
 const TOOLCHAIN_CHANNEL_BASE: &str =
     "https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8";
 const RUNTIME_PUBLIC_KEY: &str = include_str!("../../../artifacts/runtime-v1.minisign.pub");
@@ -489,7 +489,10 @@ fn expand_toolchain_archive(
             .context("create expanded toolchain image")?;
         let mut hasher = Sha256::new();
         let mut size = 0_u64;
-        let mut buffer = [0_u8; 1024 * 1024];
+        // Windows services use a 1 MiB default main-thread stack. This code
+        // also runs inside that current-thread service executor, so a 1 MiB
+        // stack buffer can abort the broker while installing a toolchain.
+        let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
             let read = decoder
                 .read(&mut buffer)
@@ -1994,14 +1997,26 @@ pub async fn qualify_installed_native_runtime(
     let project_root =
         std::env::current_dir().context("resolve qualification working directory")?;
     let mut durations = Vec::with_capacity(iterations as usize);
-    for _ in 0..iterations {
+    for iteration in 0..iterations {
         let started = Instant::now();
-        smoke_test_installed_runtime(&project_root).await?;
+        smoke_test_installed_runtime(&project_root)
+            .await
+            .with_context(|| {
+                format!(
+                    "native runtime qualification iteration {}/{}",
+                    iteration + 1,
+                    iterations
+                )
+            })?;
         durations.push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
 
-    let installed = install_toolchain(toolchain_id).await?;
-    let before = verified_toolchain(toolchain_id).await?;
+    let installed = install_toolchain(toolchain_id)
+        .await
+        .context("install signed qualification toolchain")?;
+    let before = verified_toolchain(toolchain_id)
+        .await
+        .context("verify qualification toolchain before execution")?;
     let id = Uuid::now_v7();
     let job = GuestJobV1 {
         schema: reporch_runtime_core::JOB_SCHEMA.into(),
@@ -2032,7 +2047,9 @@ pub async fn qualify_installed_native_runtime(
     };
     job.validate()
         .context("validate qualification toolchain job")?;
-    let result = execute_native(&project_root, &job).await?;
+    let result = execute_native(&project_root, &job)
+        .await
+        .context("execute signed qualification toolchain")?;
     anyhow::ensure!(
         result.exit_code == 0
             && result.stdout.encoding == reporch_runtime_protocol::GuestOutputEncodingV1::Utf8
@@ -2041,7 +2058,9 @@ pub async fn qualify_installed_native_runtime(
             && !result.stderr.truncated,
         "signed toolchain qualification returned an unexpected result"
     );
-    let after = verified_toolchain(toolchain_id).await?;
+    let after = verified_toolchain(toolchain_id)
+        .await
+        .context("verify qualification toolchain after execution")?;
     anyhow::ensure!(
         before.bundle.sha256 == after.bundle.sha256
             && before.bundle.size == after.bundle.size
@@ -3146,7 +3165,7 @@ mod tests {
             parse_channel_url(RUNTIME_CHANNEL_BASE, "runtime")
                 .unwrap()
                 .as_str(),
-            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq22/"
+            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq23/"
         );
         assert_eq!(
             parse_channel_url(TOOLCHAIN_CHANNEL_BASE, "toolchain")
