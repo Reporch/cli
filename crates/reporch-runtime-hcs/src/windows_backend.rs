@@ -336,6 +336,13 @@ impl HvSocketStream {
             last_error.map_or(0, |error| error.0)
         )
     }
+
+    pub fn set_io_timeout(&self, timeout: Duration) -> Result<()> {
+        let milliseconds = u32::try_from(timeout.as_millis())?;
+        ensure!(milliseconds > 0, "Hyper-V socket I/O timeout is zero");
+        set_timeout(self.socket, SO_RCVTIMEO, milliseconds)?;
+        set_timeout(self.socket, SO_SNDTIMEO, milliseconds)
+    }
 }
 
 fn set_blocking(socket: SOCKET) -> Result<()> {

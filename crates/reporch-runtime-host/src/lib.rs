@@ -50,7 +50,7 @@ const MAX_TOOLCHAIN_INDEX_BYTES: usize = 512 * 1024;
 const GUEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_CHANNEL_BASE: &str =
-    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq19";
+    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq20";
 const TOOLCHAIN_CHANNEL_BASE: &str =
     "https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8";
 const RUNTIME_PUBLIC_KEY: &str = include_str!("../../../artifacts/runtime-v1.minisign.pub");
@@ -1212,6 +1212,18 @@ pub fn exchange_with_guest_sync(
         _ => return Err(RuntimeError::ProtocolIncompatible.into()),
     };
     handshake.validate(&job.nonce, expected_bundle_digest)?;
+    exchange_job_with_guest_sync(stream, project_root, job)
+}
+
+/// Send a job only after the caller has authenticated a complete guest
+/// handshake. Keeping this phase separate lets the Windows HCS adapter retry
+/// an early transport connection without ever executing a job twice.
+pub fn exchange_job_with_guest_sync(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    project_root: &Path,
+    job: &GuestJobV1,
+) -> Result<GuestResultV1> {
+    job.validate()?;
     write_wire_message_sync(stream, &WireMessageV1::Job(job.clone()))?;
 
     for (index, input) in job.inputs.iter().enumerate() {
@@ -1289,6 +1301,19 @@ pub fn exchange_with_guest_sync_challenged(
     job: &GuestJobV1,
     expected_bundle_digest: &str,
 ) -> Result<GuestResultV1> {
+    establish_guest_session_sync_challenged(stream, job, expected_bundle_digest)?;
+    exchange_job_with_guest_sync(stream, project_root, job)
+}
+
+/// Authenticate a Hyper-V guest before any executable job content is sent.
+/// HCS can transiently expose a connectable socket before the guest listener
+/// is ready, so callers may safely retry this phase on a fresh connection.
+pub fn establish_guest_session_sync_challenged(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    job: &GuestJobV1,
+    expected_bundle_digest: &str,
+) -> Result<()> {
+    job.validate()?;
     let challenge = HostChallengeV1 {
         schema: reporch_runtime_protocol::HOST_CHALLENGE_SCHEMA.into(),
         protocol_version: PROTOCOL_VERSION,
@@ -1297,7 +1322,12 @@ pub fn exchange_with_guest_sync_challenged(
     };
     challenge.validate()?;
     write_wire_message_sync(stream, &WireMessageV1::HostChallenge(challenge))?;
-    exchange_with_guest_sync(stream, project_root, job, expected_bundle_digest)
+    let handshake = match read_wire_message_sync(stream)? {
+        WireMessageV1::Handshake(handshake) => handshake,
+        _ => return Err(RuntimeError::ProtocolIncompatible.into()),
+    };
+    handshake.validate(&job.nonce, expected_bundle_digest)?;
+    Ok(())
 }
 
 async fn write_wire_with_idle_timeout(
@@ -3056,7 +3086,7 @@ mod tests {
             parse_channel_url(RUNTIME_CHANNEL_BASE, "runtime")
                 .unwrap()
                 .as_str(),
-            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq19/"
+            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq20/"
         );
         assert_eq!(
             parse_channel_url(TOOLCHAIN_CHANNEL_BASE, "toolchain")
@@ -3409,6 +3439,78 @@ mod tests {
             .unwrap();
         assert_eq!(result.exit_code, 0);
         guest.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn challenged_sync_exchange_authenticates_before_sending_a_job() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle_digest = format!("sha256:{}", "b".repeat(64));
+        let job = GuestJobV1 {
+            schema: JOB_SCHEMA.into(),
+            protocol_version: PROTOCOL_VERSION,
+            id: Uuid::now_v7(),
+            nonce: "nonce-0123456789abcdef".into(),
+            operation: GuestOperationV1::Program,
+            toolchain_id: "runtime-self-test".into(),
+            toolchain_index_sequence: None,
+            toolchain_bundle_sha256: None,
+            toolchain_lock_sha256: None,
+            command: vec!["/sbin/reporch-guestd".into(), "--self-test-workload".into()],
+            environment: BTreeMap::new(),
+            inputs: Vec::new(),
+            limits: ResourceLimitsV1 {
+                timeout_ms: 1_000,
+                memory_mib: 64,
+                cpu_millis: 1_000,
+                pids: 16,
+                stdout_bytes: 1_024,
+                stderr_bytes: 1_024,
+                artifact_bytes: 1_024,
+            },
+        };
+        let guest_job = job.clone();
+        let guest_bundle = bundle_digest.clone();
+        let (mut host_stream, mut guest_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let guest = std::thread::spawn(move || {
+            let challenge = match read_wire_message_sync(&mut guest_stream).unwrap() {
+                WireMessageV1::HostChallenge(challenge) => challenge,
+                message => panic!("expected host challenge, got {message:?}"),
+            };
+            challenge.validate().unwrap();
+            assert_eq!(challenge.nonce, guest_job.nonce);
+            assert_eq!(challenge.runtime_bundle_digest, guest_bundle);
+            let handshake = GuestHandshakeV1 {
+                schema: HANDSHAKE_SCHEMA.into(),
+                protocol_version: PROTOCOL_VERSION,
+                guest_version: "test".into(),
+                runtime_bundle_digest: challenge.runtime_bundle_digest,
+                nonce: challenge.nonce,
+            };
+            write_wire_message_sync(&mut guest_stream, &WireMessageV1::Handshake(handshake))
+                .unwrap();
+            assert!(matches!(
+                read_wire_message_sync(&mut guest_stream).unwrap(),
+                WireMessageV1::Job(_)
+            ));
+            let result = GuestResultV1 {
+                schema: RESULT_SCHEMA.into(),
+                protocol_version: PROTOCOL_VERSION,
+                job_id: guest_job.id,
+                nonce: guest_job.nonce,
+                exit_code: 0,
+                duration_ms: 1,
+                stdout: GuestOutputV1::from_bytes(b"ok", false),
+                stderr: GuestOutputV1::from_bytes(b"", false),
+                artifacts: Vec::new(),
+            };
+            write_wire_message_sync(&mut guest_stream, &WireMessageV1::Result(result)).unwrap();
+        });
+
+        establish_guest_session_sync_challenged(&mut host_stream, &job, &bundle_digest).unwrap();
+        let result = exchange_job_with_guest_sync(&mut host_stream, root.path(), &job).unwrap();
+        assert_eq!(result.exit_code, 0);
+        guest.join().unwrap();
     }
 
     #[cfg(unix)]
