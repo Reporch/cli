@@ -417,7 +417,12 @@ struct RuntimeProgramRunOptions {
     /// Test name, UUID, or declared input path (for example `sample-1` or `tests/1.in`).
     #[arg(long, value_name = "NAME|UUID|PATH")]
     test: String,
-    #[arg(long)]
+    /// Save captured program output inside the project.
+    #[arg(
+        long,
+        value_name = "PROJECT_RELATIVE_PATH",
+        value_parser = parse_runtime_output_path
+    )]
     output: Option<PathBuf>,
     #[command(flatten)]
     runtime: RuntimeOptions,
@@ -542,7 +547,12 @@ struct RuntimeOptions {
     /// Execution backend. `auto` uses the mandatory Reporch VM; `podman` and `docker` are deprecated explicit compatibility modes.
     #[arg(long, value_enum, default_value_t = RuntimeKind::Auto)]
     runtime: RuntimeKind,
-    #[arg(long, default_value_t = 30)]
+    /// Sandbox wall timeout in seconds.
+    #[arg(
+        long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..=600)
+    )]
     timeout_seconds: u64,
     #[arg(long, default_value_t = 512)]
     memory_mib: u64,
@@ -3077,4 +3087,12 @@ fn parse_output_mapping(value: &str) -> Result<(Uuid, String), String> {
         })?;
     let path = relative_string(Path::new(path)).map_err(|error| error.to_string())?;
     Ok((test_id, path))
+}
+
+fn parse_runtime_output_path(value: &str) -> Result<PathBuf, String> {
+    let normalized = relative_string(Path::new(value)).map_err(|_| {
+        "output must be a safe project-relative path, for example artifacts/transcript.txt"
+            .to_owned()
+    })?;
+    Ok(PathBuf::from(normalized))
 }
