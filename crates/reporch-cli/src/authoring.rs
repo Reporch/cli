@@ -567,10 +567,11 @@ impl RuntimeOptions {
         self,
         output: &CliOutput,
     ) -> reporch_cli::authoring_runtime::AuthoringRunOptions {
-        output.progress(
-            "local execution",
-            "Preparing the Reporch VM and signed toolchain; first use may download and verify assets",
-        );
+        output.progress("local execution", "Initializing local verification");
+        let progress_output = output.clone();
+        let progress = reporch_cli::authoring_runtime::AuthoringProgress::new(move |message| {
+            progress_output.progress("local execution", message);
+        });
         let runtime = match self.runtime {
             RuntimeKind::Auto => reporch_cli::local_sandbox::OciRuntime::Auto,
             RuntimeKind::Podman => reporch_cli::local_sandbox::OciRuntime::Podman,
@@ -583,6 +584,7 @@ impl RuntimeOptions {
             memory_mib: self.memory_mib,
             cpus: self.cpus,
             output_kib: self.output_kib,
+            progress,
         }
     }
 }
