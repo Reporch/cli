@@ -43,6 +43,9 @@ DeviceAllow=/dev/kvm rwm
 # dropping privileges, even when the VM config has no network interface. The
 # unprivileged VMM receives neither CAP_NET_ADMIN nor a configured NIC.
 DeviceAllow=/dev/net/tun rwm
+# On kernel 6.1+, the pinned jailer also mirrors this exact device into the
+# jail. The service still cannot access any device outside this closed list.
+DeviceAllow=/dev/userfaultfd rwm
 ReadWritePaths=/var/lib/reporch-runtime /run/reporch-runtime /run/user
 
 [Install]
