@@ -13,7 +13,7 @@ use studio_core::{
     JudgingSpec, ManifestFile, OutputSubmissionSpec, PackageProfile, ProblemType,
     PublicationSampleV1, PublicationSpecV1, RELEASE_MANIFEST_SCHEMA_V1, ReleaseManifestV1,
     ResourceLimits, ScoreAggregation, SolutionSpec, StatementSectionsV1, TestCaseSpec,
-    TestGroupSpec,
+    TestGroupSpec, ValidatorTestSpec,
 };
 use uuid::Uuid;
 
@@ -55,6 +55,14 @@ enum InitRecoveryOutcome {
     None,
     RolledBack,
     Committed,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TemplateOptions {
+    emit_v2: bool,
+    allow_non_empty: bool,
+    required_project_id: Option<Uuid>,
+    portable: bool,
 }
 
 struct TemplateFile {
@@ -119,9 +127,12 @@ pub fn init_project_template_with_options(
         title,
         project_id,
         problem_type,
-        true,
-        allow_non_empty,
-        Some(project_id),
+        TemplateOptions {
+            emit_v2: true,
+            allow_non_empty,
+            required_project_id: Some(project_id),
+            portable: false,
+        },
     )
 }
 
@@ -138,9 +149,34 @@ pub fn init_project_template_with_optional_id(
         title,
         generated_project_id,
         problem_type,
-        true,
-        allow_non_empty,
-        project_id,
+        TemplateOptions {
+            emit_v2: true,
+            allow_non_empty,
+            required_project_id: project_id,
+            portable: false,
+        },
+    )
+}
+
+pub fn init_portable_project_template_with_optional_id(
+    directory: &Path,
+    title: &str,
+    project_id: Option<Uuid>,
+    problem_type: ProblemType,
+    allow_non_empty: bool,
+) -> Result<()> {
+    let generated_project_id = project_id.unwrap_or_else(Uuid::now_v7);
+    init_project_template_versioned(
+        directory,
+        title,
+        generated_project_id,
+        problem_type,
+        TemplateOptions {
+            emit_v2: true,
+            allow_non_empty,
+            required_project_id: project_id,
+            portable: true,
+        },
     )
 }
 
@@ -156,9 +192,12 @@ pub fn init_legacy_v1_project_template(
         title,
         project_id,
         problem_type,
-        false,
-        false,
-        Some(project_id),
+        TemplateOptions {
+            emit_v2: false,
+            allow_non_empty: false,
+            required_project_id: Some(project_id),
+            portable: false,
+        },
     )
 }
 
@@ -167,10 +206,14 @@ fn init_project_template_versioned(
     title: &str,
     project_id: Uuid,
     problem_type: ProblemType,
-    emit_v2: bool,
-    allow_non_empty: bool,
-    required_project_id: Option<Uuid>,
+    options: TemplateOptions,
 ) -> Result<()> {
+    let TemplateOptions {
+        emit_v2,
+        allow_non_empty,
+        required_project_id,
+        portable,
+    } = options;
     let title = title.trim();
     if title.is_empty() {
         bail!("title is required");
@@ -187,6 +230,20 @@ fn init_project_template_versioned(
         TemplateFile::text("tests/1.in", sample_input, "text/plain"),
         TemplateFile::text("tests/1.ans", sample_answer, "text/plain"),
     ];
+    if portable {
+        files.extend([
+            TemplateFile::text(
+                "validators/input.py",
+                starter_validator(problem_type),
+                "text/x-python",
+            ),
+            TemplateFile::text(
+                "validator-tests/invalid.in",
+                "not-an-integer\n",
+                "text/plain",
+            ),
+        ]);
+    }
 
     match problem_type {
         ProblemType::Standard => add_python_solutions(&mut files),
@@ -294,11 +351,26 @@ fn init_project_template_versioned(
             tests,
             groups: scoring_groups(problem_type),
             generators: vec![],
-            validator_path: None,
-            validator_language: None,
+            validator_path: portable.then(|| "validators/input.py".into()),
+            validator_language: portable.then(|| "python3".into()),
             extra_validator_paths: vec![],
             extra_validators: vec![],
-            validator_tests: vec![],
+            validator_tests: if portable {
+                vec![
+                    ValidatorTestSpec {
+                        name: "accepts-sample".into(),
+                        input_file: "tests/1.in".into(),
+                        expected_valid: true,
+                    },
+                    ValidatorTestSpec {
+                        name: "rejects-malformed".into(),
+                        input_file: "validator-tests/invalid.in".into(),
+                        expected_valid: false,
+                    },
+                ]
+            } else {
+                vec![]
+            },
             checker_tests: vec![],
             interactor_path,
             interactor_language,
@@ -478,6 +550,14 @@ fn preflight_init_before_lock(
         return Ok(());
     }
     preflight_template_destinations(directory, files, allow_non_empty)
+}
+
+fn starter_validator(problem_type: ProblemType) -> &'static str {
+    if problem_type == ProblemType::Interactive {
+        "import sys\n\ndef main():\n    tokens = sys.stdin.read().split()\n    if len(tokens) != 1:\n        return 1\n    try:\n        value = int(tokens[0])\n    except ValueError:\n        return 1\n    return 0 if abs(value) <= 10**9 else 1\n\nraise SystemExit(main())\n"
+    } else {
+        "import sys\n\ndef main():\n    tokens = sys.stdin.read().split()\n    if len(tokens) != 2:\n        return 1\n    try:\n        values = [int(token) for token in tokens]\n    except ValueError:\n        return 1\n    return 0 if all(abs(value) <= 10**9 for value in values) else 1\n\nraise SystemExit(main())\n"
+    }
 }
 
 fn add_python_solutions(files: &mut Vec<TemplateFile>) {
@@ -1338,18 +1418,16 @@ fn validate_init_journal_against_templates(
     journal: &InitTransactionJournal,
     expected_files: &[TemplateFile],
 ) -> Result<()> {
-    if journal.files.len() != expected_files.len() {
-        bail!(
-            "interrupted project initialization does not match this template; rerun with the same title and problem type or move the reserved recovery journal aside; no files were changed"
-        );
-    }
-    for (entry, expected) in journal.files.iter().zip(expected_files) {
-        if entry.path != expected.path {
-            bail!(
-                "interrupted project initialization does not match this template at {}; rerun with the same title and problem type or move the reserved recovery journal aside; no files were changed",
-                entry.path
-            );
-        }
+    for entry in &journal.files {
+        let expected = expected_files
+            .iter()
+            .find(|expected| entry.path == expected.path)
+            .with_context(|| {
+                format!(
+                    "interrupted project initialization does not match this template; it contains unknown path {}; move the reserved recovery journal aside; no files were changed",
+                    entry.path
+                )
+            })?;
         if !matches!(expected.path, "reporch.problem.json" | "reporch.yaml")
             && (entry.size_bytes != expected.content.len() as u64
                 || entry.sha256 != studio_core::Sha256Digest::from_bytes(&expected.content))
@@ -2134,3 +2212,6 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod project_template_recovery_regression;

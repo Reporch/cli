@@ -88,6 +88,10 @@ enum Command {
     Migrate(MigrateOptions),
     /// Validate reporch.yaml and every declared local file without network access.
     Check,
+    /// Show local project linkage and dirty state. Alias for `project status`.
+    Status,
+    /// Show local file and metadata changes. Alias for `project diff`.
+    Diff,
     /// Edit localized problem statements.
     Statement(authoring::StatementOptions),
     /// Add and organize tests. With no subcommand, starts a line-oriented guide.
@@ -130,7 +134,7 @@ enum Command {
         #[command(subcommand)]
         command: MemberCommand,
     },
-    /// Inspect Studio API compatibility and the active account's quota.
+    /// Inspect authenticated Studio API compatibility and quota; use `runtime doctor` for the local VM.
     Doctor(studio_remote::RemoteConnectionOptions),
     /// Inspect and maintain the mandatory Reporch virtual-machine runtime.
     Runtime {
@@ -190,7 +194,7 @@ enum Command {
         #[command(subcommand)]
         command: PackageCommand,
     },
-    /// Plan or run an opt-in, rootless, networkless OCI command.
+    /// Plan or run a networkless Reporch VM command; explicit OCI backends are deprecated.
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
@@ -225,6 +229,9 @@ struct SubmitOptions {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Migration applies only to a pre-1.0 directory that has reporch.problem.json and no reporch.yaml. It creates reporch.problem.pre-1.0.json without overwriting and verifies semantic/file-hash equality. A modern project reports migrated:false because no migration is needed.\n\nExample:\n  reporch migrate --directory ./legacy-problem --yes"
+)]
 struct MigrateOptions {
     #[arg(long, default_value = ".")]
     directory: PathBuf,
@@ -329,7 +336,9 @@ struct SandboxOptions {
 enum SandboxRuntime {
     #[default]
     Auto,
+    /// Deprecated explicit compatibility backend.
     Podman,
+    /// Deprecated explicit compatibility backend.
     Docker,
 }
 
@@ -394,6 +403,9 @@ struct ProjectInitOptions {
     /// Initialize alongside unrelated existing files after checking every generated path for collisions.
     #[arg(long)]
     allow_non_empty: bool,
+    /// Include a validator and unit matrix for immediate ICPC, Polygon, and DOMjudge export. `reporch new` enables this automatically.
+    #[arg(long)]
+    portable: bool,
     #[arg(long, value_enum, default_value_t = studio_remote::RemoteProblemType::Standard)]
     problem_type: studio_remote::RemoteProblemType,
     /// Bind the local manifest to an existing private Studio project.
@@ -700,7 +712,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         no_input,
         profile.as_deref(),
     );
-    ensure_mandatory_runtime(&command).await?;
+    ensure_mandatory_runtime(&command, output).await?;
     let _configuration = (profile.clone(), no_input, verbose, output.colors_enabled());
     let package_profile = profile_config::package_profile_argument()
         .map(|value| {
@@ -716,6 +728,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::New(options) => execute_project_init(options, "new", output),
         Command::Migrate(options) => migrate(&options, yes, output),
         Command::Check => check_project(output),
+        Command::Status => emit_project_status("status", output),
+        Command::Diff => emit_project_diff("diff", output),
         Command::Statement(options) => authoring::statement(options, output),
         Command::Test(options) => authoring::tests(options, output, no_input),
         Command::Generator(options) => authoring::generator(options, output).await,
@@ -752,7 +766,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             )
         }
         Command::Auth { command } => match command {
-            AuthCommand::Login(options) => auth_login(&options, output).await,
+            AuthCommand::Login(options) => auth_login(&options, no_input, output).await,
             AuthCommand::Status(options) => auth_status(&options, output).await,
             AuthCommand::Logout(options) => auth_logout(&options, profile.as_deref(), output).await,
         },
@@ -822,35 +836,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     &format!("Opened project {project_id}"),
                 )
             }
-            ProjectCommand::Status => {
-                let status = local_project_status(Path::new("."))?;
-                let human = format!(
-                    "{} · {} · {}",
-                    status.project_id,
-                    if status.linked {
-                        "linked"
-                    } else {
-                        "not linked"
-                    },
-                    if status.dirty { "changes" } else { "clean" }
-                );
-                output.emit("project status", &status, &human)
-            }
-            ProjectCommand::Diff => {
-                let diff = local_project_diff(Path::new("."))?;
-                let human = format!(
-                    "{} added, {} modified, {} removed{}",
-                    diff.added.len(),
-                    diff.modified.len(),
-                    diff.removed.len(),
-                    if diff.metadata_changed {
-                        ", metadata changed"
-                    } else {
-                        ""
-                    }
-                );
-                output.emit("project diff", &diff, &human)
-            }
+            ProjectCommand::Status => emit_project_status("project status", output),
+            ProjectCommand::Diff => emit_project_diff("project diff", output),
             ProjectCommand::Create(options) => {
                 let project = studio_remote::create_operation(&options).await?;
                 output.emit(
@@ -1391,6 +1378,12 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 output.emit("toolchain inspect", &inspected, &human)
             }
             ToolchainCommand::Install { id, runtime } => {
+                output.progress(
+                    "toolchain install",
+                    &format!(
+                        "Preparing signed toolchain {id}; the first install may take a few minutes"
+                    ),
+                );
                 let installed = reporch_cli::toolchain::install(&id, runtime.into_oci()).await?;
                 output.emit(
                     "toolchain install",
@@ -1410,6 +1403,10 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 };
                 let mut installed = Vec::with_capacity(ids.len());
                 for id in ids {
+                    output.progress(
+                        "toolchain prefetch",
+                        &format!("Preparing signed toolchain {id}"),
+                    );
                     installed.push(reporch_cli::toolchain::install(&id, runtime.into_oci()).await?);
                 }
                 output.emit(
@@ -1431,7 +1428,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
     }
 }
 
-async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
+async fn ensure_mandatory_runtime(command: &Command, output: &CliOutput) -> Result<()> {
     if command_skips_runtime_bootstrap(command) {
         return Ok(());
     }
@@ -1448,6 +1445,10 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
         .context("import the packaged Reporch Runtime")?;
     let status = reporch_runtime_host::status().await?;
     if status.installed_version.is_none() {
+        output.progress(
+            "runtime bootstrap",
+            "Installing the signed Reporch VM Runtime; this is required once per machine",
+        );
         reporch_runtime_host::update()
             .await
             .context("complete mandatory Reporch Runtime bootstrap")?;
@@ -1461,6 +1462,10 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
         return Ok(());
     }
     if reporch_runtime_host::verify_installed().await.is_err() {
+        output.progress(
+            "runtime repair",
+            "Repairing the signed Reporch VM Runtime while preserving projects and credentials",
+        );
         reporch_runtime_host::repair()
             .await
             .context("repair mandatory Reporch Runtime assets")?;
@@ -1470,6 +1475,7 @@ async fn ensure_mandatory_runtime(command: &Command) -> Result<()> {
 
 fn command_skips_runtime_bootstrap(command: &Command) -> bool {
     matches!(command, Command::Completion { .. })
+        || matches!(command, Command::Auth { .. })
         || matches!(command, Command::Desktop { .. } | Command::Artifact { .. })
         || matches!(
             command,
@@ -1495,13 +1501,24 @@ fn execute_project_init(
     command: &str,
     output: &CliOutput,
 ) -> Result<()> {
-    reporch_cli::init_project_template_with_optional_id(
-        &options.directory,
-        &options.title,
-        options.project_id,
-        options.problem_type.into(),
-        options.allow_non_empty,
-    )?;
+    let portable = options.portable || command == "new";
+    if portable {
+        reporch_cli::init_portable_project_template_with_optional_id(
+            &options.directory,
+            &options.title,
+            options.project_id,
+            options.problem_type.into(),
+            options.allow_non_empty,
+        )?;
+    } else {
+        reporch_cli::init_project_template_with_optional_id(
+            &options.directory,
+            &options.title,
+            options.project_id,
+            options.problem_type.into(),
+            options.allow_non_empty,
+        )?;
+    }
     let status = local_project_status(&options.directory)?;
     let existing_directory_note = if options.allow_non_empty {
         "\nExisting unrelated files were preserved; every generated path was collision-checked before writing."
@@ -1542,6 +1559,37 @@ fn migrate(options: &MigrateOptions, yes: bool, output: &CliOutput) -> Result<()
         format!("Already migrated: {}", outcome.directory.display())
     };
     output.emit("migrate", &outcome, &human)
+}
+
+fn emit_project_status(command: &str, output: &CliOutput) -> Result<()> {
+    let status = local_project_status(Path::new("."))?;
+    let human = format!(
+        "{} · {} · {}",
+        status.project_id,
+        if status.linked {
+            "linked"
+        } else {
+            "not linked"
+        },
+        if status.dirty { "changes" } else { "clean" }
+    );
+    output.emit(command, &status, &human)
+}
+
+fn emit_project_diff(command: &str, output: &CliOutput) -> Result<()> {
+    let diff = local_project_diff(Path::new("."))?;
+    let human = format!(
+        "{} added, {} modified, {} removed{}",
+        diff.added.len(),
+        diff.modified.len(),
+        diff.removed.len(),
+        if diff.metadata_changed {
+            ", metadata changed"
+        } else {
+            ""
+        }
+    );
+    output.emit(command, &diff, &human)
 }
 
 fn check_project(output: &CliOutput) -> Result<()> {
@@ -1796,6 +1844,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::New(_) => "new",
         Command::Migrate(_) => "migrate",
         Command::Check => "check",
+        Command::Status => "status",
+        Command::Diff => "diff",
         Command::Statement(_) => "statement",
         Command::Test(_) => "test",
         Command::Generator(_) => "generator",
@@ -2062,7 +2112,11 @@ fn qualification_authoring_matrix(
     ))
 }
 
-async fn auth_login(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
+async fn auth_login(options: &NativeAuthOptions, no_input: bool, output: &CliOutput) -> Result<()> {
+    ensure!(
+        !no_input,
+        "interactive input is disabled for this command; rerun `reporch auth login` without --no-input"
+    );
     let config = device_auth_config(options)?;
     let client = NativeAuthClient::discover(config)
         .await

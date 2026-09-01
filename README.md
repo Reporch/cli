@@ -15,7 +15,9 @@ reporch --version
 The legacy command alias `reporch-studio` invokes the same binary. The npm
 package has no lifecycle scripts and does not download executable code during
 installation. It selects a platform-specific binary delivered and integrity
-checked by npm.
+checked by npm. Before the first operational command, that binary verifies and
+installs the mandatory signed Reporch VM Runtime; `--help`, `--version`, and
+completion remain immediate.
 
 Supported systems:
 
@@ -38,6 +40,8 @@ cd my-problem
 reporch test                                      # interactive, line-oriented guide
 reporch test case add --name edge \
   --input-text "0 0" --answer-text "0"            # literal text, no files to prepare
+reporch statement add --locale en --path statements/en.md \
+  --title "My problem" --create                    # safely create a new statement
 reporch check                                     # static and completely offline
 reporch auth login
 reporch project create --title "My problem"       # copy the returned project ID
@@ -48,7 +52,9 @@ reporch review submit
 ```
 
 `reporch --help` prints this complete quick start, and `reporch new` is the
-short form of `reporch project init`. File options are labeled explicitly as
+guided, portable form of `reporch project init`: it includes an input validator
+and positive/negative validator units so ICPC, Polygon, and DOMjudge export can
+work immediately. File options are labeled explicitly as
 `INPUT_FILE`, `ANSWER_FILE`, and `SOURCE_FILE`; literal manual tests use
 `--input-text` and `--answer-text`.
 
@@ -125,6 +131,9 @@ reporch project init \
   --directory ./my-problem
 ```
 
+Add `--portable` to the longer `project init` form when the project should
+include the same validator starter as `reporch new`.
+
 The target directory is empty by default. To initialize inside an existing
 checkout, opt in with `--allow-non-empty`; Reporch checks every generated path
 before writing, refuses collisions or stale `.reporch/state.json`, and writes
@@ -154,6 +163,8 @@ reporch grader run --solution solutions/accepted.cpp --test tests/1.in
 paths. It is an expectation summary, not execution evidence. `output remove`
 prunes declarations used only by the removed mapping but deliberately leaves
 the files on disk so cleanup remains recoverable.
+`checker test` is an alias for `checker run`. `status` and `diff` are short
+forms of `project status` and `project diff`.
 
 Validator unit inputs support the same unambiguous file-or-text split as manual
 tests:
@@ -178,7 +189,9 @@ reporch migrate                 # previews and confirms in a TTY
 reporch --no-input --yes migrate # required form in CI
 ```
 
-Migration creates `reporch.problem.pre-1.0.json` once, writes `reporch.yaml`
+Migration applies only when a pre-1.0 `reporch.problem.json` exists without
+`reporch.yaml`. A current project returns `migrated:false`. Migration creates
+`reporch.problem.pre-1.0.json` once, writes `reporch.yaml`
 atomically, and checks that the generated immutable manifest has the same
 meaning and file hashes. The backup is never overwritten.
 
@@ -255,21 +268,21 @@ reporch revision diff <from-commit> <to-commit>
 reporch revision restore <commit> --directory ../restored-problem
 ```
 
-Local validation toolchains are opt-in. The available catalog is embedded in
+The available toolchain catalog is embedded in
 the binary and verified with an embedded Minisign public key before it is
-parsed. Install accepts only a catalog ID; arbitrary tags and images are not an
-input surface. Every catalog image is pinned by SHA-256 and the OCI runtime is
-re-inspected after the explicit pull:
+parsed. The first command that needs a language automatically installs the
+signed, digest-pinned toolchain. `prefetch` prepares CI or offline work in
+advance; arbitrary tags and images are not an input surface:
 
 ```bash
 reporch toolchain list
 reporch toolchain inspect gcc-16.1-cpp
-reporch toolchain install gcc-16.1-cpp
+reporch toolchain prefetch gcc-16.1-cpp
 ```
 
-`sandbox run` continues to use `--pull=never`, network isolation, a read-only
-root filesystem, dropped capabilities, and resource limits. Local results are
-never accepted as Studio release evidence.
+`auto` uses the networkless Reporch VM. Explicit `--runtime podman|docker`
+remains as a deprecated 1.x compatibility path. Local results are never
+accepted as Studio release evidence.
 
 Downloads never overwrite an existing path and are installed only after the
 declared size and SHA-256 both match. Progress events can be resumed by durable
@@ -315,24 +328,21 @@ profiles never contain tokens.
 ## Local sandbox
 
 Commands that compile or execute author code, including `answer generate`,
-`generator run`, `validator run`, `interactor run`, and `grader run`, always use
-the same isolated local sandbox. They never fall back to direct host execution.
-Local execution requires rootless Podman or rootless Docker, a digest-pinned
-image, disabled networking, a read-only project mount, and explicit resource
-limits. Standard checker and output-only comparisons do not execute author
-code and can run without an OCI daemon.
-
-On macOS, the recommended setup is rootless Podman:
+`generator run`, `validator run`, `interactor run`, and `grader run`, use an
+ephemeral networkless Linux VM. They never fall back to direct host execution
+and do not require Docker or Podman. Reporch uses Apple Virtualization.framework
+on macOS, Firecracker/KVM on Linux, and Hyper-V/HCS on Windows. Check or repair
+the installed runtime with:
 
 ```bash
-brew install podman
-podman machine init
-podman machine start
-reporch toolchain list
+reporch runtime status
+reporch runtime doctor
+reporch runtime doctor --fix
 ```
 
-Toolchain installation remains explicit. If local isolation is unavailable,
-use `reporch verify` for official Studio execution evidence.
+If host virtualization is unavailable, TTY users can consent once to an
+isolated Studio preview. CI must pass `--allow-remote-fallback` explicitly.
+Only `reporch verify` creates official Studio execution evidence.
 
 ## Build from source
 
@@ -360,6 +370,7 @@ release can be packaged.
 
 - [CLI 1.x automation contract](docs/cli-contract-v1.md)
 - [CLI 1.0 beta and stability gate](docs/1.0-beta.md)
+- [Reporch Runtime v1](docs/runtime-v1.md)
 - [Toolchain index signing and key rotation](docs/toolchain-index.md)
 - [Security policy and private reporting](SECURITY.md)
 

@@ -32,6 +32,9 @@ enum StatementCommand {
         path: PathBuf,
         #[arg(long)]
         title: Option<String>,
+        /// Create a safe Markdown starter when the path does not exist.
+        #[arg(long)]
+        create: bool,
     },
     Open {
         #[arg(long)]
@@ -56,6 +59,9 @@ enum StatementRenderFormat {
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  reporch test case add --name sample-1 --input-text '1 2' --answer-text '3' --group samples\n  reporch test group add samples --points 0\n  reporch test group add full-score --points 100 --depends-on samples"
+)]
 pub struct TestOptions {
     #[command(subcommand)]
     command: Option<TestCommand>,
@@ -156,6 +162,9 @@ struct TestGroupUpdateOptions {
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  reporch generator add --id random --source generators/random.py --language python3\n  reporch generator run random --seed 1 --output tests/generated/01.in --name random-1 --group full-score\n  reporch generator recipe random --name-prefix random --count 20 --seed-start 1 --group full-score"
+)]
 pub struct GeneratorOptions {
     #[command(subcommand)]
     command: GeneratorCommand,
@@ -172,6 +181,7 @@ enum GeneratorCommand {
 
 #[derive(Debug, ClapArgs)]
 struct GeneratorRunOptions {
+    /// Generator ID declared by `generator add`.
     id: String,
     #[arg(long)]
     output: PathBuf,
@@ -189,7 +199,9 @@ struct GeneratorRunOptions {
 
 #[derive(Debug, ClapArgs)]
 struct GeneratorRecipeOptions {
+    /// Generator ID declared by `generator add`.
     id: String,
+    /// Prefix for generated test names.
     #[arg(long)]
     name_prefix: String,
     #[arg(long, default_value = "tests/generated")]
@@ -208,17 +220,24 @@ struct GeneratorRecipeOptions {
 
 #[derive(Debug, ClapArgs)]
 struct ProgramAddOptions {
+    /// Stable generator ID used by run and recipe commands.
     #[arg(long)]
     id: String,
+    /// Generator source path inside this project.
     #[arg(long)]
     source: PathBuf,
+    /// Toolchain language, for example python3, cpp20, or rust.
     #[arg(long)]
     language: String,
+    /// Fixed argument passed before seed and recipe arguments; repeat as needed.
     #[arg(long = "argument")]
     arguments: Vec<String>,
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  reporch validator set --source validators/input.py --language python3\n  reporch validator unit-add --name accepts-sample --input-text '1 2' --expected valid\n  reporch validator unit-add --name rejects-text --input-text 'x' --expected invalid\n  reporch validator run"
+)]
 pub struct ValidatorOptions {
     #[command(subcommand)]
     command: ValidatorCommand,
@@ -269,6 +288,9 @@ enum ValidityExpectation {
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  reporch checker set --kind token\n  reporch checker set --kind floating --absolute-error 1e-6 --relative-error 1e-6\n  reporch checker unit-add --name rejects-wrong --input tests/01.in --answer tests/01.ans --output checker-tests/wrong.out --expected reject\n  reporch checker test"
+)]
 pub struct CheckerOptions {
     #[command(subcommand)]
     command: CheckerCommand,
@@ -301,6 +323,7 @@ enum CheckerCommand {
         #[arg(long, value_enum)]
         expected: CheckerExpectation,
     },
+    #[command(alias = "test")]
     Run {
         #[arg(long)]
         name: Option<String>,
@@ -468,6 +491,24 @@ enum StressCommand {
     },
 }
 
+#[derive(Debug, ClapArgs)]
+struct OutputRemoveOptions {
+    /// Submission name. The positional form is retained for compatibility.
+    #[arg(value_name = "NAME", required_unless_present = "name_option")]
+    name: Option<String>,
+    /// Submission name.
+    #[arg(long = "name", value_name = "NAME", conflicts_with = "name")]
+    name_option: Option<String>,
+}
+
+impl OutputRemoveOptions {
+    fn into_name(self) -> String {
+        self.name_option
+            .or(self.name)
+            .expect("clap requires a name")
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum OutputCommand {
     List,
@@ -484,9 +525,7 @@ enum OutputCommand {
         #[arg(long)]
         maximum_score: Option<f64>,
     },
-    Remove {
-        name: String,
-    },
+    Remove(OutputRemoveOptions),
     Test {
         #[arg(long)]
         name: Option<String>,
@@ -500,7 +539,7 @@ struct RuntimeOptions {
     /// Signed toolchain catalog ID. Inferred from the configured language when omitted.
     #[arg(long)]
     toolchain: Option<String>,
-    /// Secure OCI runtime. Local author-code execution requires rootless Podman or Docker and never falls back to the host.
+    /// Execution backend. `auto` uses the mandatory Reporch VM; `podman` and `docker` are deprecated explicit compatibility modes.
     #[arg(long, value_enum, default_value_t = RuntimeKind::Auto)]
     runtime: RuntimeKind,
     #[arg(long, default_value_t = 30)]
@@ -517,12 +556,21 @@ struct RuntimeOptions {
 enum RuntimeKind {
     #[default]
     Auto,
+    /// Deprecated explicit compatibility backend.
     Podman,
+    /// Deprecated explicit compatibility backend.
     Docker,
 }
 
 impl RuntimeOptions {
-    fn into_run_options(self) -> reporch_cli::authoring_runtime::AuthoringRunOptions {
+    fn into_run_options(
+        self,
+        output: &CliOutput,
+    ) -> reporch_cli::authoring_runtime::AuthoringRunOptions {
+        output.progress(
+            "local execution",
+            "Preparing the Reporch VM and signed toolchain; first use may download and verify assets",
+        );
         let runtime = match self.runtime {
             RuntimeKind::Auto => reporch_cli::local_sandbox::OciRuntime::Auto,
             RuntimeKind::Podman => reporch_cli::local_sandbox::OciRuntime::Podman,
@@ -634,31 +682,44 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
             locale,
             path,
             title,
+            create,
         } => {
             let relative = relative_string(&path)?;
-            let spec = reporch_cli::local_project::update_authoring_spec(
-                Path::new("."),
-                |root, spec| {
-                    reporch_cli::local_project::declare_project_file(
-                        root,
-                        spec,
-                        &relative,
-                        "text/markdown",
-                        false,
+            let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+            let created = if create {
+                materialize_statement_file(&root, &relative, title.as_deref(), &locale)?
+            } else {
+                None
+            };
+            let updated = reporch_cli::local_project::update_authoring_spec(&root, |root, spec| {
+                reporch_cli::local_project::declare_project_file(
+                    root,
+                    spec,
+                    &relative,
+                    "text/markdown",
+                    false,
+                )
+                .with_context(|| {
+                    format!(
+                        "create {relative} first or add --create, then rerun `reporch statement add --locale {locale} --path {relative}`"
                     )
-                    .with_context(|| {
-                        format!(
-                            "create {relative} first, then rerun `reporch statement add --locale {locale} --path {relative}`"
-                        )
-                    })?;
-                    spec.statements.insert(locale.clone(), relative.clone());
-                    if let Some(title) = &title {
-                        ensure!(!title.trim().is_empty(), "title cannot be empty");
-                        spec.title.insert(locale.clone(), title.trim().to_owned());
+                })?;
+                spec.statements.insert(locale.clone(), relative.clone());
+                if let Some(title) = &title {
+                    ensure!(!title.trim().is_empty(), "title cannot be empty");
+                    spec.title.insert(locale.clone(), title.trim().to_owned());
+                }
+                Ok(())
+            });
+            let spec = match updated {
+                Ok(spec) => spec,
+                Err(error) => {
+                    if let Some(path) = created {
+                        let _ = fs::remove_file(path);
                     }
-                    Ok(())
-                },
-            )?;
+                    return Err(error);
+                }
+            };
             output.emit(
                 "statement add",
                 &spec.statements,
@@ -1167,7 +1228,7 @@ pub async fn generator(options: GeneratorOptions, output: &CliOutput) -> Result<
             let path = relative_string(&options.output)?;
             let name = normalize_name(options.name.as_deref().unwrap_or(&options.id))?;
             ensure_unique_test_name(&spec, &name, None)?;
-            let run_options = options.runtime.into_run_options();
+            let run_options = options.runtime.into_run_options(output);
             let bytes = materialize_generator(
                 &root,
                 &generator,
@@ -1234,7 +1295,7 @@ pub async fn generator(options: GeneratorOptions, output: &CliOutput) -> Result<
                 .clone();
             let prefix = normalize_name(&options.name_prefix)?;
             let directory = relative_string(&options.output_directory)?;
-            let run_options = options.runtime.into_run_options();
+            let run_options = options.runtime.into_run_options(output);
             let mut materialized = Vec::with_capacity(options.count as usize);
             for index in 0..options.count {
                 let seed = options
@@ -1406,6 +1467,17 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                             arguments: vec![],
                         });
                     } else {
+                        if source != "validators/input.py"
+                            && spec.judging.validator_path.as_deref() == Some("validators/input.py")
+                        {
+                            spec.judging.validator_tests.retain(|unit| {
+                                !is_starter_validator_unit(
+                                    &unit.name,
+                                    &unit.input_file,
+                                    unit.expected_valid,
+                                )
+                            });
+                        }
                         spec.judging.validator_path = Some(source.clone());
                         spec.judging.validator_language = Some(language.clone());
                     }
@@ -1470,7 +1542,7 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                 unit.name.as_str()
             })?;
             ensure!(!units.is_empty(), "no validator unit tests are configured");
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for validator in &validators {
                 for unit in &units {
@@ -1597,7 +1669,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                 unit.name.as_str()
             })?;
             ensure!(!units.is_empty(), "no checker unit tests are configured");
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for unit in units {
                 let (actual_accepted, exit_code, duration_ms, stderr) =
@@ -1847,7 +1919,7 @@ async fn run_interactor(
         .context("configured interactor has no language")?;
     let solution = find_legacy_solution(&spec, &options.solution)?;
     let test = find_legacy_test(&spec, &options.test)?;
-    let run_options = options.runtime.into_run_options();
+    let run_options = options.runtime.into_run_options(output);
     let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
         run_options.toolchain_id.as_deref(),
         interactor_language,
@@ -1941,7 +2013,7 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         .answer_file
         .as_deref()
         .context("grader test has no answer file")?;
-    let run_options = options.runtime.into_run_options();
+    let run_options = options.runtime.into_run_options(output);
     let result = reporch_cli::authoring_runtime::run_linked_pair(
         &reporch_cli::authoring_runtime::LinkedPairRequest {
             project_directory: &root,
@@ -2122,7 +2194,8 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                 &format!("Added output submission {name}"),
             )
         }
-        OutputCommand::Remove { name } => {
+        OutputCommand::Remove(options) => {
+            let name = options.into_name();
             let mut pruned = 0_usize;
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
@@ -2163,7 +2236,7 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                 !submissions.is_empty(),
                 "no output submissions are configured"
             );
-            let run_options = runtime.into_run_options();
+            let run_options = runtime.into_run_options(output);
             let mut reports = Vec::new();
             for submission in submissions {
                 let mut cases = Vec::new();
@@ -2299,6 +2372,14 @@ fn materialize_validator_unit_input(
         created: Some(root.join(&path)),
         path,
     })
+}
+
+fn is_starter_validator_unit(name: &str, input_file: &str, expected_valid: bool) -> bool {
+    matches!(
+        (name, input_file, expected_valid),
+        ("accepts-sample", "tests/1.in", true)
+            | ("rejects-malformed", "validator-tests/invalid.in", false)
+    )
 }
 
 impl MaterializedManualCase {
@@ -2751,6 +2832,36 @@ fn write_project_bytes_atomic(root: &Path, path: &str, bytes: &[u8]) -> Result<(
         .map_err(|error| error.error)
         .with_context(|| format!("atomically create output {normalized}"))?;
     Ok(())
+}
+
+fn materialize_statement_file(
+    root: &Path,
+    relative: &str,
+    title: Option<&str>,
+    locale: &str,
+) -> Result<Option<PathBuf>> {
+    let destination = root.join(relative);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "statement path must be a regular non-symlink file: {relative}"
+            );
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let heading = title
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Problem statement");
+            let starter = format!(
+                "# {heading}\n\n<!-- Locale: {locale} -->\n\n## Description\n\nWrite the problem description here.\n\n## Input\n\nDescribe the input format.\n\n## Output\n\nDescribe the output format.\n"
+            );
+            write_project_bytes_atomic(root, relative, starter.as_bytes())?;
+            Ok(Some(destination))
+        }
+        Err(error) => Err(error).with_context(|| format!("inspect statement path {relative}")),
+    }
 }
 
 fn ensure_no_symlink_parents(root: &Path, path: &Path) -> Result<()> {

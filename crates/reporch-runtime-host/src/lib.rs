@@ -2341,17 +2341,40 @@ async fn download_cached_verified(
     ensure_runtime_child(cache_root, &cache)?;
     create_private_directory(&cache)?;
     let partial = cache.join(format!("{digest}.part"));
-    download_verified_resumable(client, url, &partial, expected_size, expected_digest).await?;
+    let completed = cache.join(format!("{digest}.blob"));
+    if resumable_file_size(&completed, expected_size, expected_digest)? != expected_size {
+        download_verified_resumable(client, url, &partial, expected_size, expected_digest).await?;
+        promote_completed_download(&partial, &completed, expected_size, expected_digest)?;
+    }
     anyhow::ensure!(
         !destination.exists(),
         "runtime download destination already exists"
     );
-    fs::hard_link(&partial, destination).with_context(|| {
+    fs::hard_link(&completed, destination).with_context(|| {
         format!(
             "materialize verified runtime download {}",
             destination.display()
         )
     })?;
+    Ok(())
+}
+
+fn promote_completed_download(
+    partial: &Path,
+    completed: &Path,
+    expected_size: u64,
+    expected_digest: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        resumable_file_size(partial, expected_size, expected_digest)? == expected_size,
+        "runtime artifact is not complete"
+    );
+    anyhow::ensure!(
+        !completed.exists(),
+        "verified runtime cache destination already exists"
+    );
+    fs::rename(partial, completed)
+        .with_context(|| format!("promote verified runtime download {}", completed.display()))?;
     Ok(())
 }
 
@@ -3653,3 +3676,6 @@ mod tests {
         assert!(stage_job_inputs_at(project.path(), &job, spool.path()).is_err());
     }
 }
+
+#[cfg(test)]
+mod download_cache_regression;

@@ -1,10 +1,10 @@
 # Reporch Runtime v1
 
-> RC8 implementation contract. The native VM path is not the default until all
-> five platform qualification gates pass and the RC8 release is published.
+> Runtime sequence 23 shipped with RC8 and remains the signed base runtime for
+> RC9. All five platform release gates passed, so the native VM path is now the
+> default.
 
-Once the qualification gates above pass, Reporch Runtime becomes the default
-local execution boundary for Reporch CLI. It
+Reporch Runtime is the default local execution boundary for Reporch CLI. It
 boots an ephemeral Linux virtual machine through Apple Virtualization.framework
 on macOS, Firecracker/KVM on Linux, or Hyper-V/HCS on Windows. Docker and Podman
 are explicit deprecated compatibility backends and are never auto-discovered.
@@ -18,8 +18,10 @@ artifact by exact byte size and SHA-256. Manifests include an expiring validity
 window, monotonic sequence, target, backend, and guest protocol range.
 
 Downloads use credential-free HTTPS, bounded metadata bodies, stalled-transfer
-timeouts, total deadlines, and create-new staging files. A complete bundle is
-renamed into place before `current.json` changes. The previous installation is
+timeouts, total deadlines, and `.part` staging files. A verified download is
+atomically promoted to a content-addressed `.blob` before it is installed, so
+completed downloads are never reported as partial. A complete bundle is renamed
+into place before `current.json` changes. The previous installation is
 retained for rollback, and repair/reset never accepts a lower sequence.
 
 Native installers carry the base runtime. npm and standalone archives do not
