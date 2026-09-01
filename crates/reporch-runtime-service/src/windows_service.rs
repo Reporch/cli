@@ -19,7 +19,6 @@ use reporch_runtime_protocol::{
     read_service_request, write_service_response,
 };
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
@@ -30,7 +29,7 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES, SetFileSecurityW, TOKEN_QUERY,
     TOKEN_USER, TokenUser,
 };
-use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+use windows::Win32::System::Pipes::{ImpersonateNamedPipeClient, PeekNamedPipe};
 use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 use windows::core::{BOOL, HSTRING, PWSTR};
 
@@ -252,17 +251,38 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn await_job_or_client_disconnect<R, F, T>(stream: &mut R, operation: F) -> Option<T>
+async fn await_job_or_client_disconnect<F, T>(stream: &NamedPipeServer, operation: F) -> Option<T>
 where
-    R: AsyncRead + Unpin,
     F: Future<Output = T>,
 {
-    let mut unexpected = [0_u8; 1];
+    await_operation_or_disconnect(operation, || !pipe_client_connected(stream)).await
+}
+
+async fn await_operation_or_disconnect<F, T, D>(operation: F, mut disconnected: D) -> Option<T>
+where
+    F: Future<Output = T>,
+    D: FnMut() -> bool,
+{
     tokio::pin!(operation);
-    tokio::select! {
-        result = &mut operation => Some(result),
-        _ = stream.read(&mut unexpected) => None,
+    loop {
+        tokio::select! {
+            result = &mut operation => return Some(result),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {
+                if disconnected() {
+                    return None;
+                }
+            }
+        }
     }
+}
+
+fn pipe_client_connected(stream: &NamedPipeServer) -> bool {
+    let handle = HANDLE(stream.as_raw_handle());
+    // Reading from a duplex named pipe solely to detect disconnects is not a
+    // reliable liveness probe: an otherwise healthy idle client can complete
+    // that read with a transient pipe error. PeekNamedPipe is non-consuming
+    // and reports a broken connection without racing the response channel.
+    unsafe { PeekNamedPipe(handle, None, 0, None, None, None) }.is_ok()
 }
 
 async fn execute_request(
@@ -767,7 +787,7 @@ mod cancellation_tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use super::{HcsJobLifecycle, await_job_or_client_disconnect, validate_allowed_sid};
+    use super::{HcsJobLifecycle, await_operation_or_disconnect, validate_allowed_sid};
 
     #[test]
     fn installer_user_sid_is_accepted_without_relaxing_the_grammar() {
@@ -793,22 +813,31 @@ mod cancellation_tests {
 
     #[tokio::test]
     async fn disconnect_drops_the_hcs_join_future() {
-        let (mut service, client) = tokio::io::duplex(64);
         let dropped = Arc::new(AtomicBool::new(false));
         let signal = DropSignal(dropped.clone());
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let disconnect_signal = disconnected.clone();
         let operation = async move {
             let _signal = signal;
             std::future::pending::<()>().await;
         };
-        drop(client);
+        disconnected.store(true, Ordering::SeqCst);
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            await_job_or_client_disconnect(&mut service, operation),
+            await_operation_or_disconnect(operation, move || {
+                disconnect_signal.load(Ordering::SeqCst)
+            }),
         )
         .await
         .unwrap();
         assert!(result.is_none());
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn completed_hcs_job_is_not_misclassified_as_a_disconnect() {
+        let result = await_operation_or_disconnect(async { 73_u32 }, || false).await;
+        assert_eq!(result, Some(73));
     }
 
     #[test]
