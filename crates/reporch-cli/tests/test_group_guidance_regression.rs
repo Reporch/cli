@@ -69,9 +69,7 @@ fn test_help_creates_a_group_before_using_it_and_explains_optional_groups() {
     let create = help
         .find("reporch test group add samples --points 0")
         .unwrap();
-    let use_group = help
-        .find("reporch test case add --name sample-1")
-        .unwrap();
+    let use_group = help.find("reporch test case add --name sample-1").unwrap();
     assert!(create < use_group, "{help}");
     assert!(help.contains("`--group` is optional"), "{help}");
     assert!(help.contains("Sample tests can remain ungrouped"), "{help}");
