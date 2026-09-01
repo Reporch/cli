@@ -155,7 +155,7 @@ assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runti
 assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
-assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq15/);
+assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq16/);
 assert.match(
   runtimeCandidates,
   /"\$target" 15 1\.0\.0-rc\.8 "\$minimum_os"/,
@@ -163,7 +163,7 @@ assert.match(
 );
 assert.match(
   runtimeCandidates,
-  /reporch-runtime-v1-seq15/,
+  /reporch-runtime-v1-seq16/,
   "runtime manifest asset URLs must match the immutable release tag"
 );
 assert.match(runtimeRelease, /immutable runtime release already exists/);
@@ -196,7 +196,7 @@ for (const target of [
 assert.match(publishedE2e, /gh attestation verify/);
 assert.match(
   appleVmQualification,
-  /\.sequence == 15/,
+  /\.sequence == 16/,
   "Apple qualification must reject a stale signed runtime sequence"
 );
 assert.match(
@@ -216,12 +216,12 @@ assert.match(
 );
 assert.match(
   linuxVmQualificationScript,
-  /\.data\.installed_sequence == 15/,
+  /\.data\.installed_sequence == 16/,
   "Linux qualification must reject a stale signed runtime sequence"
 );
 assert.match(
   windowsVmQualificationScript,
-  /installed_sequence -eq 15/,
+  /installed_sequence -eq 16/,
   "Windows qualification must reject a stale signed runtime sequence"
 );
 assert.match(
