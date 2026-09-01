@@ -2166,7 +2166,7 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                     for (test_id, path) in &mappings {
                         ensure!(
                             spec.judging.tests.iter().any(|test| test.id == *test_id),
-                            "unknown test case: {test_id}"
+                            "unknown test case: {test_id}. List test UUIDs with `reporch test case list --format json`"
                         );
                         reporch_cli::local_project::declare_project_file(
                             root,
@@ -3022,7 +3022,10 @@ fn parse_output_mapping(value: &str) -> Result<(Uuid, String), String> {
         .ok_or_else(|| "mapping must use UUID=relative/path".to_owned())?;
     let test_id = test_id
         .parse()
-        .map_err(|_| "mapping contains an invalid test UUID".to_owned())?;
+        .map_err(|_| {
+            "mapping contains an invalid test UUID; list test UUIDs with `reporch test case list --format json`"
+                .to_owned()
+        })?;
     let path = relative_string(Path::new(path)).map_err(|error| error.to_string())?;
     Ok((test_id, path))
 }

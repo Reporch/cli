@@ -2481,7 +2481,7 @@ pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput
                     for (test_id, path) in &mappings {
                         ensure!(
                             spec.testing.tests.iter().any(|test| test.id == *test_id),
-                            "unknown test case: {test_id}"
+                            "unknown test case: {test_id}. List test UUIDs with `reporch test case list --format json`"
                         );
                         reporch_cli::local_project_v2::declare_project_file(
                             root,
