@@ -2483,7 +2483,8 @@ pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput
                 &format!("Added output submission {name}"),
             )
         }
-        OutputCommand::Remove { name } => {
+        OutputCommand::Remove(options) => {
+            let name = options.into_name();
             let mut pruned = 0_usize;
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),

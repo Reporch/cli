@@ -301,6 +301,7 @@ enum CheckerCommand {
         #[arg(long, value_enum)]
         expected: CheckerExpectation,
     },
+    #[command(alias = "test")]
     Run {
         #[arg(long)]
         name: Option<String>,
@@ -468,6 +469,24 @@ enum StressCommand {
     },
 }
 
+#[derive(Debug, ClapArgs)]
+struct OutputRemoveOptions {
+    /// Submission name. The positional form is retained for compatibility.
+    #[arg(value_name = "NAME", required_unless_present = "name_option")]
+    name: Option<String>,
+    /// Submission name.
+    #[arg(long = "name", value_name = "NAME", conflicts_with = "name")]
+    name_option: Option<String>,
+}
+
+impl OutputRemoveOptions {
+    fn into_name(self) -> String {
+        self.name_option
+            .or(self.name)
+            .expect("clap requires a name")
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum OutputCommand {
     List,
@@ -484,9 +503,7 @@ enum OutputCommand {
         #[arg(long)]
         maximum_score: Option<f64>,
     },
-    Remove {
-        name: String,
-    },
+    Remove(OutputRemoveOptions),
     Test {
         #[arg(long)]
         name: Option<String>,
@@ -2134,7 +2151,8 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                 &format!("Added output submission {name}"),
             )
         }
-        OutputCommand::Remove { name } => {
+        OutputCommand::Remove(options) => {
+            let name = options.into_name();
             let mut pruned = 0_usize;
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
