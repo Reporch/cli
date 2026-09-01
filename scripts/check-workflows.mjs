@@ -151,21 +151,25 @@ const windowsVmQualificationScript = readFileSync("scripts/qualify-windows-vm.ps
 const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
 const runtimeCandidates = readFileSync("scripts/build-runtime-candidates.sh", "utf8");
 const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml", "utf8");
-assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates"/);
-assert.match(runtimeRelease, /build-runtime-candidates\.sh "\$RUNNER_TEMP\/runtime-candidates-rebuild"/);
+assert.match(runtimeRelease, /RUNTIME_SEQUENCE: "17"/);
+assert.match(runtimeRelease, /RUNTIME_VERSION: 1\.0\.0-rc\.8/);
+assert.match(runtimeRelease, /test "\$RUNTIME_TAG" = "reporch-runtime-v1-seq\$RUNTIME_SEQUENCE"/);
+assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates" "\$RUNTIME_SEQUENCE" "\$RUNTIME_VERSION"/);
+assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates-rebuild" "\$RUNTIME_SEQUENCE" "\$RUNTIME_VERSION"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
-assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq16/);
+assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq17/);
 assert.match(
   runtimeCandidates,
-  /"\$target" 15 1\.0\.0-rc\.8 "\$minimum_os"/,
-  "the signed runtime manifest sequence must match the immutable release tag"
+  /"\$target" "\$runtime_sequence" "\$runtime_version" "\$minimum_os"/,
+  "the signed runtime manifest identity must come from the release inputs"
 );
 assert.match(
   runtimeCandidates,
-  /reporch-runtime-v1-seq16/,
-  "runtime manifest asset URLs must match the immutable release tag"
+  /runtime_tag="reporch-runtime-v1-seq\$runtime_sequence"/,
+  "the runtime asset tag must be derived from the manifest sequence"
 );
+assert.match(runtimeRelease, /\.sequence == \$sequence and \.version == \$version/);
 assert.match(runtimeRelease, /immutable runtime release already exists/);
 assert.doesNotMatch(runtimeRelease, /release upload[^\n]+--clobber/);
 assert.match(toolchainRelease, /materialize-toolchain-sources\.sh/);
@@ -196,7 +200,7 @@ for (const target of [
 assert.match(publishedE2e, /gh attestation verify/);
 assert.match(
   appleVmQualification,
-  /\.sequence == 16/,
+  /\.sequence == 17/,
   "Apple qualification must reject a stale signed runtime sequence"
 );
 assert.match(
@@ -216,12 +220,12 @@ assert.match(
 );
 assert.match(
   linuxVmQualificationScript,
-  /\.data\.installed_sequence == 16/,
+  /\.data\.installed_sequence == 17/,
   "Linux qualification must reject a stale signed runtime sequence"
 );
 assert.match(
   windowsVmQualificationScript,
-  /installed_sequence -eq 16/,
+  /installed_sequence -eq 17/,
   "Windows qualification must reject a stale signed runtime sequence"
 );
 assert.match(
