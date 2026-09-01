@@ -50,7 +50,7 @@ const MAX_TOOLCHAIN_INDEX_BYTES: usize = 512 * 1024;
 const GUEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_CHANNEL_BASE: &str =
-    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq20";
+    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq21";
 const TOOLCHAIN_CHANNEL_BASE: &str =
     "https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8";
 const RUNTIME_PUBLIC_KEY: &str = include_str!("../../../artifacts/runtime-v1.minisign.pub");
@@ -373,7 +373,8 @@ pub async fn install_toolchain_direct(id: &str) -> Result<VerifiedToolchainBundl
         && existing.installation.bundle_sha256 == bundle.sha256
         && existing.installation.toolchain_lock_sha256 == entry.toolchain_lock_sha256
     {
-        return Ok(existing);
+        repair_toolchain_read_access(&existing)?;
+        return verified_toolchain_at(&root, id, target);
     }
 
     let safe_digest = bundle
@@ -419,13 +420,13 @@ pub async fn install_toolchain_direct(id: &str) -> Result<VerifiedToolchainBundl
                 &bundle.sha256,
             )?;
             fs::remove_file(&archive).context("remove expanded toolchain archive link")?;
-            set_private_read_only(&artifact)?;
+            set_toolchain_read_only(&artifact)?;
             fs::write(staging.join("index.json"), &index_bytes)
                 .context("write installed toolchain index")?;
             fs::write(staging.join("index.json.minisig"), &signature_bytes)
                 .context("write installed toolchain signature")?;
-            set_private_read_only(&staging.join("index.json"))?;
-            set_private_read_only(&staging.join("index.json.minisig"))?;
+            set_toolchain_read_only(&staging.join("index.json"))?;
+            set_toolchain_read_only(&staging.join("index.json.minisig"))?;
             Result::<()>::Ok(())
         }
         .await;
@@ -2850,6 +2851,65 @@ fn set_private_read_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn repair_toolchain_read_access(toolchain: &VerifiedToolchainBundleV2) -> Result<()> {
+    let directory = toolchain
+        .path
+        .parent()
+        .context("installed toolchain image has no bundle directory")?;
+    set_toolchain_read_only(&toolchain.path)?;
+    set_toolchain_read_only(&directory.join("index.json"))?;
+    set_toolchain_read_only(&directory.join("index.json.minisig"))?;
+    Ok(())
+}
+
+fn set_toolchain_read_only(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = fs::symlink_metadata(path).context("inspect installed toolchain file")?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "installed toolchain file must be a regular non-symlink file"
+        );
+        #[cfg(target_os = "linux")]
+        let system_service = rustix::process::getuid().is_root();
+        #[cfg(not(target_os = "linux"))]
+        let system_service = false;
+        if system_service {
+            anyhow::ensure!(
+                metadata.uid() == 0,
+                "system toolchain file must remain root-owned"
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let service_gid = rustix::process::getgid();
+                if metadata.gid() != service_gid.as_raw() {
+                    rustix::fs::chown(path, None, Some(service_gid))
+                        .context("assign toolchain file to the broker group")?;
+                }
+            }
+        }
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(toolchain_read_only_mode(system_service)),
+        )
+        .context("set installed toolchain read permissions")?;
+    }
+    #[cfg(windows)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+const fn toolchain_read_only_mode(system_service: bool) -> u32 {
+    if system_service { 0o440 } else { 0o400 }
+}
+
 fn set_runtime_artifact_permissions(path: &Path, kind: RuntimeArtifactKindV1) -> Result<()> {
     #[cfg(unix)]
     {
@@ -3086,7 +3146,7 @@ mod tests {
             parse_channel_url(RUNTIME_CHANNEL_BASE, "runtime")
                 .unwrap()
                 .as_str(),
-            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq20/"
+            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq21/"
         );
         assert_eq!(
             parse_channel_url(TOOLCHAIN_CHANNEL_BASE, "toolchain")
@@ -3205,6 +3265,13 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["version"], 2);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_toolchains_are_read_only_for_the_owner_and_system_broker_group() {
+        assert_eq!(toolchain_read_only_mode(false), 0o400);
+        assert_eq!(toolchain_read_only_mode(true), 0o440);
     }
 
     #[tokio::test]
