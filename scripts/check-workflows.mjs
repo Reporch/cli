@@ -107,6 +107,11 @@ assert.match(
 );
 assert.match(
   release,
+  /name: native-\$\{\{ matrix\.target \}\}[\s\S]*?path: release-output\s+include-hidden-files: true/,
+  "native build artifacts must preserve the verified runtime completion marker"
+);
+assert.match(
+  release,
   /REPORCH_RELEASE_SIGNING_REQUIRED: \$\{\{ needs\.verify-source\.outputs\.prerelease == 'true' && '0' \|\| '1' \}\}/,
   "stable releases must continue to require native OS signatures"
 );
