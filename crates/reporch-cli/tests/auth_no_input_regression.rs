@@ -2,15 +2,20 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn reporch() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_reporch"));
-    command.env("REPORCH_DEBUG_SKIP_RUNTIME_BOOTSTRAP", "1");
-    command
+    Command::new(env!("CARGO_BIN_EXE_reporch"))
 }
 
 #[test]
 fn auth_login_no_input_fails_before_network_or_device_polling() {
+    let isolated = tempfile::tempdir().unwrap();
+    let runtime = isolated.path().join("runtime");
     let started = Instant::now();
     let output = reporch()
+        .env("REPORCH_RUNTIME_HOME", &runtime)
+        .env(
+            "REPORCH_RUNTIME_CHANNEL_URL",
+            "https://127.0.0.1:9/runtime/channel.json",
+        )
         .args([
             "--format",
             "jsonl",
@@ -37,4 +42,8 @@ fn auth_login_no_input_fails_before_network_or_device_polling() {
     assert_eq!(error["command"], "auth login");
     assert_eq!(error["error_code"], "input.invalid");
     assert_eq!(error["retryable"], false);
+    assert!(
+        !runtime.exists(),
+        "auth unexpectedly bootstrapped the VM runtime"
+    );
 }

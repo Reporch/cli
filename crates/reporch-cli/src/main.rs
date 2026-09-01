@@ -1475,6 +1475,7 @@ async fn ensure_mandatory_runtime(command: &Command, output: &CliOutput) -> Resu
 
 fn command_skips_runtime_bootstrap(command: &Command) -> bool {
     matches!(command, Command::Completion { .. })
+        || matches!(command, Command::Auth { .. })
         || matches!(command, Command::Desktop { .. } | Command::Artifact { .. })
         || matches!(
             command,
