@@ -396,6 +396,9 @@ struct ProjectInitOptions {
     /// Initialize alongside unrelated existing files after checking every generated path for collisions.
     #[arg(long)]
     allow_non_empty: bool,
+    /// Include a validator and unit matrix for immediate ICPC, Polygon, and DOMjudge export. `reporch new` enables this automatically.
+    #[arg(long)]
+    portable: bool,
     #[arg(long, value_enum, default_value_t = studio_remote::RemoteProblemType::Standard)]
     problem_type: studio_remote::RemoteProblemType,
     /// Bind the local manifest to an existing private Studio project.
@@ -1515,13 +1518,24 @@ fn execute_project_init(
     command: &str,
     output: &CliOutput,
 ) -> Result<()> {
-    reporch_cli::init_project_template_with_optional_id(
-        &options.directory,
-        &options.title,
-        options.project_id,
-        options.problem_type.into(),
-        options.allow_non_empty,
-    )?;
+    let portable = options.portable || command == "new";
+    if portable {
+        reporch_cli::init_portable_project_template_with_optional_id(
+            &options.directory,
+            &options.title,
+            options.project_id,
+            options.problem_type.into(),
+            options.allow_non_empty,
+        )?;
+    } else {
+        reporch_cli::init_project_template_with_optional_id(
+            &options.directory,
+            &options.title,
+            options.project_id,
+            options.problem_type.into(),
+            options.allow_non_empty,
+        )?;
+    }
     let status = local_project_status(&options.directory)?;
     let existing_directory_note = if options.allow_non_empty {
         "\nExisting unrelated files were preserved; every generated path was collision-checked before writing."

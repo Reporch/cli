@@ -122,6 +122,7 @@ pub fn init_project_template_with_options(
         true,
         allow_non_empty,
         Some(project_id),
+        false,
     )
 }
 
@@ -141,6 +142,27 @@ pub fn init_project_template_with_optional_id(
         true,
         allow_non_empty,
         project_id,
+        false,
+    )
+}
+
+pub fn init_portable_project_template_with_optional_id(
+    directory: &Path,
+    title: &str,
+    project_id: Option<Uuid>,
+    problem_type: ProblemType,
+    allow_non_empty: bool,
+) -> Result<()> {
+    let generated_project_id = project_id.unwrap_or_else(Uuid::now_v7);
+    init_project_template_versioned(
+        directory,
+        title,
+        generated_project_id,
+        problem_type,
+        true,
+        allow_non_empty,
+        project_id,
+        true,
     )
 }
 
@@ -159,6 +181,7 @@ pub fn init_legacy_v1_project_template(
         false,
         false,
         Some(project_id),
+        false,
     )
 }
 
@@ -170,6 +193,7 @@ fn init_project_template_versioned(
     emit_v2: bool,
     allow_non_empty: bool,
     required_project_id: Option<Uuid>,
+    portable: bool,
 ) -> Result<()> {
     let title = title.trim();
     if title.is_empty() {
@@ -186,17 +210,21 @@ fn init_project_template_versioned(
         TemplateFile::text("statements/ko.md", statement, "text/markdown"),
         TemplateFile::text("tests/1.in", sample_input, "text/plain"),
         TemplateFile::text("tests/1.ans", sample_answer, "text/plain"),
-        TemplateFile::text(
-            "validators/input.py",
-            starter_validator(problem_type),
-            "text/x-python",
-        ),
-        TemplateFile::text(
-            "validator-tests/invalid.in",
-            "not-an-integer\n",
-            "text/plain",
-        ),
     ];
+    if portable {
+        files.extend([
+            TemplateFile::text(
+                "validators/input.py",
+                starter_validator(problem_type),
+                "text/x-python",
+            ),
+            TemplateFile::text(
+                "validator-tests/invalid.in",
+                "not-an-integer\n",
+                "text/plain",
+            ),
+        ]);
+    }
 
     match problem_type {
         ProblemType::Standard => add_python_solutions(&mut files),
@@ -304,22 +332,26 @@ fn init_project_template_versioned(
             tests,
             groups: scoring_groups(problem_type),
             generators: vec![],
-            validator_path: Some("validators/input.py".into()),
-            validator_language: Some("python3".into()),
+            validator_path: portable.then(|| "validators/input.py".into()),
+            validator_language: portable.then(|| "python3".into()),
             extra_validator_paths: vec![],
             extra_validators: vec![],
-            validator_tests: vec![
-                ValidatorTestSpec {
-                    name: "accepts-sample".into(),
-                    input_file: "tests/1.in".into(),
-                    expected_valid: true,
-                },
-                ValidatorTestSpec {
-                    name: "rejects-malformed".into(),
-                    input_file: "validator-tests/invalid.in".into(),
-                    expected_valid: false,
-                },
-            ],
+            validator_tests: if portable {
+                vec![
+                    ValidatorTestSpec {
+                        name: "accepts-sample".into(),
+                        input_file: "tests/1.in".into(),
+                        expected_valid: true,
+                    },
+                    ValidatorTestSpec {
+                        name: "rejects-malformed".into(),
+                        input_file: "validator-tests/invalid.in".into(),
+                        expected_valid: false,
+                    },
+                ]
+            } else {
+                vec![]
+            },
             checker_tests: vec![],
             interactor_path,
             interactor_language,
