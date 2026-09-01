@@ -60,7 +60,7 @@ enum StatementRenderFormat {
 
 #[derive(Debug, ClapArgs)]
 #[command(
-    after_help = "Examples:\n  reporch test group add samples --points 0\n  reporch test case add --name sample-1 --input-text '1 2' --answer-text '3' --group samples\n  reporch test case add --name sample-2 --input-text '3 4' --answer-text '7'\n  reporch test group add full-score --points 100 --depends-on samples\n\n`--group` is optional. Sample tests can remain ungrouped."
+    after_help = "Examples:\n  reporch test group add samples --points 0\n  reporch test case add --name sample-1 --input-text '1 2' --answer-text '3' --group samples\n  reporch test case add --name sample-2 --input-text '3 4' --answer-text '7'\n  reporch test group add full-score --points 100 --depends-on samples\n\n`--group` is optional. Sample tests can remain ungrouped. A 0-point sample group organizes tests and dependencies without changing the scored total."
 )]
 pub struct TestOptions {
     #[command(subcommand)]
@@ -1568,6 +1568,10 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
             let mut cases = Vec::new();
             for validator in &validators {
                 for unit in &units {
+                    output.progress(
+                        "validator run",
+                        &format!("Running validator {} · unit {}", validator.id, unit.name),
+                    );
                     let result = reporch_cli::authoring_runtime::run_program(
                         &reporch_cli::authoring_runtime::ProgramRequest {
                             project_directory: &root,
@@ -1690,10 +1694,14 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
             let units = selected_by_name(&spec.judging.checker_tests, name.as_deref(), |unit| {
                 unit.name.as_str()
             })?;
-            ensure!(!units.is_empty(), "no checker unit tests are configured");
+            ensure!(
+                !units.is_empty(),
+                "no checker unit tests are configured. Add one with `reporch checker unit-add --name accepts-sample --input tests/1.in --answer tests/1.ans --output tests/1.ans --expected accept`, then run `reporch checker test`"
+            );
             let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for unit in units {
+                output.progress("checker run", &format!("Checking unit {}", unit.name));
                 let (actual_accepted, exit_code, duration_ms, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,

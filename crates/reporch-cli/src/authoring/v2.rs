@@ -955,6 +955,10 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
             let mut cases = Vec::new();
             for validator in validators {
                 for unit in &units {
+                    output.progress(
+                        "validator run",
+                        &format!("Running validator {} · unit {}", validator.name, unit.name),
+                    );
                     let result = reporch_cli::authoring_runtime::run_program(
                         &reporch_cli::authoring_runtime::ProgramRequest {
                             project_directory: &root,
@@ -1089,10 +1093,14 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                 selected_by_name(&spec.testing.checker.unit_tests, name.as_deref(), |unit| {
                     unit.name.as_str()
                 })?;
-            ensure!(!units.is_empty(), "no checker unit tests are configured");
+            ensure!(
+                !units.is_empty(),
+                "no checker unit tests are configured. Add one with `reporch checker unit-add --name accepts-sample --input tests/1.in --answer tests/1.ans --output tests/1.ans --expected accept`, then run `reporch checker test`"
+            );
             let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for unit in units {
+                output.progress("checker run", &format!("Checking unit {}", unit.name));
                 let (actual_accepted, exit_code, duration_ms, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
