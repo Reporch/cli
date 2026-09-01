@@ -54,7 +54,7 @@ struct Args {
     /// Resolve relative paths from this directory.
     #[arg(long, global = true, default_value = ".")]
     cwd: PathBuf,
-    /// Named connection profile, or a package format for package compatibility commands.
+    /// Named connection profile. Package commands use reporch-native, icpc202509, icpc-legacy, polygon-compatible, or domjudge-zip.
     #[arg(long, global = true, env = "REPORCH_PROFILE")]
     profile: Option<String>,
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
@@ -274,7 +274,7 @@ enum ToolchainCommand {
         #[arg(long, value_enum, default_value_t = SandboxRuntime::Auto)]
         runtime: SandboxRuntime,
     },
-    /// Install signed toolchains ahead of time for offline use.
+    /// Install signed toolchains ahead of time for offline use. First installation can take about a minute; cached runs are faster.
     Prefetch {
         /// Toolchain IDs. When omitted, prefetches the complete signed catalog.
         ids: Vec<String>,
@@ -379,6 +379,9 @@ enum AuthCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[command(
+    after_help = "Package profiles:\n  reporch-native (alias: reporch)\n  icpc202509 (alias: icpc-2025-09)\n  icpc-legacy\n  polygon-compatible (alias: polygon)\n  domjudge-zip (alias: domjudge)"
+)]
 enum PackageCommand {
     /// Export a package. The project package profile and manifest directory are the defaults.
     Export {
@@ -389,10 +392,8 @@ enum PackageCommand {
         #[arg(long, value_name = "SOURCE_ROOT")]
         source_root: Option<PathBuf>,
     },
-    Import {
-        input: PathBuf,
-        directory: PathBuf,
-    },
+    /// Import a supported package into a new or empty project directory.
+    Import { input: PathBuf, directory: PathBuf },
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -496,6 +497,7 @@ enum MemberCommand {
 
 #[derive(Debug, Subcommand)]
 enum QuotaCommand {
+    /// Show CPU, concurrency, and storage quota for the authenticated account.
     Show(studio_remote::RemoteConnectionOptions),
 }
 
@@ -513,7 +515,9 @@ enum ReleaseCommand {
 
 #[derive(Debug, Subcommand)]
 enum PublicationCommand {
+    /// Publish a verified immutable release after explicit confirmation.
     Publish(studio_remote::PublishOptions),
+    /// Show the idempotent publication state for a release or linked project.
     Status(studio_remote::PublicationOptions),
 }
 
@@ -521,7 +525,9 @@ enum PublicationCommand {
 enum ValidationCommand {
     /// List official validation runs for the linked project.
     List(studio_remote::ValidationScopeOptions),
+    /// Show one validation run and its deterministic evidence summary.
     Show(studio_remote::ValidationInspectOptions),
+    /// Follow one validation run until it passes or reaches a terminal failure.
     Watch(studio_remote::ValidationInspectOptions),
 }
 
@@ -533,15 +539,21 @@ enum EventsCommand {
 
 #[derive(Debug, Subcommand)]
 enum WaiverCommand {
+    /// List active evidence-bound waivers for the linked project.
     List(studio_remote::WaiverScopeOptions),
+    /// Create a reasoned waiver for a waivable validation finding.
     Create(studio_remote::CreateWaiverOptions),
+    /// Revoke a waiver without changing immutable validation evidence.
     Revoke(studio_remote::RevokeWaiverOptions),
 }
 
 #[derive(Debug, Subcommand)]
 enum RevisionCommand {
+    /// List immutable project revisions, newest first.
     List(studio_remote::RevisionScopeOptions),
+    /// Show one immutable project revision.
     Show(studio_remote::RevisionShowOptions),
+    /// Compare two immutable project revisions.
     Diff(studio_remote::RevisionDiffOptions),
     /// Restore an immutable revision into a new or empty checkout directory.
     Restore(studio_remote::RevisionRestoreOptions),
@@ -571,15 +583,24 @@ enum ManifestCommand {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CompatibilityProfile {
-    #[value(name = "reporch-native", alias = "reporch_native")]
+    #[value(name = "reporch-native", alias = "reporch_native", alias = "reporch")]
     ReporchNative,
-    #[value(name = "icpc202509", alias = "icpc_202509", alias = "icpc_2025_09")]
+    #[value(
+        name = "icpc202509",
+        alias = "icpc_202509",
+        alias = "icpc_2025_09",
+        alias = "icpc-2025-09"
+    )]
     Icpc202509,
     #[value(name = "icpc-legacy", alias = "icpc_legacy")]
     IcpcLegacy,
-    #[value(name = "polygon-compatible", alias = "polygon_compatible")]
+    #[value(
+        name = "polygon-compatible",
+        alias = "polygon_compatible",
+        alias = "polygon"
+    )]
     PolygonCompatible,
-    #[value(name = "domjudge-zip", alias = "domjudge_zip")]
+    #[value(name = "domjudge-zip", alias = "domjudge_zip", alias = "domjudge")]
     DomjudgeZip,
 }
 

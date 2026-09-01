@@ -323,7 +323,7 @@ enum CheckerCommand {
         #[arg(long, value_enum)]
         expected: CheckerExpectation,
     },
-    #[command(alias = "test")]
+    #[command(visible_alias = "test")]
     Run {
         #[arg(long)]
         name: Option<String>,
