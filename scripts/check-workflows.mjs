@@ -151,14 +151,14 @@ const windowsVmQualificationScript = readFileSync("scripts/qualify-windows-vm.ps
 const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
 const runtimeCandidates = readFileSync("scripts/build-runtime-candidates.sh", "utf8");
 const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml", "utf8");
-assert.match(runtimeRelease, /RUNTIME_SEQUENCE: "17"/);
+assert.match(runtimeRelease, /RUNTIME_SEQUENCE: "18"/);
 assert.match(runtimeRelease, /RUNTIME_VERSION: 1\.0\.0-rc\.8/);
 assert.match(runtimeRelease, /test "\$RUNTIME_TAG" = "reporch-runtime-v1-seq\$RUNTIME_SEQUENCE"/);
 assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates" "\$RUNTIME_SEQUENCE" "\$RUNTIME_VERSION"/);
 assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates-rebuild" "\$RUNTIME_SEQUENCE" "\$RUNTIME_VERSION"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
-assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq17/);
+assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq18/);
 assert.match(
   runtimeCandidates,
   /"\$target" "\$runtime_sequence" "\$runtime_version" "\$minimum_os"/,
@@ -200,7 +200,7 @@ for (const target of [
 assert.match(publishedE2e, /gh attestation verify/);
 assert.match(
   appleVmQualification,
-  /\.sequence == 17/,
+  /\.sequence == 18/,
   "Apple qualification must reject a stale signed runtime sequence"
 );
 assert.match(
@@ -220,12 +220,12 @@ assert.match(
 );
 assert.match(
   linuxVmQualificationScript,
-  /\.data\.installed_sequence == 17/,
+  /\.data\.installed_sequence == 18/,
   "Linux qualification must reject a stale signed runtime sequence"
 );
 assert.match(
   windowsVmQualificationScript,
-  /installed_sequence -eq 17/,
+  /installed_sequence -eq 18/,
   "Windows qualification must reject a stale signed runtime sequence"
 );
 assert.match(

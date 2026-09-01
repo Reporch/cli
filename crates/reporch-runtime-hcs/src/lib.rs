@@ -14,6 +14,8 @@ pub use windows_backend::{HcsCancellationHandle, HcsVirtualMachine, HvSocketStre
 pub const HYPERV_VSOCK_PORT: u32 = 7_000;
 const HCS_SCSI_CONTROLLER_0: &str = "df6d0690-79e5-55b6-a5ec-c1e2f77f580a";
 const HCS_KERNEL_COMMAND_LINE: &str = "8250_core.nr_uarts=0 panic=-1 quiet pci=off rdinit=/sbin/reporch-guestd reporch.host_challenge=1 reporch.transport=vsock initcall_blacklist=virtio_vsock_init";
+const HCS_HOST_CONNECT_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
+const HCS_GUEST_BIND_SDDL: &str = "D:P(A;;FA;;;WD)";
 
 #[derive(Clone, Debug)]
 pub struct HcsVmConfigV1 {
@@ -91,10 +93,14 @@ impl HcsVmConfigV1 {
                 "Devices": {
                     "HvSocket": {
                         "HvSocketConfig": {
-                            "DefaultBindSecurityDescriptor": "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
-                            "DefaultConnectSecurityDescriptor": "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+                            "DefaultBindSecurityDescriptor": HCS_HOST_CONNECT_SDDL,
+                            "DefaultConnectSecurityDescriptor": HCS_HOST_CONNECT_SDDL,
                             "ServiceTable": {
-                                service_id: { "AllowWildcardBinds": false }
+                                service_id: {
+                                    "AllowWildcardBinds": true,
+                                    "BindSecurityDescriptor": HCS_GUEST_BIND_SDDL,
+                                    "ConnectSecurityDescriptor": HCS_HOST_CONNECT_SDDL
+                                }
                             }
                         }
                     }
@@ -207,11 +213,11 @@ mod tests {
                 .get("Backing")
                 .is_none()
         );
-        assert!(
-            devices["HvSocket"]["HvSocketConfig"]["ServiceTable"]
-                .get(hyperv_vsock_service_id(HYPERV_VSOCK_PORT))
-                .is_some()
-        );
+        let service = &devices["HvSocket"]["HvSocketConfig"]["ServiceTable"]
+            [hyperv_vsock_service_id(HYPERV_VSOCK_PORT)];
+        assert_eq!(service["AllowWildcardBinds"], true);
+        assert_eq!(service["BindSecurityDescriptor"], HCS_GUEST_BIND_SDDL);
+        assert_eq!(service["ConnectSecurityDescriptor"], HCS_HOST_CONNECT_SDDL);
     }
 
     #[test]
