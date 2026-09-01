@@ -99,7 +99,7 @@ fn export_icpc_based(
             && short_name
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
-        "{package_name} package name must contain only lowercase ASCII letters and digits"
+        "{package_name} package name must contain only lowercase ASCII letters and digits; output stem {output_stem:?} is invalid. Use a filename such as aplusb.zip"
     );
     ensure!(
         output.extension().and_then(|value| value.to_str()) == Some("zip"),

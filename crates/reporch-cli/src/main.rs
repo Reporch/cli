@@ -17,6 +17,7 @@ mod statement_tex;
 mod versioned_package;
 
 use std::fs;
+use std::future::Future;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -53,7 +54,7 @@ struct Args {
     /// Resolve relative paths from this directory.
     #[arg(long, global = true, default_value = ".")]
     cwd: PathBuf,
-    /// Named connection profile, or a package format for package compatibility commands.
+    /// Named connection profile. Package commands use reporch-native, icpc202509, icpc-legacy, polygon-compatible, or domjudge-zip.
     #[arg(long, global = true, env = "REPORCH_PROFILE")]
     profile: Option<String>,
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
@@ -273,7 +274,7 @@ enum ToolchainCommand {
         #[arg(long, value_enum, default_value_t = SandboxRuntime::Auto)]
         runtime: SandboxRuntime,
     },
-    /// Install signed toolchains ahead of time for offline use.
+    /// Install signed toolchains ahead of time for offline use. First installation can take about a minute; cached runs are faster.
     Prefetch {
         /// Toolchain IDs. When omitted, prefetches the complete signed catalog.
         ids: Vec<String>,
@@ -378,6 +379,9 @@ enum AuthCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[command(
+    after_help = "Package profiles:\n  reporch-native (alias: reporch)\n  icpc202509 (alias: icpc-2025-09)\n  icpc-legacy\n  polygon-compatible (alias: polygon)\n  domjudge-zip (alias: domjudge)"
+)]
 enum PackageCommand {
     /// Export a package. The project package profile and manifest directory are the defaults.
     Export {
@@ -388,10 +392,8 @@ enum PackageCommand {
         #[arg(long, value_name = "SOURCE_ROOT")]
         source_root: Option<PathBuf>,
     },
-    Import {
-        input: PathBuf,
-        directory: PathBuf,
-    },
+    /// Import a supported package into a new or empty project directory.
+    Import { input: PathBuf, directory: PathBuf },
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -495,6 +497,7 @@ enum MemberCommand {
 
 #[derive(Debug, Subcommand)]
 enum QuotaCommand {
+    /// Show CPU, concurrency, and storage quota for the authenticated account.
     Show(studio_remote::RemoteConnectionOptions),
 }
 
@@ -512,7 +515,9 @@ enum ReleaseCommand {
 
 #[derive(Debug, Subcommand)]
 enum PublicationCommand {
+    /// Publish a verified immutable release after explicit confirmation.
     Publish(studio_remote::PublishOptions),
+    /// Show the idempotent publication state for a release or linked project.
     Status(studio_remote::PublicationOptions),
 }
 
@@ -520,7 +525,9 @@ enum PublicationCommand {
 enum ValidationCommand {
     /// List official validation runs for the linked project.
     List(studio_remote::ValidationScopeOptions),
+    /// Show one validation run and its deterministic evidence summary.
     Show(studio_remote::ValidationInspectOptions),
+    /// Follow one validation run until it passes or reaches a terminal failure.
     Watch(studio_remote::ValidationInspectOptions),
 }
 
@@ -532,15 +539,21 @@ enum EventsCommand {
 
 #[derive(Debug, Subcommand)]
 enum WaiverCommand {
+    /// List active evidence-bound waivers for the linked project.
     List(studio_remote::WaiverScopeOptions),
+    /// Create a reasoned waiver for a waivable validation finding.
     Create(studio_remote::CreateWaiverOptions),
+    /// Revoke a waiver without changing immutable validation evidence.
     Revoke(studio_remote::RevokeWaiverOptions),
 }
 
 #[derive(Debug, Subcommand)]
 enum RevisionCommand {
+    /// List immutable project revisions, newest first.
     List(studio_remote::RevisionScopeOptions),
+    /// Show one immutable project revision.
     Show(studio_remote::RevisionShowOptions),
+    /// Compare two immutable project revisions.
     Diff(studio_remote::RevisionDiffOptions),
     /// Restore an immutable revision into a new or empty checkout directory.
     Restore(studio_remote::RevisionRestoreOptions),
@@ -570,15 +583,24 @@ enum ManifestCommand {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CompatibilityProfile {
-    #[value(name = "reporch-native", alias = "reporch_native")]
+    #[value(name = "reporch-native", alias = "reporch_native", alias = "reporch")]
     ReporchNative,
-    #[value(name = "icpc202509", alias = "icpc_202509", alias = "icpc_2025_09")]
+    #[value(
+        name = "icpc202509",
+        alias = "icpc_202509",
+        alias = "icpc_2025_09",
+        alias = "icpc-2025-09"
+    )]
     Icpc202509,
     #[value(name = "icpc-legacy", alias = "icpc_legacy")]
     IcpcLegacy,
-    #[value(name = "polygon-compatible", alias = "polygon_compatible")]
+    #[value(
+        name = "polygon-compatible",
+        alias = "polygon_compatible",
+        alias = "polygon"
+    )]
     PolygonCompatible,
-    #[value(name = "domjudge-zip", alias = "domjudge_zip")]
+    #[value(name = "domjudge-zip", alias = "domjudge_zip", alias = "domjudge")]
     DomjudgeZip,
 }
 
@@ -684,12 +706,30 @@ async fn cli_main() {
     };
     let output = CliOutput::new(format, arguments.quiet, arguments.color);
     let command = command_name(&arguments.command);
-    if let Err(error) = run(arguments, &output).await {
+    if let Err(error) = run_until_interrupt(run(arguments, &output), tokio::signal::ctrl_c()).await
+    {
         if error.downcast_ref::<CliInterrupted>().is_some() {
             std::process::exit(130);
         }
         let exit_code = output.emit_error(command, &error);
         std::process::exit(exit_code as i32);
+    }
+}
+
+async fn run_until_interrupt<C, S>(command: C, interrupt: S) -> Result<()>
+where
+    C: Future<Output = Result<()>>,
+    S: Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(command);
+    tokio::pin!(interrupt);
+    tokio::select! {
+        biased;
+        signal = &mut interrupt => {
+            signal.context("wait for SIGINT")?;
+            Err(CliInterrupted.into())
+        }
+        result = &mut command => result,
     }
 }
 
@@ -956,11 +996,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Runtime { command } => match command {
             RuntimeCommand::Status => {
                 let status = reporch_runtime_host::status().await?;
-                let human = format!(
-                    "Reporch Runtime: {:?} · {:?}",
-                    status.availability, status.backend
-                );
-                output.emit("runtime status", &status, &human)
+                let data = runtime_status_output(&status)?;
+                output.emit("runtime status", &data, &runtime_status_human(&status))
             }
             RuntimeCommand::Doctor { fix } => {
                 let mut report = reporch_runtime_host::doctor().await?;
@@ -978,6 +1015,13 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     report = reporch_runtime_host::doctor().await?;
                 }
                 let passed = report.checks.iter().filter(|check| check.passed).count();
+                if passed != report.checks.len() {
+                    return Err(cli_output::domain_error(
+                        "runtime.doctor_failed",
+                        format!("{passed}/{} runtime checks passed", report.checks.len()),
+                        &report,
+                    ));
+                }
                 output.emit(
                     "runtime doctor",
                     &report,
@@ -1471,6 +1515,49 @@ async fn ensure_mandatory_runtime(command: &Command, output: &CliOutput) -> Resu
             .context("repair mandatory Reporch Runtime assets")?;
     }
     Ok(())
+}
+
+fn runtime_status_output(
+    status: &reporch_runtime_core::RuntimeStatusV1,
+) -> Result<serde_json::Value> {
+    let mut data = serde_json::to_value(status).context("serialize runtime status")?;
+    let fields = data
+        .as_object_mut()
+        .context("runtime status must serialize as an object")?;
+    fields.insert(
+        "cli_version".into(),
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").into()),
+    );
+    fields.insert(
+        "runtime_version_is_independent".into(),
+        serde_json::Value::Bool(true),
+    );
+    fields.insert(
+        "compatibility_basis".into(),
+        serde_json::Value::String("protocol_version".into()),
+    );
+    fields.insert(
+        "protocol_compatible".into(),
+        serde_json::Value::Bool(status.protocol_version == reporch_runtime_core::PROTOCOL_VERSION),
+    );
+    Ok(data)
+}
+
+fn runtime_status_human(status: &reporch_runtime_core::RuntimeStatusV1) -> String {
+    let runtime_version = status
+        .installed_version
+        .as_deref()
+        .unwrap_or("not installed");
+    let sequence = status
+        .installed_sequence
+        .map_or_else(|| "none".into(), |value| value.to_string());
+    format!(
+        "Reporch Runtime {runtime_version} · sequence {sequence} · protocol {} · {:?} · {:?}. Runtime versions are independent from CLI {}; protocol compatibility governs execution.",
+        status.protocol_version,
+        status.availability,
+        status.backend,
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 fn command_skips_runtime_bootstrap(command: &Command) -> bool {
@@ -2545,6 +2632,26 @@ mod interrupt_regression_tests {
     // Generated by Codex on 2026-08-14 after SIGINT incorrectly returned success.
 
     use super::*;
+    use std::future::{pending, ready};
+
+    #[tokio::test]
+    async fn sigint_cancels_the_active_command_with_the_internal_marker() {
+        let result =
+            run_until_interrupt(pending::<Result<()>>(), ready(std::io::Result::Ok(()))).await;
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<CliInterrupted>()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_command_is_not_reclassified_as_interrupted() {
+        let result =
+            run_until_interrupt(ready(Result::Ok(())), pending::<std::io::Result<()>>()).await;
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn the_internal_interrupt_marker_takes_the_public_exit_130_path() {

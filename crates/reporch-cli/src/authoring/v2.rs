@@ -468,7 +468,12 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test group add",
                 &spec.testing.groups,
-                &format!("Added group {}", options.id),
+                &group_points_feedback_v2(
+                    spec.problem_type,
+                    &spec.testing.groups,
+                    &format!("Added group {}", options.id),
+                    &options.id,
+                ),
             )
         }
         TestGroupCommand::Update(options) => {
@@ -504,7 +509,12 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test group update",
                 &spec.testing.groups,
-                &format!("Updated group {}", options.id),
+                &group_points_feedback_v2(
+                    spec.problem_type,
+                    &spec.testing.groups,
+                    &format!("Updated group {}", options.id),
+                    &options.id,
+                ),
             )
         }
         TestGroupCommand::Remove { id } => {
@@ -945,6 +955,10 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
             let mut cases = Vec::new();
             for validator in validators {
                 for unit in &units {
+                    output.progress(
+                        "validator run",
+                        &format!("Running validator {} · unit {}", validator.name, unit.name),
+                    );
                     let result = reporch_cli::authoring_runtime::run_program(
                         &reporch_cli::authoring_runtime::ProgramRequest {
                             project_directory: &root,
@@ -1079,10 +1093,14 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                 selected_by_name(&spec.testing.checker.unit_tests, name.as_deref(), |unit| {
                     unit.name.as_str()
                 })?;
-            ensure!(!units.is_empty(), "no checker unit tests are configured");
+            ensure!(
+                !units.is_empty(),
+                "no checker unit tests are configured. Add one with `reporch checker unit-add --name accepts-sample --input tests/1.in --answer tests/1.ans --output tests/1.ans --expected accept`, then run `reporch checker test`"
+            );
             let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for unit in units {
+                output.progress("checker run", &format!("Checking unit {}", unit.name));
                 let (actual_accepted, exit_code, duration_ms, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
@@ -2481,7 +2499,7 @@ pub(super) async fn output_submission(options: OutputOptions, output: &CliOutput
                     for (test_id, path) in &mappings {
                         ensure!(
                             spec.testing.tests.iter().any(|test| test.id == *test_id),
-                            "unknown test case: {test_id}"
+                            "unknown test case: {test_id}. List test UUIDs with `reporch test case list --format json`"
                         );
                         reporch_cli::local_project_v2::declare_project_file(
                             root,
@@ -2741,7 +2759,23 @@ fn find_group<'a>(
         .groups
         .iter()
         .find(|group| group.name == value || parsed == Some(group.id))
-        .with_context(|| format!("unknown group: {value}"))
+        .with_context(|| {
+            format!(
+                "unknown group: {value}. Create it with `reporch test group add {value} --points 0`, list groups with `reporch test group list`, or omit --group for an ungrouped sample test"
+            )
+        })
+}
+
+fn group_points_feedback_v2(
+    problem_type: studio_core::ProblemType,
+    groups: &[TestGroupSpecV2],
+    action: &str,
+    group: &str,
+) -> String {
+    if problem_type != studio_core::ProblemType::Scored {
+        return action.to_owned();
+    }
+    super::scored_points_feedback(action, group, groups.iter().map(|group| group.points).sum())
 }
 
 fn find_generator<'a>(

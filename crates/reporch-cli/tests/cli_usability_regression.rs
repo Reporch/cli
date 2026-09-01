@@ -1,5 +1,5 @@
 use std::fs;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
@@ -1442,4 +1442,165 @@ fn static_semantics_require_a_reference_and_bounded_scored_points() {
             .unwrap()
             .contains("points must be a finite value from 0 to 100")
     );
+}
+
+#[test]
+fn concurrent_authoring_commands_do_not_lose_successful_updates() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "standard").status.success());
+    fs::create_dir_all(project.path().join("generators")).unwrap();
+    fs::write(
+        project.path().join("generators/deterministic.py"),
+        "print('1 2')\n",
+    )
+    .unwrap();
+
+    let mut children = (0..20)
+        .map(|index| {
+            let mut command = reporch();
+            command
+                .args(["--cwd", project.path().to_str().unwrap()])
+                .args([
+                    "generator",
+                    "add",
+                    "--id",
+                    &format!("concurrent-{index}"),
+                    "--source",
+                    "generators/deterministic.py",
+                    "--language",
+                    "python3",
+                    "--no-input",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command.spawn().unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    for child in children.drain(..) {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let listed = run_json(project.path(), &["generator", "list"]);
+    assert!(listed.status.success(), "{listed:?}");
+    let value: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(value["data"].as_array().unwrap().len(), 20, "{value:#}");
+}
+
+#[test]
+fn migrate_does_not_treat_a_generated_v2_manifest_as_legacy_input() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "standard").status.success());
+    fs::remove_file(project.path().join("reporch.yaml")).unwrap();
+
+    let migrated = reporch()
+        .args([
+            "--format",
+            "json",
+            "migrate",
+            "--directory",
+            project.path().to_str().unwrap(),
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert!(migrated.status.success(), "{migrated:?}");
+    let value: Value = serde_json::from_slice(&migrated.stdout).unwrap();
+    assert_eq!(value["data"]["migrated"], false, "{value:#}");
+    assert!(!project.path().join("reporch.yaml").exists());
+    assert!(!project.path().join("reporch.problem.pre-1.0.json").exists());
+}
+
+#[test]
+fn standard_checker_unit_tests_do_not_block_external_package_export() {
+    let project = tempfile::tempdir().unwrap();
+    assert!(init(project.path(), "standard").status.success());
+    fs::create_dir_all(project.path().join("validators")).unwrap();
+    fs::write(
+        project.path().join("validators/input.py"),
+        "import sys\nparts = sys.stdin.read().split()\nraise SystemExit(0 if len(parts) == 2 else 1)\n",
+    )
+    .unwrap();
+    let validator = run(
+        project.path(),
+        &[
+            "validator",
+            "set",
+            "--source",
+            "validators/input.py",
+            "--language",
+            "python3",
+        ],
+    );
+    assert!(validator.status.success(), "{validator:?}");
+    for (name, input, expected) in [
+        ("accepts-pair", "1 2\n", "valid"),
+        ("rejects-short", "1\n", "invalid"),
+    ] {
+        let added = run(
+            project.path(),
+            &[
+                "validator",
+                "unit-add",
+                "--name",
+                name,
+                "--input-text",
+                input,
+                "--expected",
+                expected,
+            ],
+        );
+        assert!(added.status.success(), "{added:?}");
+    }
+    fs::create_dir_all(project.path().join("checker-tests")).unwrap();
+    fs::write(project.path().join("checker-tests/wrong.out"), "999\n").unwrap();
+
+    for (name, output, expected) in [
+        ("accepts-sample", "tests/1.ans", "accept"),
+        ("rejects-wrong", "checker-tests/wrong.out", "reject"),
+    ] {
+        let added = run(
+            project.path(),
+            &[
+                "checker",
+                "unit-add",
+                "--name",
+                name,
+                "--input",
+                "tests/1.in",
+                "--answer",
+                "tests/1.ans",
+                "--output",
+                output,
+                "--expected",
+                expected,
+            ],
+        );
+        assert!(added.status.success(), "{added:?}");
+    }
+    assert!(run(project.path(), &["check"]).status.success());
+    assert!(run(project.path(), &["checker", "test"]).status.success());
+
+    for (profile, filename) in [
+        ("icpc202509", "icpc.zip"),
+        ("polygon-compatible", "polygon.zip"),
+        ("domjudge-zip", "domjudge.zip"),
+    ] {
+        let output = project.path().join(filename);
+        let exported = run(
+            project.path(),
+            &[
+                "package",
+                "export",
+                "reporch.yaml",
+                output.to_str().unwrap(),
+                "--profile",
+                profile,
+                "--no-input",
+            ],
+        );
+        assert!(exported.status.success(), "{profile}: {exported:?}");
+        assert!(output.is_file(), "missing export for {profile}");
+    }
 }

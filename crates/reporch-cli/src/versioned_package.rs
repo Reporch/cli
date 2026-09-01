@@ -477,19 +477,26 @@ fn project_v2_to_v1(manifest: &ReleaseManifestV2) -> Result<ReleaseManifestV1> {
                     expected_valid: test.expected_valid,
                 })
                 .collect(),
-            checker_tests: manifest
-                .testing
-                .checker
-                .unit_tests
-                .iter()
-                .map(|test| CheckerTestSpec {
-                    name: test.name.clone(),
-                    input_file: test.input_file.clone(),
-                    answer_file: test.answer_file.clone(),
-                    output_file: test.output_file.clone(),
-                    expected_accepted: test.expected_accepted,
-                })
-                .collect(),
+            checker_tests: if matches!(
+                manifest.testing.checker.checker,
+                studio_core::CheckerSpec::Custom { .. }
+            ) {
+                manifest
+                    .testing
+                    .checker
+                    .unit_tests
+                    .iter()
+                    .map(|test| CheckerTestSpec {
+                        name: test.name.clone(),
+                        input_file: test.input_file.clone(),
+                        answer_file: test.answer_file.clone(),
+                        output_file: test.output_file.clone(),
+                        expected_accepted: test.expected_accepted,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
             interactor_path: interactor.map(|value| value.interactor.source_path.clone()),
             interactor_language: interactor.map(|value| value.interactor.language.clone()),
             grader_path: grader,
@@ -638,6 +645,18 @@ fn v2_compatibility_report(
             "compatibility.v2_generator_recipe_sidecar",
             "typed generator recipes are preserved only in the Reporch V2 sidecar",
             "testing.generators",
+        );
+    }
+    if !manifest.testing.checker.unit_tests.is_empty()
+        && !matches!(
+            manifest.testing.checker.checker,
+            studio_core::CheckerSpec::Custom { .. }
+        )
+    {
+        add_warning(
+            "compatibility.v2_standard_checker_unit_sidecar",
+            "built-in checker unit tests are preserved only in the Reporch V2 sidecar",
+            "testing.checker.unit_tests",
         );
     }
     report.lossless = report.issues.is_empty();

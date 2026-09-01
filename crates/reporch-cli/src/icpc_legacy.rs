@@ -1227,7 +1227,7 @@ fn package_root(output: &Path) -> Result<String> {
             && root
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
-        "legacy ICPC package name must contain only lowercase ASCII letters and digits"
+        "legacy ICPC package name must contain only lowercase ASCII letters and digits; output stem {root:?} is invalid. Use a filename such as aplusb.zip"
     );
     Ok(root.into())
 }

@@ -627,12 +627,24 @@ impl ReleaseManifestV2 {
         for validator in &self.testing.validators.extra {
             validate_program(&paths, validator)?;
         }
+        unique_ids(
+            self.testing
+                .validators
+                .unit_tests
+                .iter()
+                .map(|test| test.id),
+            "validator unit",
+        )?;
         for test in &self.testing.validators.unit_tests {
             require_file(&paths, &test.input_file)?;
         }
         if let CheckerSpec::Custom { source_path, .. } = &self.testing.checker.checker {
             require_file(&paths, source_path)?;
         }
+        unique_ids(
+            self.testing.checker.unit_tests.iter().map(|test| test.id),
+            "checker unit",
+        )?;
         for test in &self.testing.checker.unit_tests {
             require_file(&paths, &test.input_file)?;
             require_file(&paths, &test.answer_file)?;
@@ -680,6 +692,10 @@ impl ReleaseManifestV2 {
 
         if let Some(interactive) = &self.execution.interactive {
             validate_program(&paths, &interactive.interactor)?;
+            unique_ids(
+                interactive.unit_tests.iter().map(|test| test.id),
+                "interactive unit",
+            )?;
             for test in &interactive.unit_tests {
                 require_file(&paths, &test.input_file)?;
                 require_id(
@@ -968,6 +984,32 @@ mod tests {
         let manifest = minimal_manifest();
         manifest.validate_references().unwrap();
         assert_eq!(manifest.digest().unwrap(), manifest.digest().unwrap());
+    }
+
+    #[test]
+    fn validator_unit_test_ids_must_be_unique() {
+        let mut manifest = minimal_manifest();
+        let duplicate_id = Uuid::now_v7();
+        manifest.testing.validators.unit_tests = vec![
+            ValidatorUnitSpecV2 {
+                id: duplicate_id,
+                name: "valid".into(),
+                input_file: "statements/ko.md".into(),
+                expected_valid: true,
+            },
+            ValidatorUnitSpecV2 {
+                id: duplicate_id,
+                name: "invalid".into(),
+                input_file: "statements/ko.md".into(),
+                expected_valid: false,
+            },
+        ];
+
+        assert!(matches!(
+            manifest.validate_references(),
+            Err(ManifestError::DuplicateIdentity(identity))
+                if identity.contains("validator unit")
+        ));
     }
 
     fn harness_manifest(explicit_source_roles: bool) -> ReleaseManifestV2 {

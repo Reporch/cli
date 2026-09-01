@@ -2311,6 +2311,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "fs2",
  "futures-util",
  "hex",
  "minisign-verify",

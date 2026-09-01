@@ -60,7 +60,7 @@ enum StatementRenderFormat {
 
 #[derive(Debug, ClapArgs)]
 #[command(
-    after_help = "Examples:\n  reporch test case add --name sample-1 --input-text '1 2' --answer-text '3' --group samples\n  reporch test group add samples --points 0\n  reporch test group add full-score --points 100 --depends-on samples"
+    after_help = "Examples:\n  reporch test group add samples --points 0\n  reporch test case add --name sample-1 --input-text '1 2' --answer-text '3' --group samples\n  reporch test case add --name sample-2 --input-text '3 4' --answer-text '7'\n  reporch test group add full-score --points 100 --depends-on samples\n\n`--group` is optional. Sample tests can remain ungrouped. A 0-point sample group organizes tests and dependencies without changing the scored total."
 )]
 pub struct TestOptions {
     #[command(subcommand)]
@@ -323,7 +323,7 @@ enum CheckerCommand {
         #[arg(long, value_enum)]
         expected: CheckerExpectation,
     },
-    #[command(alias = "test")]
+    #[command(visible_alias = "test")]
     Run {
         #[arg(long)]
         name: Option<String>,
@@ -417,7 +417,12 @@ struct RuntimeProgramRunOptions {
     /// Test name, UUID, or declared input path (for example `sample-1` or `tests/1.in`).
     #[arg(long, value_name = "NAME|UUID|PATH")]
     test: String,
-    #[arg(long)]
+    /// Save captured program output inside the project.
+    #[arg(
+        long,
+        value_name = "PROJECT_RELATIVE_PATH",
+        value_parser = parse_runtime_output_path
+    )]
     output: Option<PathBuf>,
     #[command(flatten)]
     runtime: RuntimeOptions,
@@ -542,7 +547,12 @@ struct RuntimeOptions {
     /// Execution backend. `auto` uses the mandatory Reporch VM; `podman` and `docker` are deprecated explicit compatibility modes.
     #[arg(long, value_enum, default_value_t = RuntimeKind::Auto)]
     runtime: RuntimeKind,
-    #[arg(long, default_value_t = 30)]
+    /// Sandbox wall timeout in seconds.
+    #[arg(
+        long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..=600)
+    )]
     timeout_seconds: u64,
     #[arg(long, default_value_t = 512)]
     memory_mib: u64,
@@ -567,10 +577,11 @@ impl RuntimeOptions {
         self,
         output: &CliOutput,
     ) -> reporch_cli::authoring_runtime::AuthoringRunOptions {
-        output.progress(
-            "local execution",
-            "Preparing the Reporch VM and signed toolchain; first use may download and verify assets",
-        );
+        output.progress("local execution", "Initializing local verification");
+        let progress_output = output.clone();
+        let progress = reporch_cli::authoring_runtime::AuthoringProgress::new(move |message| {
+            progress_output.progress("local execution", message);
+        });
         let runtime = match self.runtime {
             RuntimeKind::Auto => reporch_cli::local_sandbox::OciRuntime::Auto,
             RuntimeKind::Podman => reporch_cli::local_sandbox::OciRuntime::Podman,
@@ -583,6 +594,7 @@ impl RuntimeOptions {
             memory_mib: self.memory_mib,
             cpus: self.cpus,
             output_kib: self.output_kib,
+            progress,
         }
     }
 }
@@ -1099,7 +1111,12 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test group add",
                 &spec.judging.groups,
-                &format!("Added group {}", options.id),
+                &group_points_feedback_v1(
+                    spec.problem_type,
+                    &spec.judging.groups,
+                    &format!("Added group {}", options.id),
+                    &options.id,
+                ),
             )
         }
         TestGroupCommand::Update(options) => {
@@ -1129,7 +1146,12 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test group update",
                 &spec.judging.groups,
-                &format!("Updated group {}", options.id),
+                &group_points_feedback_v1(
+                    spec.problem_type,
+                    &spec.judging.groups,
+                    &format!("Updated group {}", options.id),
+                    &options.id,
+                ),
             )
         }
         TestGroupCommand::Remove { id } => {
@@ -1546,6 +1568,10 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
             let mut cases = Vec::new();
             for validator in &validators {
                 for unit in &units {
+                    output.progress(
+                        "validator run",
+                        &format!("Running validator {} · unit {}", validator.id, unit.name),
+                    );
                     let result = reporch_cli::authoring_runtime::run_program(
                         &reporch_cli::authoring_runtime::ProgramRequest {
                             project_directory: &root,
@@ -1668,10 +1694,14 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
             let units = selected_by_name(&spec.judging.checker_tests, name.as_deref(), |unit| {
                 unit.name.as_str()
             })?;
-            ensure!(!units.is_empty(), "no checker unit tests are configured");
+            ensure!(
+                !units.is_empty(),
+                "no checker unit tests are configured. Add one with `reporch checker unit-add --name accepts-sample --input tests/1.in --answer tests/1.ans --output tests/1.ans --expected accept`, then run `reporch checker test`"
+            );
             let run_options = runtime.into_run_options(output);
             let mut cases = Vec::new();
             for unit in units {
+                output.progress("checker run", &format!("Checking unit {}", unit.name));
                 let (actual_accepted, exit_code, duration_ms, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
@@ -2153,8 +2183,9 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
         } => {
             ensure!(!mappings.is_empty(), "at least one --map is required");
             let expected_score = score_range(minimum_score, maximum_score, expected)?;
-            let spec =
-                reporch_cli::local_project::update_authoring_spec(Path::new("."), |root, spec| {
+            let spec = reporch_cli::local_project::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
                     ensure!(
                         !spec
                             .output_submissions
@@ -2166,7 +2197,7 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                     for (test_id, path) in &mappings {
                         ensure!(
                             spec.judging.tests.iter().any(|test| test.id == *test_id),
-                            "unknown test case: {test_id}"
+                            "unknown test case: {test_id}. List test UUIDs with `reporch test case list --format json`"
                         );
                         reporch_cli::local_project::declare_project_file(
                             root,
@@ -2187,7 +2218,8 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                         expected_score: expected_score.clone(),
                     });
                     Ok(())
-                })?;
+                },
+            )?;
             output.emit(
                 "output add",
                 &spec.output_submissions,
@@ -2938,7 +2970,7 @@ fn ensure_groups_exist(spec: &reporch_format::AuthoringSpecV1, groups: &[String]
     for id in groups {
         ensure!(
             spec.judging.groups.iter().any(|group| &group.id == id),
-            "unknown group: {id}"
+            "unknown group: {id}. Create it with `reporch test group add {id} --points 0`, list groups with `reporch test group list`, or omit --group for an ungrouped sample test"
         );
     }
     Ok(())
@@ -2954,6 +2986,41 @@ fn validate_group_id(id: &str) -> Result<()> {
         "group ID must contain 1-64 letters, numbers, '-' or '_'"
     );
     Ok(())
+}
+
+fn group_points_feedback_v1(
+    problem_type: studio_core::ProblemType,
+    groups: &[TestGroupSpec],
+    action: &str,
+    group: &str,
+) -> String {
+    if problem_type != studio_core::ProblemType::Scored {
+        return action.to_owned();
+    }
+    scored_points_feedback(action, group, groups.iter().map(|group| group.points).sum())
+}
+
+fn scored_points_feedback(action: &str, group: &str, total: f64) -> String {
+    let total_display = display_points(total);
+    if total > 100.0 {
+        let over = display_points(total - 100.0);
+        format!(
+            "{action} · scored groups total {total_display}/100 ({over} points over; adjust with `reporch test group update {group} --points <POINTS>` before `reporch check`)"
+        )
+    } else if total < 100.0 {
+        let remaining = display_points(100.0 - total);
+        format!("{action} · scored groups total {total_display}/100 ({remaining} points remaining)")
+    } else {
+        format!("{action} · scored groups total 100/100")
+    }
+}
+
+fn display_points(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
+    }
 }
 
 fn normalize_name(value: &str) -> Result<String> {
@@ -3022,7 +3089,18 @@ fn parse_output_mapping(value: &str) -> Result<(Uuid, String), String> {
         .ok_or_else(|| "mapping must use UUID=relative/path".to_owned())?;
     let test_id = test_id
         .parse()
-        .map_err(|_| "mapping contains an invalid test UUID".to_owned())?;
+        .map_err(|_| {
+            "mapping contains an invalid test UUID; list test UUIDs with `reporch test case list --format json`"
+                .to_owned()
+        })?;
     let path = relative_string(Path::new(path)).map_err(|error| error.to_string())?;
     Ok((test_id, path))
+}
+
+fn parse_runtime_output_path(value: &str) -> Result<PathBuf, String> {
+    let normalized = relative_string(Path::new(value)).map_err(|_| {
+        "output must be a safe project-relative path, for example artifacts/transcript.txt"
+            .to_owned()
+    })?;
+    Ok(PathBuf::from(normalized))
 }

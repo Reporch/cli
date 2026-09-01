@@ -452,9 +452,12 @@ pub struct MemberScopeOptions {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+#[command(after_help = "Example:\n  reporch member search jinwoo --project-id <UUID>")]
 pub struct MemberSearchOptions {
     #[command(flatten)]
     pub scope: MemberScopeOptions,
+    /// Name, handle, or email fragment to find.
+    #[arg(value_name = "QUERY")]
     pub query: String,
 }
 

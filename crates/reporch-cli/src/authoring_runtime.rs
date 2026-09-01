@@ -1,11 +1,32 @@
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use studio_core::CheckerSpec;
 
 use crate::local_sandbox::{LocalSandboxOptions, LocalSandboxResult, OciRuntime};
+
+#[derive(Clone)]
+pub struct AuthoringProgress(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl AuthoringProgress {
+    pub fn new(callback: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    fn report(&self, message: impl AsRef<str>) {
+        (self.0)(message.as_ref());
+    }
+}
+
+impl fmt::Debug for AuthoringProgress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthoringProgress(..)")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AuthoringRunOptions {
@@ -15,6 +36,7 @@ pub struct AuthoringRunOptions {
     pub memory_mib: u64,
     pub cpus: f64,
     pub output_kib: u64,
+    pub progress: AuthoringProgress,
 }
 
 #[derive(Debug, Clone)]
@@ -67,10 +89,18 @@ pub async fn run_program(request: &ProgramRequest<'_>) -> Result<LocalSandboxRes
         .map(|path| checked_workspace_file(&root, path))
         .transpose()?;
 
+    request.options.progress.report(format!(
+        "Resolving the signed {} toolchain",
+        request.language
+    ));
     let entry = crate::toolchain::resolve_for_language(
         request.options.toolchain_id.as_deref(),
         request.language,
     )?;
+    request.options.progress.report(format!(
+        "Installing or verifying signed toolchain {}; first use may download assets",
+        entry.id
+    ));
     let inspection = if request.options.runtime == OciRuntime::Auto {
         crate::toolchain::install(&entry.id, request.options.runtime).await?
     } else {
@@ -99,7 +129,15 @@ pub async fn run_program(request: &ProgramRequest<'_>) -> Result<LocalSandboxRes
         cpus: request.options.cpus,
         output_kib: request.options.output_kib,
     };
+    request
+        .options
+        .progress
+        .report("Preparing the isolated Reporch VM");
     let plan = crate::local_sandbox::plan(&sandbox).await?;
+    request
+        .options
+        .progress
+        .report("Running the isolated Reporch VM job");
     crate::local_sandbox::execute(&plan).await
 }
 
@@ -202,7 +240,14 @@ async fn checked_installed_toolchain(
     language: &str,
     options: &AuthoringRunOptions,
 ) -> Result<crate::toolchain::ToolchainEntryV1> {
+    options
+        .progress
+        .report(format!("Resolving the signed {language} toolchain"));
     let entry = crate::toolchain::resolve_for_language(options.toolchain_id.as_deref(), language)?;
+    options.progress.report(format!(
+        "Installing or verifying signed toolchain {}; first use may download assets",
+        entry.id
+    ));
     let inspection = if options.runtime == OciRuntime::Auto {
         crate::toolchain::install(&entry.id, options.runtime).await?
     } else {
@@ -233,7 +278,11 @@ async fn execute_in_toolchain(
         cpus: options.cpus,
         output_kib: options.output_kib,
     };
+    options.progress.report("Preparing the isolated Reporch VM");
     let plan = crate::local_sandbox::plan(&sandbox).await?;
+    options
+        .progress
+        .report("Running the isolated Reporch VM job");
     crate::local_sandbox::execute(&plan).await
 }
 
