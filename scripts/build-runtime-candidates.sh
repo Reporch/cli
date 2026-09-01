@@ -1,12 +1,25 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 1 ]; then
-  printf '%s\n' 'usage: scripts/build-runtime-candidates.sh <new-output-directory>' >&2
+if [ "$#" -ne 3 ]; then
+  printf '%s\n' 'usage: scripts/build-runtime-candidates.sh <new-output-directory> <runtime-sequence> <runtime-version>' >&2
   exit 2
 fi
 
 output=$1
+runtime_sequence=$2
+runtime_version=$3
+case "$runtime_sequence" in
+  ''|*[!0-9]*) printf '%s\n' 'runtime sequence must be a positive integer' >&2; exit 2 ;;
+esac
+if [ "$runtime_sequence" -le 0 ]; then
+  printf '%s\n' 'runtime sequence must be a positive integer' >&2
+  exit 2
+fi
+case "$runtime_version" in
+  ''|*[!0-9A-Za-z.-]*) printf '%s\n' 'runtime version is invalid' >&2; exit 2 ;;
+esac
+runtime_tag="reporch-runtime-v1-seq$runtime_sequence"
 case "$output" in
   /*) ;;
   *) printf '%s\n' 'runtime candidate output must be absolute' >&2; exit 2 ;;
@@ -106,8 +119,8 @@ manifest() {
   target=$1
   minimum_os=$2
   target/release/reporch-runtime-bundle-builder \
-    "$target" 15 1.0.0-rc.8 "$minimum_os" \
-    https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq16/ \
+    "$target" "$runtime_sequence" "$runtime_version" "$minimum_os" \
+    "https://github.com/Reporch/cli/releases/download/$runtime_tag/" \
     "$staging/artifacts/$target" "$staging/manifests/runtime-$target-manifest.json"
 }
 manifest darwin-arm64 13.0

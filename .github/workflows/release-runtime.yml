@@ -9,7 +9,7 @@ permissions:
   attestations: write
 
 concurrency:
-  group: release-runtime-v1-seq16
+  group: release-runtime-v1-seq17
   cancel-in-progress: false
 
 jobs:
@@ -20,7 +20,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RUNTIME_TAG: reporch-runtime-v1-seq16
+      RUNTIME_SEQUENCE: "17"
+      RUNTIME_VERSION: 1.0.0-rc.8
+      RUNTIME_TAG: reporch-runtime-v1-seq17
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -44,13 +46,16 @@ jobs:
           cargo install --list | grep -q '^cargo-xwin v0.23.1:'
           node scripts/check-runtime-sources.mjs
           node scripts/check-workflows.mjs
+          test "$RUNTIME_TAG" = "reporch-runtime-v1-seq$RUNTIME_SEQUENCE"
           test -z "$(git status --porcelain)"
       - name: Build all five immutable runtime candidates twice locally
         shell: bash
         run: |
           set -euo pipefail
-          scripts/build-runtime-candidates.sh "$RUNNER_TEMP/runtime-candidates"
-          scripts/build-runtime-candidates.sh "$RUNNER_TEMP/runtime-candidates-rebuild"
+          scripts/build-runtime-candidates.sh \
+            "$RUNNER_TEMP/runtime-candidates" "$RUNTIME_SEQUENCE" "$RUNTIME_VERSION"
+          scripts/build-runtime-candidates.sh \
+            "$RUNNER_TEMP/runtime-candidates-rebuild" "$RUNTIME_SEQUENCE" "$RUNTIME_VERSION"
           node scripts/compare-runtime-candidates.mjs \
             "$RUNNER_TEMP/runtime-candidates" \
             "$RUNNER_TEMP/runtime-candidates-rebuild" \
@@ -71,6 +76,12 @@ jobs:
           cargo build --locked --release -p reporch-cli
           for target in darwin-arm64 darwin-x64 linux-arm64-gnu linux-x64-gnu windows-x64-msvc; do
             manifest="$RUNNER_TEMP/runtime-candidates/manifests/runtime-$target-manifest.json"
+            jq -e \
+              --argjson sequence "$RUNTIME_SEQUENCE" \
+              --arg version "$RUNTIME_VERSION" \
+              --arg prefix "https://github.com/Reporch/cli/releases/download/$RUNTIME_TAG/" \
+              '.sequence == $sequence and .version == $version and all(.artifacts[]; .source_url | startswith($prefix))' \
+              "$manifest" >/dev/null
             signature="$manifest.minisig"
             cargo run --locked --manifest-path tools/runtime-manifest-signer/Cargo.toml -- \
               "$manifest" "$RUNNER_TEMP/runtime-manifest.key" \
@@ -106,8 +117,8 @@ jobs:
             exit 1
           fi
           gh release create "$RUNTIME_TAG" --draft --target "$GITHUB_SHA" \
-            --title "Reporch Runtime v1 sequence 16" \
-            --notes "Signed Docker-free Reporch VM runtime sequence 16. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
+            --title "Reporch Runtime v1 sequence 17" \
+            --notes "Signed Docker-free Reporch VM runtime sequence 17. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
           gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/runtime-release"/*
           mkdir "$RUNNER_TEMP/runtime-release-download"
           gh release download "$RUNTIME_TAG" --dir "$RUNNER_TEMP/runtime-release-download"
