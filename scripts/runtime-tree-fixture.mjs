@@ -6,8 +6,10 @@ function digest(bytes) {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
+export const RUNTIME_TREE_FIXTURE_SEQUENCE = 23;
+
 export function createRuntimeTreeFixture(root, target, version = "1.0.0-rc.8") {
-  const sequence = 23;
+  const sequence = RUNTIME_TREE_FIXTURE_SEQUENCE;
   const bundle = join(root, "bundles", `${sequence}-${version}`);
   mkdirSync(bundle, { recursive: true });
   const definitions = [
