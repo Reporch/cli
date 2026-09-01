@@ -14,7 +14,10 @@ import test from "node:test";
 
 import { TARGETS } from "./release-lib.mjs";
 import { nativeArchiveName, packNativeRelease } from "./pack-native-release.mjs";
-import { createRuntimeTreeFixture } from "./runtime-tree-fixture.mjs";
+import {
+  RUNTIME_TREE_FIXTURE_SEQUENCE,
+  createRuntimeTreeFixture
+} from "./runtime-tree-fixture.mjs";
 
 test("standalone archive names cover every official target", () => {
   const names = TARGETS.map((target) => nativeArchiveName("0.9.0", target));
@@ -64,7 +67,11 @@ test(
       );
       assert.equal(manifest.schema, "reporch.cli-native-release.v1");
       assert.equal(manifest.archives.length, TARGETS.length);
-      assert.ok(manifest.archives.every((archive) => archive.runtimeSequence === 8));
+      assert.ok(
+        manifest.archives.every(
+          (archive) => archive.runtimeSequence === RUNTIME_TREE_FIXTURE_SEQUENCE
+        )
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
