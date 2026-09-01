@@ -29,6 +29,7 @@ fn statement_add_safely_creates_a_missing_markdown_file() {
             "statements/ko-KR.md",
             "--title",
             "두 수의 합",
+            "--create",
         ])
         .output()
         .unwrap();
@@ -72,6 +73,7 @@ fn statement_add_refuses_to_follow_a_symlink() {
             "ko-KR",
             "--path",
             "statements/linked.md",
+            "--create",
         ])
         .output()
         .unwrap();

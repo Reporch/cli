@@ -34,26 +34,38 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
             locale,
             path,
             title,
+            create,
         } => {
             let relative = relative_string(&path)?;
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
-            let created = materialize_statement_file(&root, &relative, title.as_deref(), &locale)?;
-            let updated =
-                reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
+            let created = if create {
+                materialize_statement_file(&root, &relative, title.as_deref(), &locale)?
+            } else {
+                None
+            };
+            let updated = reporch_cli::local_project_v2::update_authoring_spec(
+                &root,
+                |root, spec| {
                     reporch_cli::local_project_v2::declare_project_file(
                         root,
                         spec,
                         &relative,
                         "text/markdown",
                         false,
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "create {relative} first or add --create, then rerun `reporch statement add --locale {locale} --path {relative}`"
+                        )
+                    })?;
                     spec.statements.insert(locale.clone(), relative.clone());
                     if let Some(title) = &title {
                         ensure!(!title.trim().is_empty(), "title cannot be empty");
                         spec.title.insert(locale.clone(), title.trim().to_owned());
                     }
                     Ok(())
-                });
+                },
+            );
             let spec = match updated {
                 Ok(spec) => spec,
                 Err(error) => {

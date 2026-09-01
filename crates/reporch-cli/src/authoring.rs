@@ -32,6 +32,9 @@ enum StatementCommand {
         path: PathBuf,
         #[arg(long)]
         title: Option<String>,
+        /// Create a safe Markdown starter when the path does not exist.
+        #[arg(long)]
+        create: bool,
     },
     Open {
         #[arg(long)]
@@ -679,10 +682,15 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
             locale,
             path,
             title,
+            create,
         } => {
             let relative = relative_string(&path)?;
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
-            let created = materialize_statement_file(&root, &relative, title.as_deref(), &locale)?;
+            let created = if create {
+                materialize_statement_file(&root, &relative, title.as_deref(), &locale)?
+            } else {
+                None
+            };
             let updated = reporch_cli::local_project::update_authoring_spec(&root, |root, spec| {
                 reporch_cli::local_project::declare_project_file(
                     root,
@@ -690,7 +698,12 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
                     &relative,
                     "text/markdown",
                     false,
-                )?;
+                )
+                .with_context(|| {
+                    format!(
+                        "create {relative} first or add --create, then rerun `reporch statement add --locale {locale} --path {relative}`"
+                    )
+                })?;
                 spec.statements.insert(locale.clone(), relative.clone());
                 if let Some(title) = &title {
                     ensure!(!title.trim().is_empty(), "title cannot be empty");
