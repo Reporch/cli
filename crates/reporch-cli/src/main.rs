@@ -754,7 +754,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             )
         }
         Command::Auth { command } => match command {
-            AuthCommand::Login(options) => auth_login(&options, output).await,
+            AuthCommand::Login(options) => auth_login(&options, no_input, output).await,
             AuthCommand::Status(options) => auth_status(&options, output).await,
             AuthCommand::Logout(options) => auth_logout(&options, profile.as_deref(), output).await,
         },
@@ -2064,7 +2064,11 @@ fn qualification_authoring_matrix(
     ))
 }
 
-async fn auth_login(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
+async fn auth_login(options: &NativeAuthOptions, no_input: bool, output: &CliOutput) -> Result<()> {
+    ensure!(
+        !no_input,
+        "interactive input is disabled for this command; rerun `reporch auth login` without --no-input"
+    );
     let config = device_auth_config(options)?;
     let client = NativeAuthClient::discover(config)
         .await
