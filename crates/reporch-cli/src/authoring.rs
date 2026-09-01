@@ -500,7 +500,7 @@ struct RuntimeOptions {
     /// Signed toolchain catalog ID. Inferred from the configured language when omitted.
     #[arg(long)]
     toolchain: Option<String>,
-    /// Secure OCI runtime. Local author-code execution requires rootless Podman or Docker and never falls back to the host.
+    /// Execution backend. `auto` uses the mandatory Reporch VM; `podman` and `docker` are deprecated explicit compatibility modes.
     #[arg(long, value_enum, default_value_t = RuntimeKind::Auto)]
     runtime: RuntimeKind,
     #[arg(long, default_value_t = 30)]
@@ -517,7 +517,9 @@ struct RuntimeOptions {
 enum RuntimeKind {
     #[default]
     Auto,
+    /// Deprecated explicit compatibility backend.
     Podman,
+    /// Deprecated explicit compatibility backend.
     Docker,
 }
 

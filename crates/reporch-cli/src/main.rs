@@ -190,7 +190,7 @@ enum Command {
         #[command(subcommand)]
         command: PackageCommand,
     },
-    /// Plan or run an opt-in, rootless, networkless OCI command.
+    /// Plan or run a networkless Reporch VM command; explicit OCI backends are deprecated.
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
@@ -329,7 +329,9 @@ struct SandboxOptions {
 enum SandboxRuntime {
     #[default]
     Auto,
+    /// Deprecated explicit compatibility backend.
     Podman,
+    /// Deprecated explicit compatibility backend.
     Docker,
 }
 
