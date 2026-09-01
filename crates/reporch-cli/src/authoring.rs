@@ -1099,7 +1099,12 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test group add",
                 &spec.judging.groups,
-                &format!("Added group {}", options.id),
+                &group_points_feedback_v1(
+                    spec.problem_type,
+                    &spec.judging.groups,
+                    &format!("Added group {}", options.id),
+                    &options.id,
+                ),
             )
         }
         TestGroupCommand::Update(options) => {
@@ -1129,7 +1134,12 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test group update",
                 &spec.judging.groups,
-                &format!("Updated group {}", options.id),
+                &group_points_feedback_v1(
+                    spec.problem_type,
+                    &spec.judging.groups,
+                    &format!("Updated group {}", options.id),
+                    &options.id,
+                ),
             )
         }
         TestGroupCommand::Remove { id } => {
@@ -2153,8 +2163,9 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
         } => {
             ensure!(!mappings.is_empty(), "at least one --map is required");
             let expected_score = score_range(minimum_score, maximum_score, expected)?;
-            let spec =
-                reporch_cli::local_project::update_authoring_spec(Path::new("."), |root, spec| {
+            let spec = reporch_cli::local_project::update_authoring_spec(
+                Path::new("."),
+                |root, spec| {
                     ensure!(
                         !spec
                             .output_submissions
@@ -2187,7 +2198,8 @@ pub async fn output_submission(options: OutputOptions, output: &CliOutput) -> Re
                         expected_score: expected_score.clone(),
                     });
                     Ok(())
-                })?;
+                },
+            )?;
             output.emit(
                 "output add",
                 &spec.output_submissions,
@@ -2954,6 +2966,41 @@ fn validate_group_id(id: &str) -> Result<()> {
         "group ID must contain 1-64 letters, numbers, '-' or '_'"
     );
     Ok(())
+}
+
+fn group_points_feedback_v1(
+    problem_type: studio_core::ProblemType,
+    groups: &[TestGroupSpec],
+    action: &str,
+    group: &str,
+) -> String {
+    if problem_type != studio_core::ProblemType::Scored {
+        return action.to_owned();
+    }
+    scored_points_feedback(action, group, groups.iter().map(|group| group.points).sum())
+}
+
+fn scored_points_feedback(action: &str, group: &str, total: f64) -> String {
+    let total_display = display_points(total);
+    if total > 100.0 {
+        let over = display_points(total - 100.0);
+        format!(
+            "{action} · scored groups total {total_display}/100 ({over} points over; adjust with `reporch test group update {group} --points <POINTS>` before `reporch check`)"
+        )
+    } else if total < 100.0 {
+        let remaining = display_points(100.0 - total);
+        format!("{action} · scored groups total {total_display}/100 ({remaining} points remaining)")
+    } else {
+        format!("{action} · scored groups total 100/100")
+    }
+}
+
+fn display_points(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
+    }
 }
 
 fn normalize_name(value: &str) -> Result<String> {

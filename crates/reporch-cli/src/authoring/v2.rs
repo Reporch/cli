@@ -468,7 +468,12 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test group add",
                 &spec.testing.groups,
-                &format!("Added group {}", options.id),
+                &group_points_feedback_v2(
+                    spec.problem_type,
+                    &spec.testing.groups,
+                    &format!("Added group {}", options.id),
+                    &options.id,
+                ),
             )
         }
         TestGroupCommand::Update(options) => {
@@ -504,7 +509,12 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test group update",
                 &spec.testing.groups,
-                &format!("Updated group {}", options.id),
+                &group_points_feedback_v2(
+                    spec.problem_type,
+                    &spec.testing.groups,
+                    &format!("Updated group {}", options.id),
+                    &options.id,
+                ),
             )
         }
         TestGroupCommand::Remove { id } => {
@@ -2746,6 +2756,18 @@ fn find_group<'a>(
                 "unknown group: {value}. Create it with `reporch test group add {value} --points 0`, list groups with `reporch test group list`, or omit --group for an ungrouped sample test"
             )
         })
+}
+
+fn group_points_feedback_v2(
+    problem_type: studio_core::ProblemType,
+    groups: &[TestGroupSpecV2],
+    action: &str,
+    group: &str,
+) -> String {
+    if problem_type != studio_core::ProblemType::Scored {
+        return action.to_owned();
+    }
+    super::scored_points_feedback(action, group, groups.iter().map(|group| group.points).sum())
 }
 
 fn find_generator<'a>(
