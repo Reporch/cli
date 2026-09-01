@@ -2741,7 +2741,11 @@ fn find_group<'a>(
         .groups
         .iter()
         .find(|group| group.name == value || parsed == Some(group.id))
-        .with_context(|| format!("unknown group: {value}"))
+        .with_context(|| {
+            format!(
+                "unknown group: {value}. Create it with `reporch test group add {value} --points 0`, list groups with `reporch test group list`, or omit --group for an ungrouped sample test"
+            )
+        })
 }
 
 fn find_generator<'a>(

@@ -60,7 +60,7 @@ enum StatementRenderFormat {
 
 #[derive(Debug, ClapArgs)]
 #[command(
-    after_help = "Examples:\n  reporch test case add --name sample-1 --input-text '1 2' --answer-text '3' --group samples\n  reporch test group add samples --points 0\n  reporch test group add full-score --points 100 --depends-on samples"
+    after_help = "Examples:\n  reporch test group add samples --points 0\n  reporch test case add --name sample-1 --input-text '1 2' --answer-text '3' --group samples\n  reporch test case add --name sample-2 --input-text '3 4' --answer-text '7'\n  reporch test group add full-score --points 100 --depends-on samples\n\n`--group` is optional. Sample tests can remain ungrouped."
 )]
 pub struct TestOptions {
     #[command(subcommand)]
@@ -2938,7 +2938,7 @@ fn ensure_groups_exist(spec: &reporch_format::AuthoringSpecV1, groups: &[String]
     for id in groups {
         ensure!(
             spec.judging.groups.iter().any(|group| &group.id == id),
-            "unknown group: {id}"
+            "unknown group: {id}. Create it with `reporch test group add {id} --points 0`, list groups with `reporch test group list`, or omit --group for an ungrouped sample test"
         );
     }
     Ok(())
