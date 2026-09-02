@@ -273,7 +273,11 @@ jobs:
     if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
     needs: [verify-source, publish]
     permissions:
-      contents: read
+      # Draft releases are intentionally not public until every target passes
+      # this job. GitHub only exposes draft assets to tokens with push access,
+      # so this job needs contents:write while it downloads them. GH_TOKEN is
+      # removed before either downloaded binary is extracted or executed.
+      contents: write
       attestations: read
     strategy:
       fail-fast: false

@@ -135,6 +135,21 @@ assert.doesNotMatch(
 assert.match(release, /qualify-published-artifacts:/);
 assert.match(
   release,
+  /qualify-published-artifacts:[\s\S]*?permissions:\s*\n\s*#[\s\S]*?contents: write\s*\n\s*attestations: read/,
+  "draft release qualification needs push-level visibility for unpublished assets"
+);
+assert.match(
+  release,
+  /gh attestation verify "\$archive"[\s\S]*?unset GH_TOKEN[\s\S]*?tar -xzf "\$archive"/,
+  "Unix qualification must discard its draft-release token before extracting or running assets"
+);
+assert.match(
+  release,
+  /gh attestation verify \$archive[\s\S]*?Remove-Item Env:GH_TOKEN[\s\S]*?Expand-Archive/,
+  "Windows qualification must discard its draft-release token before extracting or running assets"
+);
+assert.match(
+  release,
   /scripts\/qualify-installed-auth\.mjs/,
   "every future release must exercise installed Device OAuth and the protected native credential file"
 );
