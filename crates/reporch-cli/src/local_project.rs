@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use reporch_format::{
@@ -20,6 +21,8 @@ pub const LOCAL_STATE_DIRECTORY: &str = ".reporch";
 pub const LOCAL_STATE_FILE_NAME: &str = "state.json";
 const MAX_LEGACY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LOCAL_STATE_BYTES: u64 = 1024 * 1024;
+const ATOMIC_REPLACE_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const ATOMIC_REPLACE_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -611,12 +614,38 @@ pub(crate) fn atomic_replace(path: &Path, bytes: &[u8], unix_mode: u32) -> Resul
     }
     #[cfg(not(unix))]
     let _ = unix_mode;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("atomically replace {}", path.display()))?;
+    let deadline = Instant::now() + ATOMIC_REPLACE_RETRY_TIMEOUT;
+    loop {
+        match temporary.persist(path) {
+            Ok(_) => break,
+            Err(error) => {
+                let retryable =
+                    transient_atomic_replace_error(&error.error) && Instant::now() < deadline;
+                temporary = error.file;
+                if retryable {
+                    std::thread::sleep(ATOMIC_REPLACE_RETRY_INTERVAL);
+                    continue;
+                }
+                return Err(error.error)
+                    .with_context(|| format!("atomically replace {}", path.display()));
+            }
+        }
+    }
     sync_parent(path)?;
     Ok(())
+}
+
+fn transient_atomic_replace_error(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 pub(crate) fn reject_non_regular_destination(path: &Path) -> Result<()> {
