@@ -124,6 +124,11 @@ const ci = readFileSync(".github/workflows/ci.yml", "utf8");
 assert.match(ci, /actionlint_1\.7\.12_darwin_arm64\.tar\.gz/);
 assert.match(ci, /ACTIONLINT_SHA256:\s*[a-f0-9]{64}/);
 assert.match(ci, /shasum -a 256 --check/);
+assert.match(
+  ci,
+  /cargo build --locked --release[\s\S]*scripts\/qualify-installed-auth\.mjs[\s\S]*scripts\/test-current-npm-package\.mjs/,
+  "native CI must exercise the installed authentication path before npm publication"
+);
 const publisher = readFileSync("scripts/publish-npm-release.mjs", "utf8");
 assert.match(publisher, /"--tag",\s*npmTag/);
 assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prerelease/);
