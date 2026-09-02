@@ -6,8 +6,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use reporch_runtime_protocol::{
-    GuestHandshakeV1, GuestJobV1, GuestOutputV1, GuestResultV1, HANDSHAKE_SCHEMA, PROTOCOL_VERSION,
-    ProtocolFailureV1, RESULT_SCHEMA, WireMessageV1, read_wire_message, write_wire_message,
+    GuestHandshakeV1, GuestJobV1, GuestOutputV1, GuestResultV1, GuestTerminationV2,
+    HANDSHAKE_SCHEMA, PROTOCOL_VERSION, ProtocolFailureV1, RESULT_SCHEMA, WireMessageV1,
+    read_wire_message, write_wire_message,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -690,28 +691,40 @@ async fn execute_job(job: &GuestJobV1) -> Result<GuestResultV1> {
     let stderr = child.stderr.take().context("capture guest stderr")?;
     let stdout_task = tokio::spawn(read_bounded(stdout, job.limits.stdout_bytes));
     let stderr_task = tokio::spawn(read_bounded(stderr, job.limits.stderr_bytes));
-    let status = match tokio::time::timeout(
+    let (exit_code, mut termination) = match tokio::time::timeout(
         std::time::Duration::from_millis(job.limits.timeout_ms),
         child.wait(),
     )
     .await
     {
-        Ok(status) => status.context("wait for guest workload")?,
+        Ok(status) => {
+            let status = status.context("wait for guest workload")?;
+            (
+                status.code().unwrap_or(128),
+                if status.code().is_some() {
+                    GuestTerminationV2::Exited
+                } else {
+                    GuestTerminationV2::Signalled
+                },
+            )
+        }
         Err(_) => {
             kill_process_tree(&mut child).await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            bail!("guest workload exceeded {} ms", job.limits.timeout_ms);
+            (124, GuestTerminationV2::TimedOut)
         }
     };
     let (stdout, stdout_truncated) = stdout_task.await.context("join guest stdout")??;
     let (stderr, stderr_truncated) = stderr_task.await.context("join guest stderr")??;
+    if termination == GuestTerminationV2::Exited && (stdout_truncated || stderr_truncated) {
+        termination = GuestTerminationV2::OutputLimit;
+    }
     Ok(GuestResultV1 {
         schema: RESULT_SCHEMA.into(),
         protocol_version: PROTOCOL_VERSION,
         job_id: job.id,
         nonce: job.nonce.clone(),
-        exit_code: status.code().unwrap_or(128),
+        exit_code,
+        termination,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         stdout: GuestOutputV1::from_bytes(&stdout, stdout_truncated),
         stderr: GuestOutputV1::from_bytes(&stderr, stderr_truncated),

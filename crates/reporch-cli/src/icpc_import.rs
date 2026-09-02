@@ -457,6 +457,7 @@ fn build_manifest(
             .map_or(CheckerSpec::Token, |program| CheckerSpec::Custom {
                 source_path: program.source_path.clone(),
                 language: program.language.clone(),
+                protocol: studio_core::CheckerProtocolV1::Icpc202509,
             })
     };
     let validator_tests = import_validator_tests(&paths, &tests, validator.is_some());

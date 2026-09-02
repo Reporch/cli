@@ -13,6 +13,7 @@ use studio_core::{
     ProgramSpec, RELEASE_MANIFEST_SCHEMA_V1, ReleaseManifestV1, ReleaseManifestV2,
     ScoreAggregation, Sha256Digest, SolutionSpec, TestCaseSpec, TestGroupSpec, ValidatorTestSpec,
     VersionedReleaseManifest, compatibility_report, normalize_relative_path,
+    validate_versioned_manifest,
 };
 use tempfile::Builder;
 use zip::write::SimpleFileOptions;
@@ -57,7 +58,13 @@ pub fn export_v2_with_sidecar<F>(
 where
     F: FnOnce(&ReleaseManifestV1, &Path, &Path) -> Result<()>,
 {
-    manifest.validate_references()?;
+    let versioned = VersionedReleaseManifest::V2(Box::new(manifest.clone()));
+    let issues = validate_versioned_manifest(&versioned);
+    ensure!(
+        issues.is_empty(),
+        "V2 package validation failed: {}",
+        serde_json::to_string(&issues)?
+    );
     ensure!(
         profile != PackageProfile::ReporchNative,
         "native export has its own V2 format"
@@ -166,7 +173,12 @@ pub fn import_v2_sidecar(
         matches!(sidecar.manifest, VersionedReleaseManifest::V2(_)),
         "external V2 sidecar must contain a V2 manifest"
     );
-    sidecar.manifest.validate_references()?;
+    let issues = validate_versioned_manifest(&sidecar.manifest);
+    ensure!(
+        issues.is_empty(),
+        "external V2 sidecar validation failed: {}",
+        serde_json::to_string(&issues)?
+    );
     ensure!(
         sidecar.manifest.digest()? == sidecar.manifest_digest,
         "external V2 sidecar manifest digest mismatch"

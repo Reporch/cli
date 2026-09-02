@@ -31,7 +31,7 @@ pub struct NativeAuthOptions {
     #[arg(
         long,
         env = "REPORCH_STUDIO_CLI_CLIENT_ID",
-        default_value = "reporch-studio-cli"
+        default_value = "reporch-studio-cli-v1"
     )]
     pub client_id: String,
     /// Permit plain HTTP only for a localhost development issuer.
@@ -44,7 +44,7 @@ pub struct NativeAuthOptions {
 }
 
 pub fn device_auth_config(options: &NativeAuthOptions) -> Result<NativeAuthConfig> {
-    NativeAuthConfig::device(
+    NativeAuthConfig::device_dpop(
         &options.issuer,
         &options.client_id,
         vec![

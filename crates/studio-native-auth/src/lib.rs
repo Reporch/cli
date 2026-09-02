@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
@@ -9,6 +11,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use keyring::v1::{Entry, Error as KeyringError};
+use p256::ecdsa::signature::Signer as _;
+use p256::ecdsa::{Signature, SigningKey};
 use rand::RngCore;
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
@@ -27,7 +31,10 @@ const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
 const CALLBACK_TIMEOUT_SECONDS: u64 = 5 * 60;
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const TOKEN_SCHEMA_V1: &str = "reporch.native-token.v1";
+const TOKEN_SCHEMA_V2: &str = "reporch.native-credential.v2";
+const CREDENTIAL_FILE_SCHEMA_V2: &str = "reporch.native-credential-file.v2";
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 256 * 1024;
 const CREDENTIAL_STORE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
 #[derive(Clone)]
@@ -37,6 +44,7 @@ pub struct NativeAuthConfig {
     scopes: Vec<String>,
     redirect_uri: Option<Url>,
     allow_insecure_http: bool,
+    dpop_required: bool,
 }
 
 impl NativeAuthConfig {
@@ -46,7 +54,16 @@ impl NativeAuthConfig {
         scopes: Vec<String>,
         allow_insecure_http: bool,
     ) -> Result<Self, NativeAuthError> {
-        Self::new(issuer, client_id, scopes, None, allow_insecure_http)
+        Self::new(issuer, client_id, scopes, None, allow_insecure_http, false)
+    }
+
+    pub fn device_dpop(
+        issuer: &str,
+        client_id: &str,
+        scopes: Vec<String>,
+        allow_insecure_http: bool,
+    ) -> Result<Self, NativeAuthError> {
+        Self::new(issuer, client_id, scopes, None, allow_insecure_http, true)
     }
 
     pub fn loopback_pkce(
@@ -62,6 +79,7 @@ impl NativeAuthConfig {
             scopes,
             Some(redirect_uri),
             allow_insecure_http,
+            false,
         )
     }
 
@@ -71,6 +89,7 @@ impl NativeAuthConfig {
         scopes: Vec<String>,
         redirect_uri: Option<&str>,
         allow_insecure_http: bool,
+        dpop_required: bool,
     ) -> Result<Self, NativeAuthError> {
         let issuer = normalized_issuer(issuer, allow_insecure_http)?;
         let client_id = client_id.trim().to_owned();
@@ -103,6 +122,7 @@ impl NativeAuthConfig {
             scopes: normalized_scopes,
             redirect_uri,
             allow_insecure_http,
+            dpop_required,
         })
     }
 
@@ -195,12 +215,16 @@ impl NativeAuthConfig {
             && token.scopes.iter().all(|scope| {
                 !scope.is_empty() && scope.len() <= 128 && !scope.chars().any(char::is_whitespace)
             });
-        if token.schema != TOKEN_SCHEMA_V1
+        let dpop_valid = match (&token.schema[..], &token.token_type[..], &token.device_key) {
+            (TOKEN_SCHEMA_V1, "Bearer", None) => true,
+            (TOKEN_SCHEMA_V2, "DPoP", Some(key)) => key.validate().is_ok(),
+            _ => false,
+        };
+        if !dpop_valid
             || token.issuer != self.issuer()
             || token.client_id != self.client_id
             || token.access_token.is_empty()
             || token.access_token.len() > MAX_TOKEN_BYTES
-            || token.token_type != "Bearer"
             || !refresh_token_valid
             || !id_token_valid
             || !scopes_valid
@@ -235,6 +259,31 @@ pub struct DeviceAuthorizationPrompt {
     pub verification_uri_complete: Option<String>,
     pub expires_at: DateTime<Utc>,
     pub interval_seconds: u64,
+    #[serde(skip_serializing)]
+    device_key: Option<DeviceKeyV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EcPublicJwkV1 {
+    kty: String,
+    crv: String,
+    x: String,
+    y: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceKeyV1 {
+    private_scalar: String,
+    public_jwk: EcPublicJwkV1,
+    thumbprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeAuthorization {
+    pub authorization: String,
+    pub dpop_proof: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -293,6 +342,14 @@ impl NativeAuthClient {
         if let Some(endpoint) = &metadata.revocation_endpoint {
             validate_provider_endpoint(endpoint, config.allow_insecure_http)?;
         }
+        if config.dpop_required
+            && !metadata
+                .dpop_signing_alg_values_supported
+                .iter()
+                .any(|algorithm| algorithm == "ES256")
+        {
+            return Err(NativeAuthError::ServerUpgradeRequired);
+        }
         Ok(Self {
             config,
             metadata,
@@ -309,16 +366,19 @@ impl NativeAuthClient {
             .as_ref()
             .ok_or(NativeAuthError::DeviceAuthorizationUnsupported)?;
         let scopes = self.config.scopes.join(" ");
-        let response = self
-            .http
-            .post(endpoint.clone())
-            .form(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("scope", scopes.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(NativeAuthError::Network)?;
+        let device_key = self
+            .config
+            .dpop_required
+            .then(DeviceKeyV1::generate)
+            .transpose()?;
+        let mut request = self.http.post(endpoint.clone()).form(&[
+            ("client_id", self.config.client_id.as_str()),
+            ("scope", scopes.as_str()),
+        ]);
+        if let Some(key) = &device_key {
+            request = request.header("DPoP", key.proof("POST", endpoint, None)?);
+        }
+        let response = request.send().await.map_err(NativeAuthError::Network)?;
         if !response.status().is_success() {
             return Err(provider_error(response).await);
         }
@@ -345,6 +405,7 @@ impl NativeAuthClient {
             verification_uri_complete: verification_uri_complete.map(|url| url.to_string()),
             expires_at: Utc::now() + Duration::seconds(response.expires_in as i64),
             interval_seconds: response.interval.unwrap_or(5).clamp(1, 30),
+            device_key,
         })
     }
 
@@ -359,23 +420,44 @@ impl NativeAuthClient {
                 return Err(NativeAuthError::DeviceCodeExpired);
             }
             sleep(StdDuration::from_secs(interval)).await;
-            let response = self
-                .http
-                .post(self.metadata.token_endpoint.clone())
-                .form(&[
-                    ("grant_type", DEVICE_GRANT_TYPE),
-                    ("device_code", prompt.device_code.as_str()),
-                    ("client_id", self.config.client_id.as_str()),
-                ])
-                .send()
-                .await
-                .map_err(NativeAuthError::Network)?;
+            let mut request = self.http.post(self.metadata.token_endpoint.clone()).form(&[
+                ("grant_type", DEVICE_GRANT_TYPE),
+                ("device_code", prompt.device_code.as_str()),
+                ("client_id", self.config.client_id.as_str()),
+            ]);
+            if let Some(key) = &prompt.device_key {
+                request = request.header(
+                    "DPoP",
+                    key.proof("POST", &self.metadata.token_endpoint, None)?,
+                );
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(_error) => {
+                    // Device polling is explicitly repeatable until the code expires.
+                    // A transient DNS/TLS/connect/read timeout must not discard the
+                    // in-memory DPoP key after the user has already approved the code.
+                    if Utc::now() >= prompt.expires_at {
+                        return Err(NativeAuthError::DeviceCodeExpired);
+                    }
+                    interval = (interval + 1).min(30);
+                    continue;
+                }
+            };
             if response.status().is_success() {
-                let token = self.decode_initial_token(response).await?;
-                store.save(&self.config.credential_key(), &token).await?;
+                let token = self
+                    .decode_initial_token(response, prompt.device_key.clone())
+                    .await?;
+                let key = self.config.credential_key();
+                let _guard = store.lock(&key).await?;
+                store.save(&key, &token).await?;
                 return Ok(self.config.status_from_token(Some(&token)));
             }
             let status = response.status();
+            if matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504) {
+                interval = (interval + 1).min(30);
+                continue;
+            }
             let error = decode_provider_json::<OAuthErrorWire>(response)
                 .await
                 .unwrap_or(OAuthErrorWire {
@@ -450,8 +532,10 @@ impl NativeAuthClient {
         if !response.status().is_success() {
             return Err(provider_error(response).await);
         }
-        let token = self.decode_initial_token(response).await?;
-        store.save(&self.config.credential_key(), &token).await?;
+        let token = self.decode_initial_token(response, None).await?;
+        let key = self.config.credential_key();
+        let _guard = store.lock(&key).await?;
+        store.save(&key, &token).await?;
         Ok(self.config.status_from_token(Some(&token)))
     }
 
@@ -466,47 +550,89 @@ impl NativeAuthClient {
         &self,
         store: &S,
     ) -> Result<String, NativeAuthError> {
+        let key = self.config.credential_key();
+        let _guard = store.lock(&key).await?;
         let mut token = store
-            .load(&self.config.credential_key())
+            .load(&key)
             .await?
             .ok_or(NativeAuthError::NotAuthenticated)?;
         self.config.validate_stored_token(&token)?;
         if token.expires_at <= Utc::now() + Duration::seconds(TOKEN_EXPIRY_SKEW_SECONDS) {
             token = self.refresh_token(&token).await?;
-            store.save(&self.config.credential_key(), &token).await?;
+            store.save(&key, &token).await?;
         }
         Ok(token.access_token)
     }
 
+    pub async fn authorization<S: TokenStore + ?Sized>(
+        &self,
+        store: &S,
+        method: &str,
+        target_uri: &Url,
+    ) -> Result<NativeAuthorization, NativeAuthError> {
+        let key = self.config.credential_key();
+        let _guard = store.lock(&key).await?;
+        let mut token = store
+            .load(&key)
+            .await?
+            .ok_or(NativeAuthError::NotAuthenticated)?;
+        self.config.validate_stored_token(&token)?;
+        if token.expires_at <= Utc::now() + Duration::seconds(TOKEN_EXPIRY_SKEW_SECONDS) {
+            token = self.refresh_token(&token).await?;
+            store.save(&key, &token).await?;
+        }
+        let dpop_proof = token
+            .device_key
+            .as_ref()
+            .map(|key| key.proof(method, target_uri, Some(&token.access_token)))
+            .transpose()?;
+        let scheme = if dpop_proof.is_some() {
+            "DPoP"
+        } else {
+            "Bearer"
+        };
+        Ok(NativeAuthorization {
+            authorization: format!("{scheme} {}", token.access_token),
+            dpop_proof,
+        })
+    }
+
     pub async fn logout<S: TokenStore + ?Sized>(&self, store: &S) -> Result<bool, NativeAuthError> {
-        let token = store.load(&self.config.credential_key()).await?;
+        let key = self.config.credential_key();
+        let _guard = store.lock(&key).await?;
+        let token = store.load(&key).await?;
         if let Some(token) = token.as_ref()
             && let Err(error) = self.config.validate_stored_token(token)
         {
-            store.delete(&self.config.credential_key()).await?;
+            store.delete(&key).await?;
             return Err(error);
         }
-        let remotely_revoked = if let (Some(token), Some(endpoint)) =
-            (token.as_ref(), self.metadata.revocation_endpoint.as_ref())
-        {
-            let revoke_token = token
-                .refresh_token
-                .as_deref()
-                .unwrap_or(&token.access_token);
-            self.http
-                .post(endpoint.clone())
-                .form(&[
-                    ("token", revoke_token),
-                    ("client_id", self.config.client_id.as_str()),
-                ])
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
-        } else {
-            false
+        let Some(token) = token.as_ref() else {
+            store.delete(&key).await?;
+            return Ok(false);
         };
-        store.delete(&self.config.credential_key()).await?;
-        Ok(remotely_revoked)
+        let endpoint = self
+            .metadata
+            .revocation_endpoint
+            .as_ref()
+            .ok_or(NativeAuthError::RevocationUnavailable)?;
+        let revoke_token = token
+            .refresh_token
+            .as_deref()
+            .unwrap_or(&token.access_token);
+        let mut request = self.http.post(endpoint.clone()).form(&[
+            ("token", revoke_token),
+            ("client_id", self.config.client_id.as_str()),
+        ]);
+        if let Some(key) = token.device_key.as_ref() {
+            request = request.header("DPoP", key.proof("POST", endpoint, None)?);
+        }
+        let response = request.send().await.map_err(NativeAuthError::Network)?;
+        if !response.status().is_success() {
+            return Err(provider_error(response).await);
+        }
+        store.delete(&key).await?;
+        Ok(true)
     }
 
     async fn refresh_token(
@@ -517,30 +643,34 @@ impl NativeAuthClient {
             .refresh_token
             .as_deref()
             .ok_or(NativeAuthError::RefreshUnavailable)?;
-        let response = self
-            .http
-            .post(self.metadata.token_endpoint.clone())
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", self.config.client_id.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(NativeAuthError::Network)?;
+        let mut request = self.http.post(self.metadata.token_endpoint.clone()).form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", self.config.client_id.as_str()),
+        ]);
+        if let Some(key) = previous.device_key.as_ref() {
+            request = request.header(
+                "DPoP",
+                key.proof("POST", &self.metadata.token_endpoint, None)?,
+            );
+        }
+        let response = request.send().await.map_err(NativeAuthError::Network)?;
         if !response.status().is_success() {
             return Err(provider_error(response).await);
         }
         let wire: TokenResponseWire = decode_provider_json(response).await?;
-        self.token_from_wire(wire, previous.refresh_token.clone())
+        let refreshed = self.token_from_wire(wire, previous.device_key.clone())?;
+        validate_refresh_rotation(&refreshed, refresh_token)?;
+        Ok(refreshed)
     }
 
     async fn decode_initial_token(
         &self,
         response: reqwest::Response,
+        device_key: Option<DeviceKeyV1>,
     ) -> Result<StoredTokenSet, NativeAuthError> {
         let wire: TokenResponseWire = decode_provider_json(response).await?;
-        let token = self.token_from_wire(wire, None)?;
+        let token = self.token_from_wire(wire, device_key)?;
         if token.refresh_token.is_none() {
             return Err(NativeAuthError::RefreshUnavailable);
         }
@@ -550,11 +680,16 @@ impl NativeAuthClient {
     fn token_from_wire(
         &self,
         wire: TokenResponseWire,
-        fallback_refresh_token: Option<String>,
+        device_key: Option<DeviceKeyV1>,
     ) -> Result<StoredTokenSet, NativeAuthError> {
+        let expected_token_type = if device_key.is_some() {
+            "DPoP"
+        } else {
+            "Bearer"
+        };
         if wire.access_token.is_empty()
             || wire.access_token.len() > MAX_TOKEN_BYTES
-            || !wire.token_type.eq_ignore_ascii_case("bearer")
+            || !wire.token_type.eq_ignore_ascii_case(expected_token_type)
             || wire.expires_in == 0
             || wire.expires_in > 24 * 60 * 60
         {
@@ -581,17 +716,34 @@ impl NativeAuthClient {
             return Err(NativeAuthError::InvalidProviderResponse);
         }
         Ok(StoredTokenSet {
-            schema: TOKEN_SCHEMA_V1.into(),
+            schema: if device_key.is_some() {
+                TOKEN_SCHEMA_V2.into()
+            } else {
+                TOKEN_SCHEMA_V1.into()
+            },
             issuer: self.config.issuer().into(),
             client_id: self.config.client_id.clone(),
             access_token: wire.access_token,
-            refresh_token: wire.refresh_token.or(fallback_refresh_token),
+            refresh_token: wire.refresh_token,
             id_token: wire.id_token,
-            token_type: "Bearer".into(),
+            token_type: expected_token_type.into(),
             expires_at: Utc::now() + Duration::seconds(wire.expires_in as i64),
             scopes,
+            device_key,
         })
     }
+}
+
+fn validate_refresh_rotation(
+    refreshed: &StoredTokenSet,
+    previous_refresh_token: &str,
+) -> Result<(), NativeAuthError> {
+    refreshed
+        .refresh_token
+        .as_deref()
+        .filter(|candidate| !candidate.is_empty() && *candidate != previous_refresh_token)
+        .ok_or(NativeAuthError::RefreshRotationRequired)?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -602,6 +754,12 @@ pub struct CredentialKey {
 
 #[async_trait]
 pub trait TokenStore: Send + Sync {
+    async fn lock(
+        &self,
+        _key: &CredentialKey,
+    ) -> Result<CredentialOperationGuard, NativeAuthError> {
+        Ok(CredentialOperationGuard::default())
+    }
     async fn load(&self, key: &CredentialKey) -> Result<Option<StoredTokenSet>, NativeAuthError>;
     async fn save(
         &self,
@@ -609,6 +767,106 @@ pub trait TokenStore: Send + Sync {
         token: &StoredTokenSet,
     ) -> Result<(), NativeAuthError>;
     async fn delete(&self, key: &CredentialKey) -> Result<(), NativeAuthError>;
+}
+
+#[derive(Default)]
+pub struct CredentialOperationGuard(Option<fs::File>);
+
+impl Drop for CredentialOperationGuard {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.as_ref() {
+            let _ = fs2::FileExt::unlock(file);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeFileTokenStore {
+    path: PathBuf,
+}
+
+impl NativeFileTokenStore {
+    pub fn discover() -> Result<Self, NativeAuthError> {
+        Ok(Self {
+            path: native_credential_path()?,
+        })
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCredentialFileV2 {
+    schema: String,
+    entries: BTreeMap<String, StoredTokenSet>,
+}
+
+fn credential_map_key(key: &CredentialKey) -> String {
+    format!("{}\u{1f}{}", key.service, key.account)
+}
+
+#[async_trait]
+impl TokenStore for NativeFileTokenStore {
+    async fn lock(
+        &self,
+        _key: &CredentialKey,
+    ) -> Result<CredentialOperationGuard, NativeAuthError> {
+        let path = self.lock_path();
+        tokio::task::spawn_blocking(move || acquire_credential_file_lock(&path))
+            .await
+            .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
+    }
+
+    async fn load(&self, key: &CredentialKey) -> Result<Option<StoredTokenSet>, NativeAuthError> {
+        let path = self.path.clone();
+        let map_key = credential_map_key(key);
+        tokio::task::spawn_blocking(move || {
+            let file = read_credential_file(&path)?;
+            Ok(file.entries.get(&map_key).cloned())
+        })
+        .await
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
+    }
+
+    async fn save(
+        &self,
+        key: &CredentialKey,
+        token: &StoredTokenSet,
+    ) -> Result<(), NativeAuthError> {
+        let path = self.path.clone();
+        let map_key = credential_map_key(key);
+        let token = token.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut file = read_credential_file(&path)?;
+            file.entries.insert(map_key, token);
+            write_credential_file(&path, &file)
+        })
+        .await
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
+    }
+
+    async fn delete(&self, key: &CredentialKey) -> Result<(), NativeAuthError> {
+        let path = self.path.clone();
+        let map_key = credential_map_key(key);
+        tokio::task::spawn_blocking(move || {
+            let mut file = read_credential_file(&path)?;
+            file.entries.remove(&map_key);
+            if file.entries.is_empty() {
+                match fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(NativeAuthError::CredentialStore(error.to_string())),
+                }
+            } else {
+                write_credential_file(&path, &file)
+            }
+        })
+        .await
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
+    }
 }
 
 #[derive(Default)]
@@ -673,6 +931,7 @@ pub async fn qualification_keyring_canary() -> Result<(), NativeAuthError> {
         token_type: "Bearer".into(),
         expires_at: Utc::now() + Duration::minutes(5),
         scopes: vec!["openid".into()],
+        device_key: None,
     };
     let store = KeyringTokenStore;
     let result = async {
@@ -694,6 +953,86 @@ pub async fn qualification_keyring_canary() -> Result<(), NativeAuthError> {
     let cleanup = store.delete(&key).await;
     result?;
     cleanup
+}
+
+/// Exercise the 1.0 permission-restricted credential file without touching a
+/// user's real login or invoking an OS keychain prompt.
+pub async fn qualification_native_file_canary() -> Result<(), NativeAuthError> {
+    let directory = std::env::temp_dir().join(format!(
+        "reporch-credential-qualification-{}",
+        uuid::Uuid::now_v7()
+    ));
+    fs::create_dir(&directory)
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    let store = NativeFileTokenStore {
+        path: directory.join("credentials-v2.json"),
+    };
+    let key = CredentialKey {
+        service: KEYRING_SERVICE.into(),
+        account: "qualification-native-file".into(),
+    };
+    let token = StoredTokenSet {
+        schema: TOKEN_SCHEMA_V2.into(),
+        issuer: "https://qualification.invalid/oauth".into(),
+        client_id: "reporch-studio-cli-v1".into(),
+        access_token: "qualification-access-token".into(),
+        refresh_token: Some("qualification-refresh-token".into()),
+        id_token: None,
+        token_type: "DPoP".into(),
+        expires_at: Utc::now() + Duration::minutes(5),
+        scopes: vec!["openid".into()],
+        device_key: Some(DeviceKeyV1::generate()?),
+    };
+    let result = async {
+        let _guard = store.lock(&key).await?;
+        store.save(&key, &token).await?;
+        let restored = store
+            .load(&key)
+            .await?
+            .ok_or(NativeAuthError::CredentialStoreCorrupt)?;
+        if restored.access_token != token.access_token
+            || restored.refresh_token != token.refresh_token
+            || restored
+                .device_key
+                .as_ref()
+                .is_none_or(|key| key.validate().is_err())
+        {
+            return Err(NativeAuthError::CredentialStoreCorrupt);
+        }
+        store.delete(&key).await
+    }
+    .await;
+    let _ = fs::remove_dir_all(&directory);
+    result
+}
+
+/// Remove a pre-1.0 bearer credential from the OS keychain before a fresh
+/// sender-constrained login. Bearer refresh tokens cannot be safely converted
+/// into DPoP credentials, so migration deliberately consists of revoking local
+/// reuse and completing a new authorization flow.
+pub async fn remove_legacy_keyring_credential(
+    issuer: &str,
+    client_id: &str,
+    allow_insecure_http: bool,
+) -> Result<bool, NativeAuthError> {
+    let config = NativeAuthConfig::device(
+        issuer,
+        client_id,
+        vec!["openid".into()],
+        allow_insecure_http,
+    )?;
+    let key = config.credential_key();
+    let store = KeyringTokenStore;
+    let existed = store.load(&key).await?.is_some();
+    if existed {
+        match NativeAuthClient::discover(config.clone()).await {
+            Ok(client) => {
+                let _ = client.logout(&store).await?;
+            }
+            Err(_) => store.delete(&key).await?,
+        }
+    }
+    Ok(existed)
 }
 
 #[async_trait]
@@ -741,7 +1080,7 @@ impl TokenStore for KeyringTokenStore {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredTokenSet {
     schema: String,
     issuer: String,
@@ -752,6 +1091,8 @@ pub struct StoredTokenSet {
     token_type: String,
     expires_at: DateTime<Utc>,
     scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_key: Option<DeviceKeyV1>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -763,6 +1104,8 @@ struct ProviderMetadata {
     device_authorization_endpoint: Option<Url>,
     #[serde(default)]
     revocation_endpoint: Option<Url>,
+    #[serde(default)]
+    dpop_signing_alg_values_supported: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -809,6 +1152,8 @@ pub enum NativeAuthError {
     InvalidProviderResponse,
     #[error("device authorization is not supported by this provider")]
     DeviceAuthorizationUnsupported,
+    #[error("Reporch authentication server does not support the required DPoP CLI capability")]
+    ServerUpgradeRequired,
     #[error("device authorization expired")]
     DeviceCodeExpired,
     #[error("the user denied authorization")]
@@ -821,6 +1166,10 @@ pub enum NativeAuthError {
     },
     #[error("a refresh token was not issued")]
     RefreshUnavailable,
+    #[error("the OAuth provider did not rotate the refresh token")]
+    RefreshRotationRequired,
+    #[error("the OAuth provider does not expose a revocation endpoint")]
+    RevocationUnavailable,
     #[error("native client is not authenticated")]
     NotAuthenticated,
     #[error("native OAuth network request failed")]
@@ -877,6 +1226,571 @@ async fn decode_provider_json<T: DeserializeOwned>(
         body.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&body).map_err(|_| NativeAuthError::InvalidProviderResponse)
+}
+
+impl DeviceKeyV1 {
+    fn generate() -> Result<Self, NativeAuthError> {
+        let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let x = point.x().ok_or(NativeAuthError::CredentialStoreCorrupt)?;
+        let y = point.y().ok_or(NativeAuthError::CredentialStoreCorrupt)?;
+        let public_jwk = EcPublicJwkV1 {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x: URL_SAFE_NO_PAD.encode(x),
+            y: URL_SAFE_NO_PAD.encode(y),
+        };
+        let thumbprint = jwk_thumbprint(&public_jwk)?;
+        Ok(Self {
+            private_scalar: URL_SAFE_NO_PAD.encode(signing_key.to_bytes()),
+            public_jwk,
+            thumbprint,
+        })
+    }
+
+    fn signing_key(&self) -> Result<SigningKey, NativeAuthError> {
+        let private = URL_SAFE_NO_PAD
+            .decode(&self.private_scalar)
+            .map_err(|_| NativeAuthError::CredentialStoreCorrupt)?;
+        SigningKey::from_slice(&private).map_err(|_| NativeAuthError::CredentialStoreCorrupt)
+    }
+
+    fn validate(&self) -> Result<(), NativeAuthError> {
+        if self.public_jwk.kty != "EC"
+            || self.public_jwk.crv != "P-256"
+            || self.thumbprint != jwk_thumbprint(&self.public_jwk)?
+        {
+            return Err(NativeAuthError::CredentialStoreCorrupt);
+        }
+        let signing_key = self.signing_key()?;
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        if point.x().map(|value| URL_SAFE_NO_PAD.encode(value)) != Some(self.public_jwk.x.clone())
+            || point.y().map(|value| URL_SAFE_NO_PAD.encode(value))
+                != Some(self.public_jwk.y.clone())
+        {
+            return Err(NativeAuthError::CredentialStoreCorrupt);
+        }
+        Ok(())
+    }
+
+    fn proof(
+        &self,
+        method: &str,
+        target_uri: &Url,
+        access_token: Option<&str>,
+    ) -> Result<String, NativeAuthError> {
+        self.validate()?;
+        let method = method.trim().to_ascii_uppercase();
+        if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
+            return Err(NativeAuthError::InvalidConfiguration(
+                "DPoP method is unsupported".into(),
+            ));
+        }
+        let htu = normalized_dpop_htu(target_uri)?;
+        let header = serde_json::json!({
+            "alg": "ES256",
+            "typ": "dpop+jwt",
+            "jwk": self.public_jwk,
+        });
+        let mut claims = serde_json::json!({
+            "htm": method,
+            "htu": htu,
+            "iat": Utc::now().timestamp(),
+            "jti": uuid::Uuid::now_v7().to_string(),
+        });
+        if let Some(access_token) = access_token {
+            claims["ath"] = serde_json::Value::String(
+                URL_SAFE_NO_PAD.encode(Sha256::digest(access_token.as_bytes())),
+            );
+        }
+        let encoded_header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&header)
+                .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?,
+        );
+        let encoded_claims = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&claims)
+                .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?,
+        );
+        let signing_input = format!("{encoded_header}.{encoded_claims}");
+        let signature: Signature = self.signing_key()?.sign(signing_input.as_bytes());
+        Ok(format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        ))
+    }
+}
+
+fn jwk_thumbprint(jwk: &EcPublicJwkV1) -> Result<String, NativeAuthError> {
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "crv": "P-256",
+        "kty": "EC",
+        "x": jwk.x,
+        "y": jwk.y,
+    }))
+    .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical)))
+}
+
+fn normalized_dpop_htu(value: &Url) -> Result<String, NativeAuthError> {
+    validate_provider_endpoint(value, value.scheme() == "http")?;
+    let mut value = value.clone();
+    value.set_query(None);
+    value.set_fragment(None);
+    if (value.scheme() == "https" && value.port() == Some(443))
+        || (value.scheme() == "http" && value.port() == Some(80))
+    {
+        value.set_port(None).map_err(|()| {
+            NativeAuthError::InvalidConfiguration("invalid DPoP target port".into())
+        })?;
+    }
+    Ok(value.to_string())
+}
+
+fn native_credential_path() -> Result<PathBuf, NativeAuthError> {
+    if let Some(override_path) = std::env::var_os("REPORCH_CONFIG_HOME") {
+        let root = PathBuf::from(override_path);
+        if !root.is_absolute() {
+            return Err(NativeAuthError::CredentialStore(
+                "REPORCH_CONFIG_HOME must be absolute".into(),
+            ));
+        }
+        return Ok(root.join("credentials-v2.json"));
+    }
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| NativeAuthError::CredentialStore("APPDATA is unavailable".into()))?;
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .ok_or_else(|| {
+            NativeAuthError::CredentialStore("config directory is unavailable".into())
+        })?;
+    Ok(base.join("reporch").join("credentials-v2.json"))
+}
+
+fn ensure_secure_credential_directory(path: &Path) -> Result<(), NativeAuthError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| NativeAuthError::CredentialStore("credential path has no parent".into()))?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(NativeAuthError::CredentialStoreCorrupt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(parent)
+                .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+        }
+        Err(error) => return Err(NativeAuthError::CredentialStore(error.to_string())),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+        let metadata = fs::symlink_metadata(parent)
+            .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+            return Err(NativeAuthError::CredentialStoreCorrupt);
+        }
+    }
+    #[cfg(windows)]
+    secure_windows_path(parent)?;
+    Ok(())
+}
+
+fn read_credential_file(path: &Path) -> Result<NativeCredentialFileV2, NativeAuthError> {
+    ensure_secure_credential_directory(path)?;
+    let bytes = match read_secure_file(path, MAX_CREDENTIAL_FILE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(NativeAuthError::CredentialStore(message)) if message == "not found" => {
+            return Ok(NativeCredentialFileV2 {
+                schema: CREDENTIAL_FILE_SCHEMA_V2.into(),
+                entries: BTreeMap::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let file: NativeCredentialFileV2 =
+        serde_json::from_slice(&bytes).map_err(|_| NativeAuthError::CredentialStoreCorrupt)?;
+    if file.schema != CREDENTIAL_FILE_SCHEMA_V2 || file.entries.len() > 32 {
+        return Err(NativeAuthError::CredentialStoreCorrupt);
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn read_secure_file(path: &Path, maximum: u64) -> Result<Vec<u8>, NativeAuthError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let fd = match rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => {
+            return Err(NativeAuthError::CredentialStore("not found".into()));
+        }
+        Err(error) => return Err(NativeAuthError::CredentialStore(error.to_string())),
+    };
+    let mut file = fs::File::from(fd);
+    let metadata = file
+        .metadata()
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > maximum
+    {
+        return Err(NativeAuthError::CredentialStoreCorrupt);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn read_secure_file(path: &Path, maximum: u64) -> Result<Vec<u8>, NativeAuthError> {
+    use std::io::Read as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(NativeAuthError::CredentialStore("not found".into()));
+        }
+        Err(error) => return Err(NativeAuthError::CredentialStore(error.to_string())),
+    };
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > maximum {
+        return Err(NativeAuthError::CredentialStoreCorrupt);
+    }
+    verify_windows_path(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    Ok(bytes)
+}
+
+fn write_credential_file(
+    path: &Path,
+    file: &NativeCredentialFileV2,
+) -> Result<(), NativeAuthError> {
+    ensure_secure_credential_directory(path)?;
+    let bytes = serde_json::to_vec(file)
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    if bytes.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
+        return Err(NativeAuthError::CredentialStoreCorrupt);
+    }
+    if path.exists() {
+        let _ = read_secure_file(path, MAX_CREDENTIAL_FILE_BYTES)?;
+    }
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
+    #[cfg(unix)]
+    let mut output = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
+    };
+    #[cfg(windows)]
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    use std::io::Write as _;
+    let result = (|| {
+        output
+            .write_all(&bytes)
+            .and_then(|()| output.sync_all())
+            .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+        drop(output);
+        #[cfg(windows)]
+        secure_windows_path(&temporary)?;
+        atomic_replace_credential_file(&temporary, path)?;
+        #[cfg(windows)]
+        verify_windows_path(path)?;
+        #[cfg(unix)]
+        sync_parent_directory(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn atomic_replace_credential_file(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), NativeAuthError> {
+    fs::rename(source, destination)
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))
+}
+
+#[cfg(windows)]
+fn atomic_replace_credential_file(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), NativeAuthError> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$source = $args[0]
+$destination = $args[1]
+if ([System.IO.File]::Exists($destination)) {
+    [System.IO.File]::Replace($source, $destination, $null, $false)
+} else {
+    [System.IO.File]::Move($source, $destination)
+}
+"#;
+    let status = std::process::Command::new("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .arg(source)
+        .arg(destination)
+        .status()
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    if !status.success() {
+        return Err(NativeAuthError::CredentialStore(
+            "failed to atomically replace the credential file".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), NativeAuthError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| NativeAuthError::CredentialStore("credential path has no parent".into()))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))
+}
+
+fn acquire_credential_file_lock(path: &Path) -> Result<CredentialOperationGuard, NativeAuthError> {
+    ensure_secure_credential_directory(path)?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let fd = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+        let file = fs::File::from(fd);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(NativeAuthError::CredentialStoreCorrupt);
+        }
+        file
+    };
+    #[cfg(windows)]
+    let file = {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+        secure_windows_path(path)?;
+        file
+    };
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(30);
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(CredentialOperationGuard(Some(file))),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(StdDuration::from_millis(25));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(NativeAuthError::CredentialStoreTimeout);
+            }
+            Err(error) => return Err(NativeAuthError::CredentialStore(error.to_string())),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn current_windows_sid() -> Result<String, NativeAuthError> {
+    let output = std::process::Command::new("whoami.exe")
+        .arg("/user")
+        .arg("/fo")
+        .arg("csv")
+        .arg("/nh")
+        .output()
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    if !output.status.success() {
+        return Err(NativeAuthError::CredentialStore(
+            "whoami could not resolve the current SID".into(),
+        ));
+    }
+    let line =
+        String::from_utf8(output.stdout).map_err(|_| NativeAuthError::CredentialStoreCorrupt)?;
+    let sid = line
+        .trim()
+        .trim_matches('"')
+        .rsplit_once("\",\"")
+        .map(|(_, sid)| sid.trim_matches('"').trim())
+        .filter(|sid| sid.starts_with("S-1-") && sid.len() <= 184)
+        .ok_or(NativeAuthError::CredentialStoreCorrupt)?;
+    Ok(sid.to_owned())
+}
+
+#[cfg(windows)]
+fn secure_windows_path(path: &Path) -> Result<(), NativeAuthError> {
+    let sid = current_windows_sid()?;
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$path = $args[0]
+$sid = [System.Security.Principal.SecurityIdentifier]::new($args[1])
+if ([System.IO.Directory]::Exists($path)) {
+    $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $sid,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+} else {
+    $acl = [System.Security.AccessControl.FileSecurity]::new()
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $sid,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+}
+$acl.SetOwner($sid)
+$acl.SetAccessRuleProtection($true, $false)
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $path -AclObject $acl
+"#;
+    let status = std::process::Command::new("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .arg(path)
+        .arg(&sid)
+        .status()
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    if !status.success() {
+        return Err(NativeAuthError::CredentialStore(
+            "failed to restrict the credential DACL".into(),
+        ));
+    }
+    verify_windows_path(path)
+}
+
+#[cfg(windows)]
+fn verify_windows_path(path: &Path) -> Result<(), NativeAuthError> {
+    let sid = current_windows_sid()?;
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$acl = Get-Acl -LiteralPath $args[0]
+$rules = @($acl.Access | ForEach-Object {
+    [pscustomobject]@{
+        sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        inherited = $_.IsInherited
+        type = $_.AccessControlType.ToString()
+        rights = [int64]$_.FileSystemRights
+    }
+})
+[pscustomobject]@{
+    owner = ([System.Security.Principal.NTAccount]$acl.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    protected = $acl.AreAccessRulesProtected
+    linkType = (Get-Item -LiteralPath $args[0] -Force).LinkType
+    rules = $rules
+} | ConvertTo-Json -Compress -Depth 4
+"#;
+    let output = std::process::Command::new("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .arg(path)
+        .output()
+        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
+    if !output.status.success() {
+        return Err(NativeAuthError::CredentialStoreCorrupt);
+    }
+    #[derive(Deserialize)]
+    struct WindowsAclRule {
+        sid: String,
+        inherited: bool,
+        #[serde(rename = "type")]
+        access_type: String,
+        rights: i64,
+    }
+    #[derive(Deserialize)]
+    struct WindowsAcl {
+        owner: String,
+        protected: bool,
+        #[serde(rename = "linkType")]
+        link_type: Option<String>,
+        rules: Vec<WindowsAclRule>,
+    }
+    let acl: WindowsAcl = serde_json::from_slice(&output.stdout)
+        .map_err(|_| NativeAuthError::CredentialStoreCorrupt)?;
+    let expected_sid = sid.to_ascii_uppercase();
+    let full_control = 0x1f01ff_i64;
+    if !acl.protected
+        || acl.owner.to_ascii_uppercase() != expected_sid
+        || acl
+            .link_type
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || acl.rules.len() != 1
+        || acl.rules.iter().any(|rule| {
+            rule.sid.to_ascii_uppercase() != expected_sid
+                || rule.inherited
+                || !rule.access_type.eq_ignore_ascii_case("Allow")
+                || rule.rights & full_control != full_control
+        })
+    {
+        return Err(NativeAuthError::CredentialStoreCorrupt);
+    }
+    Ok(())
 }
 
 fn normalized_issuer(value: &str, allow_insecure_http: bool) -> Result<Url, NativeAuthError> {
@@ -1125,6 +2039,143 @@ mod tests {
         }
     }
 
+    fn test_client(dpop_required: bool, revocation_endpoint: Option<Url>) -> NativeAuthClient {
+        let config = if dpop_required {
+            NativeAuthConfig::device_dpop(
+                "https://reporch.test/oauth",
+                "native-test",
+                vec!["offline_access".into(), "openid".into()],
+                false,
+            )
+        } else {
+            NativeAuthConfig::device(
+                "https://reporch.test/oauth",
+                "native-test",
+                vec!["offline_access".into(), "openid".into()],
+                false,
+            )
+        }
+        .unwrap();
+        NativeAuthClient {
+            config,
+            metadata: ProviderMetadata {
+                issuer: "https://reporch.test/oauth".into(),
+                authorization_endpoint: Url::parse("https://reporch.test/oauth/authorize/")
+                    .unwrap(),
+                token_endpoint: Url::parse("https://reporch.test/oauth/token/").unwrap(),
+                device_authorization_endpoint: None,
+                revocation_endpoint,
+                dpop_signing_alg_values_supported: if dpop_required {
+                    vec!["ES256".into()]
+                } else {
+                    Vec::new()
+                },
+            },
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn token_wire(token_type: &str, refresh_token: Option<&str>) -> TokenResponseWire {
+        TokenResponseWire {
+            access_token: "access-token".into(),
+            token_type: token_type.into(),
+            expires_in: 300,
+            refresh_token: refresh_token.map(str::to_owned),
+            id_token: None,
+            scope: Some("openid offline_access".into()),
+        }
+    }
+
+    #[test]
+    fn dpop_token_responses_fail_closed_on_bearer_downgrade() {
+        let dpop = test_client(true, None);
+        assert!(matches!(
+            dpop.token_from_wire(
+                token_wire("Bearer", Some("refresh-token")),
+                Some(DeviceKeyV1::generate().unwrap()),
+            ),
+            Err(NativeAuthError::InvalidProviderResponse)
+        ));
+        let accepted = dpop
+            .token_from_wire(
+                token_wire("DPoP", Some("refresh-token")),
+                Some(DeviceKeyV1::generate().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(accepted.token_type, "DPoP");
+
+        let bearer = test_client(false, None);
+        assert!(matches!(
+            bearer.token_from_wire(token_wire("DPoP", Some("refresh-token")), None),
+            Err(NativeAuthError::InvalidProviderResponse)
+        ));
+        assert_eq!(
+            bearer
+                .token_from_wire(token_wire("Bearer", Some("refresh-token")), None)
+                .unwrap()
+                .token_type,
+            "Bearer"
+        );
+    }
+
+    #[test]
+    fn refresh_rotation_requires_a_new_distinct_token() {
+        let client = test_client(true, None);
+        let key = Some(DeviceKeyV1::generate().unwrap());
+        let missing = client
+            .token_from_wire(token_wire("DPoP", None), key.clone())
+            .unwrap();
+        assert!(matches!(
+            validate_refresh_rotation(&missing, "previous-refresh"),
+            Err(NativeAuthError::RefreshRotationRequired)
+        ));
+        let repeated = client
+            .token_from_wire(token_wire("DPoP", Some("previous-refresh")), key.clone())
+            .unwrap();
+        assert!(matches!(
+            validate_refresh_rotation(&repeated, "previous-refresh"),
+            Err(NativeAuthError::RefreshRotationRequired)
+        ));
+        let rotated = client
+            .token_from_wire(token_wire("DPoP", Some("next-refresh")), key)
+            .unwrap();
+        validate_refresh_rotation(&rotated, "previous-refresh").unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_remote_revocation_preserves_the_local_device_credential() {
+        async fn unavailable() -> (StatusCode, Json<serde_json::Value>) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "temporarily_unavailable"})),
+            )
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let endpoint =
+            Url::parse(&format!("http://{}/revoke", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/revoke", post(unavailable)))
+                .await
+                .unwrap()
+        });
+        let mut client = test_client(true, Some(endpoint));
+        client.config.allow_insecure_http = true;
+        let store = MemoryStore::default();
+        let token = client
+            .token_from_wire(
+                token_wire("DPoP", Some("refresh-token")),
+                Some(DeviceKeyV1::generate().unwrap()),
+            )
+            .unwrap();
+        let key = client.config.credential_key();
+        store.save(&key, &token).await.unwrap();
+
+        assert!(client.logout(&store).await.is_err());
+        assert!(store.load(&key).await.unwrap().is_some());
+        server.abort();
+    }
+
     #[test]
     fn pkce_matches_the_rfc_7636_vector() {
         assert_eq!(
@@ -1160,6 +2211,7 @@ mod tests {
                 token_endpoint: Url::parse("https://reporch.test/oauth/token/").unwrap(),
                 device_authorization_endpoint: None,
                 revocation_endpoint: None,
+                dpop_signing_alg_values_supported: Vec::new(),
             },
             http: reqwest::Client::new(),
         };
@@ -1177,6 +2229,7 @@ mod tests {
                     token_type: "Bearer".into(),
                     expires_at: Utc::now() + Duration::minutes(10),
                     scopes: vec!["openid".into()],
+                    device_key: None,
                 },
             )
             .await
@@ -1211,6 +2264,7 @@ mod tests {
                     token_type: "Bearer".into(),
                     expires_at: Utc::now() + Duration::minutes(10),
                     scopes: vec!["openid".into()],
+                    device_key: None,
                 },
             )
             .await
@@ -1245,6 +2299,7 @@ mod tests {
                     token_type: "Bearer".into(),
                     expires_at: Utc::now() + Duration::minutes(10),
                     scopes: vec!["openid".into()],
+                    device_key: None,
                 },
             )
             .await
@@ -1280,6 +2335,7 @@ mod tests {
             token_type: "Bearer".into(),
             expires_at: Utc::now() + Duration::minutes(10),
             scopes: vec!["openid".into()],
+            device_key: None,
         };
         store
             .save(&config.credential_key(), &token("account-a-id-token"))
@@ -1318,6 +2374,8 @@ mod tests {
     struct MockProviderState {
         issuer: String,
         token_polls: Arc<AtomicUsize>,
+        fail_first_poll: bool,
+        dpop: bool,
     }
 
     async fn discovery(State(state): State<MockProviderState>) -> Json<serde_json::Value> {
@@ -1326,7 +2384,8 @@ mod tests {
             "authorization_endpoint": format!("{}/authorize", state.issuer),
             "token_endpoint": format!("{}/token", state.issuer),
             "device_authorization_endpoint": format!("{}/device-authorization", state.issuer),
-            "revocation_endpoint": format!("{}/revoke", state.issuer)
+            "revocation_endpoint": format!("{}/revoke", state.issuer),
+            "dpop_signing_alg_values_supported": ["ES256"]
         }))
     }
 
@@ -1363,7 +2422,14 @@ mod tests {
             form.get("device_code").map(String::as_str),
             Some("server-only-device-code")
         );
-        if state.token_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+        let poll = state.token_polls.fetch_add(1, Ordering::SeqCst);
+        if state.fail_first_poll && poll == 0 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "temporarily_unavailable"})),
+            );
+        }
+        if poll == usize::from(state.fail_first_poll) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "authorization_pending"})),
@@ -1374,7 +2440,7 @@ mod tests {
             Json(json!({
                 "access_token": "mock-access-token",
                 "refresh_token": "mock-refresh-token",
-                "token_type": "Bearer",
+                "token_type": if state.dpop { "DPoP" } else { "Bearer" },
                 "expires_in": 600,
                 "scope": "openid offline_access"
             })),
@@ -1389,6 +2455,8 @@ mod tests {
         let state = MockProviderState {
             issuer: issuer.clone(),
             token_polls: Arc::new(AtomicUsize::new(0)),
+            fail_first_poll: false,
+            dpop: false,
         };
         let app = Router::new()
             .route("/.well-known/openid-configuration", get(discovery))
@@ -1424,6 +2492,48 @@ mod tests {
         assert!(!serialized_status.contains("mock-access-token"));
         assert!(!serialized_status.contains("mock-refresh-token"));
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn device_flow_retries_a_transient_provider_failure_without_losing_the_device_key() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let issuer = format!("http://{address}");
+        let state = MockProviderState {
+            issuer: issuer.clone(),
+            token_polls: Arc::new(AtomicUsize::new(0)),
+            fail_first_poll: true,
+            dpop: true,
+        };
+        let app = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery))
+            .route("/device-authorization", post(device_authorization))
+            .route("/token", post(token))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = NativeAuthConfig::device_dpop(
+            &issuer,
+            "native-test",
+            vec!["openid".into(), "offline_access".into()],
+            true,
+        )
+        .unwrap();
+        let client = NativeAuthClient::discover(config).await.unwrap();
+        let prompt = client.request_device_authorization().await.unwrap();
+        let store = MemoryStore::default();
+        let status = client
+            .finish_device_authorization(&prompt, &store)
+            .await
+            .unwrap();
+
+        assert!(status.authenticated);
+        assert_eq!(state.token_polls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            client.access_token(&store).await.unwrap(),
+            "mock-access-token"
+        );
         server.abort();
     }
 
@@ -1558,5 +2668,62 @@ mod tests {
             Err(NativeAuthError::CredentialStoreTimeout)
         ));
         assert!(started.elapsed() < StdDuration::from_millis(150));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_credential_file_rejects_wide_permissions_hardlinks_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeFileTokenStore {
+            path: root.path().join("config/reporch/credentials-v2.json"),
+        };
+        let key = CredentialKey {
+            service: KEYRING_SERVICE.into(),
+            account: "native-security-test".into(),
+        };
+        let token = StoredTokenSet {
+            schema: TOKEN_SCHEMA_V2.into(),
+            issuer: "https://reporch.test/oauth".into(),
+            client_id: "reporch-studio-cli-v1".into(),
+            access_token: "native-security-access-token".into(),
+            refresh_token: Some("native-security-refresh-token".into()),
+            id_token: None,
+            token_type: "DPoP".into(),
+            expires_at: Utc::now() + Duration::minutes(5),
+            scopes: vec!["openid".into()],
+            device_key: Some(DeviceKeyV1::generate().unwrap()),
+        };
+        store.save(&key, &token).await.unwrap();
+        let metadata = fs::metadata(&store.path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(store.path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        fs::set_permissions(&store.path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            store.load(&key).await,
+            Err(NativeAuthError::CredentialStoreCorrupt)
+        ));
+        fs::set_permissions(&store.path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        fs::hard_link(&store.path, root.path().join("credential-copy")).unwrap();
+        assert!(matches!(
+            store.load(&key).await,
+            Err(NativeAuthError::CredentialStoreCorrupt)
+        ));
+        fs::remove_file(root.path().join("credential-copy")).unwrap();
+        fs::remove_file(&store.path).unwrap();
+        let target = root.path().join("attacker-controlled");
+        fs::write(&target, b"{}").unwrap();
+        symlink(&target, &store.path).unwrap();
+        assert!(store.load(&key).await.is_err());
     }
 }

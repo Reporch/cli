@@ -15,19 +15,30 @@ base64.workspace = true
 chrono.workspace = true
 keyring.workspace = true
 open.workspace = true
+p256.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+fs2.workspace = true
+rustix.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
+uuid.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 reqwest = { workspace = true, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 reqwest = { workspace = true, features = ["native-tls"] }
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Memory",
+] }
 
 [dev-dependencies]
 axum.workspace = true
+tempfile.workspace = true

@@ -229,6 +229,8 @@ fn v2_projects_can_edit_statements_tests_and_named_groups_without_internal_ids()
         &["test", "group", "add", "easy", "--points", "100"],
     );
     assert!(group.status.success(), "{group:?}");
+    fs::write(project.path().join("tests/2.in"), "2 3\n").unwrap();
+    fs::write(project.path().join("tests/2.ans"), "5\n").unwrap();
     let added = run_json(
         project.path(),
         &[
@@ -238,9 +240,9 @@ fn v2_projects_can_edit_statements_tests_and_named_groups_without_internal_ids()
             "--name",
             "second",
             "--input",
-            "tests/1.in",
+            "tests/2.in",
             "--answer",
-            "tests/1.ans",
+            "tests/2.ans",
             "--group",
             "easy",
         ],

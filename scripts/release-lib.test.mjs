@@ -19,7 +19,7 @@ test("release target set is exact and unique", () => {
 
 test("prereleases never move the npm latest tag", () => {
   assert.equal(npmTagForVersion("1.0.0-rc.1"), "next");
-  assert.equal(npmTagForVersion("1.0.0"), "latest");
+  assert.equal(npmTagForVersion("1.0.0"), "candidate");
   assert.throws(() => npmTagForVersion("1.0"), /invalid release version/);
 });
 

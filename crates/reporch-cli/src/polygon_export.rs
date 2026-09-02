@@ -273,6 +273,7 @@ fn problem_xml(manifest: &ReleaseManifestV1, short_name: &str) -> Result<Vec<u8>
         CheckerSpec::Custom {
             source_path,
             language,
+            ..
         } => xml.push_str(&format!(
             "    <checker type=\"custom\" path=\"{}\" language=\"{}\"/>\n",
             attr(source_path),

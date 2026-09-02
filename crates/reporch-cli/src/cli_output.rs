@@ -272,6 +272,19 @@ fn classify_error(error: &Error) -> ClassifiedError {
     if error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<studio_native_auth::NativeAuthError>(),
+            Some(studio_native_auth::NativeAuthError::ServerUpgradeRequired)
+        )
+    }) {
+        return ClassifiedError {
+            exit_code: ExitCode::InfrastructureFailure,
+            error_code: "auth.server_upgrade_required".into(),
+            retryable: false,
+            trace_id: None,
+        };
+    }
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<studio_native_auth::NativeAuthError>(),
             Some(studio_native_auth::NativeAuthError::CredentialStoreTimeout)
         )
     }) {
@@ -287,13 +300,12 @@ fn classify_error(error: &Error) -> ClassifiedError {
         .find_map(|cause| cause.downcast_ref::<reporch_runtime_core::RuntimeError>())
     {
         return ClassifiedError {
-            exit_code: if matches!(
-                runtime,
-                reporch_runtime_core::RuntimeError::RemoteQuotaExceeded
-            ) {
-                ExitCode::PermissionDenied
-            } else {
-                ExitCode::InfrastructureFailure
+            exit_code: match runtime {
+                reporch_runtime_core::RuntimeError::RemoteQuotaExceeded => {
+                    ExitCode::PermissionDenied
+                }
+                reporch_runtime_core::RuntimeError::ExecutionTimedOut => ExitCode::DomainFailure,
+                _ => ExitCode::InfrastructureFailure,
             },
             error_code: runtime.code().into(),
             retryable: runtime.retryable(),
@@ -439,7 +451,7 @@ mod tests {
     #[test]
     fn credential_store_timeout_is_retryable_infrastructure_not_missing_auth() {
         let error = anyhow::Error::new(studio_native_auth::NativeAuthError::CredentialStoreTimeout)
-            .context("read the OS credential store");
+            .context("read the protected native credential file");
         let classified = classify_error(&error);
         assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
         assert_eq!(classified.error_code, "infrastructure.unavailable");

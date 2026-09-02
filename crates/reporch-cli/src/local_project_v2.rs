@@ -31,6 +31,17 @@ pub struct MigrationOutcomeV2 {
     pub migrated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProjectPruneResultV1 {
+    pub schema: &'static str,
+    pub applied: bool,
+    pub inventory_removed: Vec<String>,
+    pub files_preserved: Vec<String>,
+    pub files_trashed: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trash_directory: Option<PathBuf>,
+}
+
 enum GeneratedManifest {
     V1(Box<ReleaseManifestV1>),
     V2(Box<ReleaseManifestV2>),
@@ -250,6 +261,194 @@ pub fn compile_authoring_spec(
         .collect::<Result<Vec<_>>>()?;
     spec.materialize(commit_id, files)
         .context("materialize immutable v2 release manifest")
+}
+
+/// Build the complete structured and Markdown-asset reference graph for V2.
+pub fn referenced_project_paths(root: &Path, spec: &AuthoringSpecV2) -> Result<BTreeSet<String>> {
+    let mut paths = BTreeSet::new();
+    paths.extend(spec.statements.values().cloned());
+    paths.extend(spec.tutorials.values().cloned());
+    for statement in spec.statements.values().chain(spec.tutorials.values()) {
+        let bytes =
+            read_bounded_regular_file(&root.join(statement), MAX_AUTHORING_SPEC_BYTES as u64)
+                .with_context(|| format!("read Markdown document {statement}"))?;
+        let markdown = std::str::from_utf8(&bytes)
+            .with_context(|| format!("Markdown document is not UTF-8: {statement}"))?;
+        let assets = studio_core::statement_image_paths(markdown).map_err(|issues| {
+            anyhow::anyhow!(
+                "cannot prune while Markdown references are invalid in {statement}: {}",
+                serde_json::to_string(&issues).unwrap_or_default()
+            )
+        })?;
+        paths.extend(assets);
+    }
+    for test in &spec.testing.tests {
+        paths.insert(test.input_file.clone());
+        paths.extend(test.answer_file.iter().cloned());
+    }
+    for generator in &spec.testing.generators {
+        paths.insert(generator.program.source_path.clone());
+    }
+    paths.extend(
+        spec.testing
+            .validators
+            .primary
+            .iter()
+            .chain(spec.testing.validators.extra.iter())
+            .map(|program| program.source_path.clone()),
+    );
+    paths.extend(
+        spec.testing
+            .validators
+            .unit_tests
+            .iter()
+            .map(|unit| unit.input_file.clone()),
+    );
+    if let studio_core::CheckerSpec::Custom { source_path, .. } = &spec.testing.checker.checker {
+        paths.insert(source_path.clone());
+    }
+    for unit in &spec.testing.checker.unit_tests {
+        paths.insert(unit.input_file.clone());
+        paths.insert(unit.answer_file.clone());
+        paths.insert(unit.output_file.clone());
+    }
+    paths.extend(
+        spec.testing
+            .solutions
+            .iter()
+            .map(|solution| solution.program.source_path.clone()),
+    );
+    if let Some(interactive) = &spec.execution.interactive {
+        paths.insert(interactive.interactor.source_path.clone());
+        paths.extend(
+            interactive
+                .unit_tests
+                .iter()
+                .map(|unit| unit.input_file.clone()),
+        );
+    }
+    if let Some(harness) = &spec.execution.harness {
+        paths.extend(harness.interface_files.iter().cloned());
+        paths.extend(harness.public_files.iter().cloned());
+        paths.extend(harness.private_files.iter().cloned());
+        paths.extend(harness.stub_templates.values().cloned());
+        for profile in harness.profiles.values() {
+            paths.insert(profile.source_path.clone());
+            paths.extend(profile.submission_source_path.iter().cloned());
+            paths.extend(profile.asset_paths.iter().cloned());
+            paths.extend(profile.compile_script.iter().cloned());
+            paths.extend(profile.run_script.iter().cloned());
+        }
+    }
+    for submission in &spec.output_submissions {
+        paths.extend(submission.outputs.values().cloned());
+    }
+    if let Some(publication) = &spec.publication {
+        for sample in &publication.samples {
+            paths.insert(sample.input_file.clone());
+            paths.insert(sample.output_file.clone());
+        }
+    }
+    paths
+        .into_iter()
+        .map(|path| studio_core::normalize_relative_path(&path).map_err(Into::into))
+        .collect()
+}
+
+/// Remove unreferenced inventory entries under the authoring lock.
+///
+/// Optional physical deletion is implemented as a recoverable atomic rename
+/// into `.reporch/prune-trash`, so an interrupted operation never destroys a
+/// file that a concurrent authoring command has just referenced.
+pub fn prune_project(
+    directory: &Path,
+    apply: bool,
+    delete_files: bool,
+) -> Result<ProjectPruneResultV1> {
+    ensure!(apply || !delete_files, "--delete-files requires --apply");
+    let root = crate::local_project::discover_project(directory)?;
+    let _lock = acquire_authoring_lock(&root)?;
+    let mut spec = read_authoring_spec(&root)?;
+    let references = referenced_project_paths(&root, &spec)?;
+    let candidates = spec
+        .files
+        .iter()
+        .filter(|file| !references.contains(&file.path))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    if !apply {
+        return Ok(ProjectPruneResultV1 {
+            schema: "reporch.project-prune-result.v1",
+            applied: false,
+            inventory_removed: candidates.clone(),
+            files_preserved: candidates,
+            files_trashed: Vec::new(),
+            trash_directory: None,
+        });
+    }
+
+    let operation_id = Uuid::now_v7();
+    let trash_root = root
+        .join(crate::local_project::LOCAL_STATE_DIRECTORY)
+        .join("prune-trash")
+        .join(operation_id.to_string());
+    let mut moved = Vec::<(PathBuf, PathBuf)>::new();
+    if delete_files {
+        let trash_parent = trash_root
+            .parent()
+            .context("prune trash directory has no parent")?;
+        ensure_private_lock_directory(trash_parent)?;
+        fs::create_dir(&trash_root)
+            .with_context(|| format!("create recoverable prune trash {}", trash_root.display()))?;
+        for path in &candidates {
+            // Hashing performs the canonical containment, regular-file and
+            // symlink-ancestor checks before any rename occurs.
+            let _ = hash_regular_project_file(&root, path)?;
+        }
+        for path in &candidates {
+            let source = root.join(path);
+            let destination = trash_root.join(path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("create recoverable prune trash {}", parent.display())
+                })?;
+            }
+            if let Err(error) = fs::rename(&source, &destination) {
+                for (original, trashed) in moved.iter().rev() {
+                    let _ = fs::rename(trashed, original);
+                }
+                return Err(error).with_context(|| format!("trash unreferenced file {path}"));
+            }
+            moved.push((source, destination));
+        }
+    }
+
+    spec.files.retain(|file| references.contains(&file.path));
+    if let Err(error) = spec
+        .validate_references()
+        .context("pruned authoring spec contains invalid references")
+        .and_then(|()| write_authoring_spec_atomic(&root, &spec).map(|_| ()))
+    {
+        for (original, trashed) in moved.iter().rev() {
+            if let Some(parent) = original.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::rename(trashed, original);
+        }
+        return Err(error);
+    }
+    Ok(ProjectPruneResultV1 {
+        schema: "reporch.project-prune-result.v1",
+        applied: true,
+        inventory_removed: candidates.clone(),
+        files_preserved: if delete_files {
+            Vec::new()
+        } else {
+            candidates.clone()
+        },
+        files_trashed: if delete_files { candidates } else { Vec::new() },
+        trash_directory: delete_files.then_some(trash_root),
+    })
 }
 
 pub fn project_status(directory: &Path) -> Result<ProjectStatusV1> {
@@ -632,5 +831,57 @@ mod tests {
             remote_id
         );
         assert_eq!(status.remote.unwrap().api_url, "https://studio.reporch.com");
+    }
+
+    #[test]
+    fn project_prune_is_dry_run_by_default_and_physical_removal_is_recoverable() {
+        let temporary = tempfile::tempdir().unwrap();
+        write_minimal_v1(temporary.path());
+        migrate_v1_authoring_file(temporary.path()).unwrap();
+        fs::write(temporary.path().join("unused.txt"), b"preserve me\n").unwrap();
+        update_authoring_spec(temporary.path(), |_root, spec| {
+            spec.files.push(AuthoringFileV2 {
+                path: "unused.txt".into(),
+                media_type: "text/plain".into(),
+                executable: false,
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let preview = prune_project(temporary.path(), false, false).unwrap();
+        assert!(!preview.applied);
+        assert_eq!(preview.inventory_removed, vec!["unused.txt"]);
+        assert!(temporary.path().join("unused.txt").exists());
+        assert!(
+            read_authoring_spec(temporary.path())
+                .unwrap()
+                .files
+                .iter()
+                .any(|file| file.path == "unused.txt")
+        );
+
+        let inventory_only = prune_project(temporary.path(), true, false).unwrap();
+        assert!(inventory_only.applied);
+        assert_eq!(inventory_only.files_preserved, vec!["unused.txt"]);
+        assert!(temporary.path().join("unused.txt").exists());
+
+        update_authoring_spec(temporary.path(), |_root, spec| {
+            spec.files.push(AuthoringFileV2 {
+                path: "unused.txt".into(),
+                media_type: "text/plain".into(),
+                executable: false,
+            });
+            Ok(())
+        })
+        .unwrap();
+        let removed = prune_project(temporary.path(), true, true).unwrap();
+        assert_eq!(removed.files_trashed, vec!["unused.txt"]);
+        assert!(!temporary.path().join("unused.txt").exists());
+        let trash = removed.trash_directory.unwrap();
+        assert_eq!(
+            fs::read(trash.join("unused.txt")).unwrap(),
+            b"preserve me\n"
+        );
     }
 }

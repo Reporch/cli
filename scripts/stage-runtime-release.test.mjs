@@ -44,7 +44,7 @@ function fixture(root) {
       writeFileSync(join(directory, file), bytes);
       writeFileSync(join(directory, `${file}.spdx.json`), "{}\n");
       writeFileSync(join(directory, `${file}.intoto.jsonl`), "{}\n");
-      const prefix = `https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq23/runtime-${target}-${file}`;
+      const prefix = `https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq24/runtime-${target}-${file}`;
       return {
         kind,
         file_name: file,

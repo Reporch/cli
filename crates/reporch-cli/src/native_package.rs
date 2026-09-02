@@ -13,10 +13,7 @@ use studio_contracts::{
 };
 #[cfg(test)]
 use studio_core::ReleaseManifestV1;
-use studio_core::{
-    IssueSeverity, Sha256Digest, VersionedReleaseManifest, normalize_relative_path,
-    validate_manifest,
-};
+use studio_core::{IssueSeverity, Sha256Digest, VersionedReleaseManifest, normalize_relative_path};
 use tempfile::Builder;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, System, ZipArchive, ZipWriter};
@@ -458,14 +455,10 @@ pub fn import_native_versioned(input: &Path, directory: &Path) -> Result<Version
 }
 
 fn ensure_valid_manifest(manifest: &VersionedReleaseManifest) -> Result<()> {
-    manifest.validate_references()?;
-    let blocking = match manifest {
-        VersionedReleaseManifest::V1(manifest) => validate_manifest(manifest)
-            .into_iter()
-            .filter(|issue| issue.severity == IssueSeverity::Error)
-            .collect::<Vec<_>>(),
-        VersionedReleaseManifest::V2(_) => Vec::new(),
-    };
+    let blocking = studio_core::validate_versioned_manifest(manifest)
+        .into_iter()
+        .filter(|issue| issue.severity == IssueSeverity::Error)
+        .collect::<Vec<_>>();
     if !blocking.is_empty() {
         bail!(
             "native manifest validation failed: {}",
@@ -784,7 +777,7 @@ mod tests {
     fn reserved_archive_paths_are_part_of_manifest_validation() {
         let (_temporary, mut manifest) = fixture();
         manifest.files[0].path = "Manifest.JSON".into();
-        let issues = validate_manifest(&manifest);
+        let issues = studio_core::validate_manifest(&manifest);
         assert!(
             issues
                 .iter()

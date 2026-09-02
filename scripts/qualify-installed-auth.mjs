@@ -1,9 +1,10 @@
-import { randomBytes } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -46,18 +47,80 @@ function randomOpaque(prefix) {
   return `${prefix}-${randomBytes(24).toString("base64url")}`;
 }
 
+function encode(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function normalizeHtu(value) {
+  const url = new URL(value);
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function jwkThumbprint(jwk) {
+  const canonical = JSON.stringify({ crv: "P-256", kty: "EC", x: jwk.x, y: jwk.y });
+  return encode(createHash("sha256").update(canonical).digest());
+}
+
 export async function startFixture() {
   const state = {
     deviceAuthorizations: 0,
     tokenGrants: 0,
     projectLists: 0,
+    deviceSessionLists: 0,
+    deviceSessionRevocations: 0,
     revocations: 0,
     browserVisits: 0,
   };
   const accessToken = randomOpaque("access");
+  const refreshedAccessToken = randomOpaque("access-rotated");
   const refreshToken = randomOpaque("refresh");
+  const rotatedRefreshToken = randomOpaque("refresh-rotated");
   const deviceCode = randomOpaque("device");
+  const replayIds = new Set();
+  let deviceJkt;
   let origin;
+
+  function validateDpop(request, accessTokenForProof) {
+    const parts = String(request.headers.dpop ?? "").split(".");
+    if (parts.length !== 3) throw new Error("missing DPoP proof");
+    const header = JSON.parse(Buffer.from(parts[0], "base64url"));
+    const claims = JSON.parse(Buffer.from(parts[1], "base64url"));
+    if (header.alg !== "ES256" || String(header.typ).toLowerCase() !== "dpop+jwt") {
+      throw new Error("invalid DPoP header");
+    }
+    if (header.jwk?.kty !== "EC" || header.jwk?.crv !== "P-256") {
+      throw new Error("invalid DPoP key");
+    }
+    const publicKey = createPublicKey({ key: header.jwk, format: "jwk" });
+    if (!verify(
+      "sha256",
+      Buffer.from(`${parts[0]}.${parts[1]}`),
+      { key: publicKey, dsaEncoding: "ieee-p1363" },
+      Buffer.from(parts[2], "base64url"),
+    )) throw new Error("invalid DPoP signature");
+    const target = normalizeHtu(new URL(request.url, origin).toString());
+    if (claims.htm !== request.method || normalizeHtu(claims.htu) !== target) {
+      throw new Error("invalid DPoP target");
+    }
+    if (!Number.isInteger(claims.iat) || Math.abs(Date.now() / 1000 - claims.iat) > 300) {
+      throw new Error("invalid DPoP time");
+    }
+    if (typeof claims.jti !== "string" || replayIds.has(claims.jti)) {
+      throw new Error("replayed DPoP proof");
+    }
+    replayIds.add(claims.jti);
+    const jkt = jwkThumbprint(header.jwk);
+    if (deviceJkt && deviceJkt !== jkt) throw new Error("wrong DPoP key");
+    if (accessTokenForProof) {
+      const expectedAth = encode(createHash("sha256").update(accessTokenForProof).digest());
+      if (claims.ath !== expectedAth) throw new Error("invalid DPoP token hash");
+    } else if ("ath" in claims) {
+      throw new Error("unexpected DPoP token hash");
+    }
+    return jkt;
+  }
 
   const server = createServer(async (request, response) => {
     try {
@@ -73,18 +136,20 @@ export async function startFixture() {
           token_endpoint: `${issuer}/token`,
           device_authorization_endpoint: `${issuer}/device-authorization`,
           revocation_endpoint: `${issuer}/revoke`,
+          dpop_signing_alg_values_supported: ["ES256"],
         });
         return;
       }
       if (request.method === "POST" && url.pathname === "/oauth/device-authorization") {
         const form = await readForm(request);
         if (
-          form.get("client_id") !== "reporch-studio-cli" ||
+          form.get("client_id") !== "reporch-studio-cli-v1" ||
           !form.get("scope")?.split(/\s+/).includes("studio:entitlements")
         ) {
           sendJson(response, 400, { error: "invalid_request" });
           return;
         }
+        deviceJkt = validateDpop(request);
         state.deviceAuthorizations += 1;
         sendJson(response, 200, {
           device_code: deviceCode,
@@ -97,30 +162,48 @@ export async function startFixture() {
       }
       if (request.method === "POST" && url.pathname === "/oauth/token") {
         const form = await readForm(request);
-        if (
-          form.get("grant_type") !== "urn:ietf:params:oauth:grant-type:device_code" ||
-          form.get("device_code") !== deviceCode ||
-          form.get("client_id") !== "reporch-studio-cli"
-        ) {
+        if (form.get("client_id") !== "reporch-studio-cli-v1") {
           sendJson(response, 400, { error: "invalid_grant" });
           return;
         }
+        validateDpop(request);
         state.tokenGrants += 1;
-        sendJson(response, 200, {
-          access_token: accessToken,
-          refresh_token: refreshToken,
-          token_type: "Bearer",
-          expires_in: 3600,
-          scope: "openid offline_access profile studio:entitlements",
-        });
+        if (
+          form.get("grant_type") === "urn:ietf:params:oauth:grant-type:device_code" &&
+          form.get("device_code") === deviceCode
+        ) {
+          sendJson(response, 200, {
+            access_token: accessToken,
+            refresh_token: refreshToken,
+            token_type: "DPoP",
+            expires_in: 1,
+            scope: "openid offline_access profile studio:entitlements",
+          });
+          return;
+        }
+        if (
+          form.get("grant_type") === "refresh_token" &&
+          form.get("refresh_token") === refreshToken
+        ) {
+          sendJson(response, 200, {
+            access_token: refreshedAccessToken,
+            refresh_token: rotatedRefreshToken,
+            token_type: "DPoP",
+            expires_in: 3600,
+            scope: "openid offline_access profile studio:entitlements",
+          });
+          return;
+        }
+        sendJson(response, 400, { error: "invalid_grant" });
         return;
       }
       if (request.method === "POST" && url.pathname === "/oauth/revoke") {
         const form = await readForm(request);
-        if (form.get("token") !== refreshToken) {
+        if (form.get("token") !== rotatedRefreshToken) {
           sendJson(response, 400, { error: "invalid_token" });
           return;
         }
+        validateDpop(request);
         state.revocations += 1;
         response.writeHead(200, { "cache-control": "no-store" });
         response.end();
@@ -136,16 +219,54 @@ export async function startFixture() {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/projects") {
-        if (request.headers.authorization !== `Bearer ${accessToken}`) {
+        if (request.headers.authorization !== `DPoP ${refreshedAccessToken}`) {
           sendJson(response, 401, {
             error_code: "auth.required",
-            message: "Bearer token required",
+            message: "DPoP token required",
             retryable: false,
           });
           return;
         }
+        validateDpop(request, refreshedAccessToken);
         state.projectLists += 1;
         sendJson(response, 200, { items: [], next_cursor: null });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/auth/device-sessions") {
+        if (request.headers.authorization !== `DPoP ${refreshedAccessToken}`) {
+          sendJson(response, 401, { error_code: "auth.required", message: "DPoP token required" });
+          return;
+        }
+        validateDpop(request, refreshedAccessToken);
+        state.deviceSessionLists += 1;
+        sendJson(response, 200, {
+          schema: "reporch.device-session-page.v1",
+          items: [{
+            id: "019f8fc9-cff3-7421-8cf8-0661a7a484dd",
+            client_id: "reporch-studio-cli-v1",
+            created_at: "2026-09-01T00:00:00Z",
+            last_used_at: "2026-09-02T00:00:00Z",
+            expires_at: "2026-12-01T00:00:00Z",
+            revoked_at: null,
+          }],
+        });
+        return;
+      }
+      if (
+        request.method === "DELETE" &&
+        url.pathname === "/api/v1/auth/device-sessions/019f8fc9-cff3-7421-8cf8-0661a7a484dd"
+      ) {
+        if (request.headers.authorization !== `DPoP ${refreshedAccessToken}`) {
+          sendJson(response, 401, { error_code: "auth.required", message: "DPoP token required" });
+          return;
+        }
+        validateDpop(request, refreshedAccessToken);
+        state.deviceSessionRevocations += 1;
+        sendJson(response, 200, {
+          schema: "reporch.device-session-revocation.v1",
+          id: "019f8fc9-cff3-7421-8cf8-0661a7a484dd",
+          revoked: true,
+        });
         return;
       }
       sendJson(response, 404, { error: "not_found" });
@@ -247,7 +368,7 @@ async function main() {
   }
   Object.assign(environment, {
     REPORCH_STUDIO_OIDC_ISSUER: fixture.issuer,
-    REPORCH_STUDIO_CLI_CLIENT_ID: "reporch-studio-cli",
+    REPORCH_STUDIO_CLI_CLIENT_ID: "reporch-studio-cli-v1",
     REPORCH_STUDIO_API_URL: fixture.apiUrl,
     REPORCH_STUDIO_ALLOW_INSECURE_HTTP: "true",
     REPORCH_CONFIG_HOME: configHome,
@@ -278,7 +399,22 @@ async function main() {
       "auth status",
     );
     if (!authenticatedStatus.authenticated || !authenticatedStatus.refresh_available) {
-      throw new Error("installed auth status did not restore the OS credential");
+      throw new Error("installed auth status did not restore the protected native credential");
+    }
+    const statusDurations = [];
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const started = performance.now();
+      const measuredStatus = assertEnvelope(
+        await runCommand(binary, ["--format", "json", "auth", "status"], environment),
+        "auth status",
+      );
+      statusDurations.push(performance.now() - started);
+      if (!measuredStatus.authenticated) throw new Error("measured auth status lost the session");
+    }
+    statusDurations.sort((left, right) => left - right);
+    const authStatusP95Ms = statusDurations[Math.ceil(statusDurations.length * 0.95) - 1];
+    if (authStatusP95Ms > 100) {
+      throw new Error(`auth status p95 exceeded 100ms: ${authStatusP95Ms.toFixed(2)}ms`);
     }
 
     const projects = assertEnvelope(
@@ -288,6 +424,22 @@ async function main() {
     if (!Array.isArray(projects.items) || projects.items.length !== 0) {
       throw new Error("authenticated project list returned an incompatible page");
     }
+
+    const devices = assertEnvelope(
+      await runCommand(binary, ["--format", "json", "auth", "devices", "list"], environment),
+      "auth devices list",
+    );
+    if (devices.items?.length !== 1 || devices.items[0].client_id !== "reporch-studio-cli-v1") {
+      throw new Error("authenticated device session list returned an incompatible page");
+    }
+    const revoked = assertEnvelope(
+      await runCommand(binary, [
+        "--format", "json", "auth", "devices", "revoke",
+        "019f8fc9-cff3-7421-8cf8-0661a7a484dd",
+      ], environment),
+      "auth devices revoke",
+    );
+    if (!revoked.revoked) throw new Error("device session revocation did not succeed");
 
     const logout = assertEnvelope(
       await runCommand(binary, ["--format", "json", "auth", "logout"], environment),
@@ -307,8 +459,10 @@ async function main() {
     loggedIn = false;
     if (
       fixture.state.deviceAuthorizations !== 1 ||
-      fixture.state.tokenGrants !== 1 ||
+      fixture.state.tokenGrants !== 2 ||
       fixture.state.projectLists !== 1 ||
+      fixture.state.deviceSessionLists !== 1 ||
+      fixture.state.deviceSessionRevocations !== 1 ||
       fixture.state.revocations !== 1
     ) {
       throw new Error("installed OAuth fixture observed an incomplete request sequence");
@@ -322,8 +476,11 @@ async function main() {
           target_os: process.platform,
           target_arch: process.arch,
           device_authorization: true,
-          os_credential_restore: true,
+          native_credential_restore: true,
+          refresh_rotation: true,
+          auth_status_p95_ms: authStatusP95Ms,
           authenticated_studio_request: true,
+          device_session_management: true,
           remote_revocation: true,
           local_credential_removal: true,
           browser_open_attempted: true,

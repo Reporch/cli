@@ -12,6 +12,8 @@ use std::fs;
 use std::io::{BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -50,7 +52,7 @@ const MAX_TOOLCHAIN_INDEX_BYTES: usize = 512 * 1024;
 const GUEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_CHANNEL_BASE: &str =
-    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq23";
+    "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq24";
 const TOOLCHAIN_CHANNEL_BASE: &str =
     "https://github.com/Reporch/cli/releases/download/reporch-toolchains-v2-seq8";
 const RUNTIME_PUBLIC_KEY: &str = include_str!("../../../artifacts/runtime-v1.minisign.pub");
@@ -1088,11 +1090,83 @@ pub async fn execute_native(project_root: &Path, job: &GuestJobV1) -> Result<Gue
     };
     let project_root = project_root.to_owned();
     let job = job.clone();
-    tokio::task::spawn_blocking(move || {
-        apple_backend::execute(&bundle, toolchain.as_ref(), &project_root, &job)
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation_guard = CancellationOnDrop(Some(cancellation.clone()));
+    let worker_cancellation = cancellation.clone();
+    let execution = tokio::task::spawn_blocking(move || {
+        // The blocking lifecycle owns the slot. Dropping the async waiter can
+        // request cancellation, but can never release admission while a VM is
+        // still booting or cleaning up.
+        let _slot = acquire_execution_slot(&worker_cancellation)?;
+        apple_backend::execute(
+            &bundle,
+            toolchain.as_ref(),
+            &project_root,
+            &job,
+            &worker_cancellation,
+        )
     })
     .await
-    .context("join Apple Virtualization execution")?
+    .context("join Apple Virtualization execution")?;
+    cancellation_guard.disarm();
+    execution
+}
+
+#[cfg(target_os = "macos")]
+struct CancellationOnDrop(Option<Arc<AtomicBool>>);
+
+#[cfg(target_os = "macos")]
+impl CancellationOnDrop {
+    fn disarm(mut self) {
+        self.0.take();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CancellationOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.0.as_ref() {
+            cancellation.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ExecutionSlot(fs::File);
+
+#[cfg(target_os = "macos")]
+impl Drop for ExecutionSlot {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_execution_slot(cancellation: &AtomicBool) -> Result<ExecutionSlot> {
+    let slot_root = runtime_root()?.join("execution-slots");
+    create_private_directory(&slot_root)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30 * 60);
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            anyhow::bail!("runtime execution cancelled while waiting for admission");
+        }
+        for index in 0..2 {
+            let path = slot_root.join(format!("slot-{index}.lock"));
+            let file = open_installation_lock(&path)?;
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(ExecutionSlot(file)),
+                Err(error) if installation_lock_is_contended(&error) => {}
+                Err(error) => return Err(error).context("lock runtime execution slot"),
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RuntimeError::ServiceUnavailable(
+                "runtime execution admission timed out".into(),
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3188,7 +3262,7 @@ mod tests {
             parse_channel_url(RUNTIME_CHANNEL_BASE, "runtime")
                 .unwrap()
                 .as_str(),
-            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq23/"
+            "https://github.com/Reporch/cli/releases/download/reporch-runtime-v1-seq24/"
         );
         assert_eq!(
             parse_channel_url(TOOLCHAIN_CHANNEL_BASE, "toolchain")
@@ -3534,6 +3608,7 @@ mod tests {
                 job_id: guest_job.id,
                 nonce: guest_job.nonce,
                 exit_code: 0,
+                termination: reporch_runtime_protocol::GuestTerminationV2::Exited,
                 duration_ms: 1,
                 stdout: GuestOutputV1::from_bytes(b"ok", false),
                 stderr: GuestOutputV1::from_bytes(b"", false),
@@ -3608,6 +3683,7 @@ mod tests {
                 job_id: guest_job.id,
                 nonce: guest_job.nonce,
                 exit_code: 0,
+                termination: reporch_runtime_protocol::GuestTerminationV2::Exited,
                 duration_ms: 1,
                 stdout: GuestOutputV1::from_bytes(b"ok", false),
                 stderr: GuestOutputV1::from_bytes(b"", false),

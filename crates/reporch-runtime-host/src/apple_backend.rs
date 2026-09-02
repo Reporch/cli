@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::os::fd::{BorrowedFd, IntoRawFd as _, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -63,6 +64,7 @@ pub(crate) fn execute(
     toolchain: Option<&VerifiedToolchainBundleV2>,
     project_root: &Path,
     job: &GuestJobV1,
+    cancellation: &AtomicBool,
 ) -> Result<GuestResultV1> {
     job.validate()?;
     ensure!(
@@ -94,9 +96,13 @@ pub(crate) fn execute(
         )
     };
 
-    start_vm(&queue, &vm)?;
+    ensure!(
+        !cancellation.load(Ordering::Acquire),
+        "runtime execution cancelled"
+    );
+    start_vm(&queue, &vm, cancellation)?;
     let execution = (|| -> Result<GuestResultV1> {
-        let owned_fd = connect_vsock(&queue, &vm)?;
+        let owned_fd = connect_vsock(&queue, &vm, cancellation)?;
         let stream = StdUnixStream::from(owned_fd);
         stream
             .set_nonblocking(true)
@@ -109,13 +115,17 @@ pub(crate) fn execute(
         runtime.block_on(async move {
             let mut stream = tokio::net::UnixStream::from_std(stream)
                 .context("adopt Apple virtio socket in Tokio")?;
-            exchange_with_guest(
-                &mut stream,
-                project_root,
-                job,
-                &bundle.installation.bundle_sha256,
-            )
-            .await
+            tokio::select! {
+                result = exchange_with_guest(
+                    &mut stream,
+                    project_root,
+                    job,
+                    &bundle.installation.bundle_sha256,
+                ) => result,
+                () = wait_for_cancellation(cancellation) => {
+                    anyhow::bail!("runtime execution cancelled")
+                }
+            }
         })
     })();
     let stopped = stop_vm(&queue, &vm);
@@ -265,7 +275,11 @@ fn file_url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
 
-fn start_vm(queue: &DispatchQueue, vm: &Retained<VZVirtualMachine>) -> Result<()> {
+fn start_vm(
+    queue: &DispatchQueue,
+    vm: &Retained<VZVirtualMachine>,
+    cancellation: &AtomicBool,
+) -> Result<()> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let vm = QueueBound(vm.clone());
     queue.exec_async(move || {
@@ -280,16 +294,42 @@ fn start_vm(queue: &DispatchQueue, vm: &Retained<VZVirtualMachine>) -> Result<()
         // remains retained by Virtualization.framework until completion.
         unsafe { vm.get().startWithCompletionHandler(&callback) };
     });
-    receiver
-        .recv_timeout(VM_START_TIMEOUT)
-        .map_err(|_| RuntimeError::GuestBootFailed("Apple VM start timed out".into()))?
-        .map_err(RuntimeError::GuestBootFailed)?;
-    Ok(())
+    let deadline = std::time::Instant::now() + VM_START_TIMEOUT;
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            anyhow::bail!("runtime execution cancelled while starting Apple VM");
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RuntimeError::GuestBootFailed("Apple VM start timed out".into()).into());
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(result) => {
+                return result
+                    .map_err(RuntimeError::GuestBootFailed)
+                    .map_err(Into::into);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(RuntimeError::GuestBootFailed(
+                    "Apple VM start callback disconnected".into(),
+                )
+                .into());
+            }
+        }
+    }
 }
 
-fn connect_vsock(queue: &DispatchQueue, vm: &Retained<VZVirtualMachine>) -> Result<OwnedFd> {
+fn connect_vsock(
+    queue: &DispatchQueue,
+    vm: &Retained<VZVirtualMachine>,
+    cancellation: &AtomicBool,
+) -> Result<OwnedFd> {
     let deadline = std::time::Instant::now() + VSOCK_CONNECT_TIMEOUT;
     loop {
+        if cancellation.load(Ordering::Acquire) {
+            anyhow::bail!("runtime execution cancelled while connecting to Apple VM");
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         let vm = QueueBound(vm.clone());
         queue.exec_async(move || {
@@ -337,7 +377,7 @@ fn connect_vsock(queue: &DispatchQueue, vm: &Retained<VZVirtualMachine>) -> Resu
         if remaining.is_zero() {
             return Err(RuntimeError::GuestUnresponsive.into());
         }
-        match receiver.recv_timeout(remaining.min(Duration::from_secs(2))) {
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(Ok(fd)) => return Ok(fd),
             Ok(Err(_)) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -348,6 +388,12 @@ fn connect_vsock(queue: &DispatchQueue, vm: &Retained<VZVirtualMachine>) -> Resu
             Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {}
             Err(_) => return Err(RuntimeError::GuestUnresponsive.into()),
         }
+    }
+}
+
+async fn wait_for_cancellation(cancellation: &AtomicBool) {
+    while !cancellation.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -490,7 +536,8 @@ mod tests {
         let mut durations = Vec::with_capacity(iterations as usize);
         for _ in 0..iterations {
             let started = std::time::Instant::now();
-            let result = execute(&bundle, None, project.path(), &job).unwrap();
+            let result =
+                execute(&bundle, None, project.path(), &job, &AtomicBool::new(false)).unwrap();
             durations.push(started.elapsed());
             assert_eq!(result.exit_code, 0);
             assert_eq!(result.stdout.data, "reporch-runtime-self-test-ok\n");
@@ -595,7 +642,14 @@ mod tests {
                 artifact_bytes: 4_096,
             },
         };
-        let result = execute(&bundle, Some(&toolchain), project.path(), &job).unwrap();
+        let result = execute(
+            &bundle,
+            Some(&toolchain),
+            project.path(),
+            &job,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(
             result.exit_code, 0,
             "stdout={} stderr={}",

@@ -722,7 +722,7 @@ fn scored_check_rejects_a_starter_plus_an_accidental_second_hundred_points() {
     }
 
     let checked = run(project.path(), &["check"]);
-    assert_eq!(checked.status.code(), Some(2), "{checked:?}");
+    assert_eq!(checked.status.code(), Some(1), "{checked:?}");
     let stderr = String::from_utf8(checked.stderr).unwrap();
     assert!(
         stderr.contains("scored problem group points must total 100"),
@@ -1311,8 +1311,17 @@ fn output_remove_prunes_only_unused_declarations_and_leaves_files_on_disk() {
     assert!(output_path.is_file());
 
     fs::remove_file(output_path).unwrap();
-    let checked = run(project.path(), &["check"]);
-    assert!(checked.status.success(), "{checked:?}");
+    let checked = run_json(project.path(), &["check"]);
+    assert_eq!(checked.status.code(), Some(1), "{checked:?}");
+    let check_error: Value = serde_json::from_slice(&checked.stderr).unwrap();
+    assert_eq!(check_error["error_code"], "check.failed");
+    assert!(
+        check_error["details"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "output_submissions.negative_missing")
+    );
     let yaml = fs::read_to_string(project.path().join("reporch.yaml")).unwrap();
     assert!(!yaml.contains("outputs/known-wrong.txt"), "{yaml}");
 
@@ -1421,7 +1430,7 @@ fn static_semantics_require_a_reference_and_bounded_scored_points() {
         assert!(removed.status.success(), "{name}: {removed:?}");
     }
     let missing_reference = run(standard.path(), &["check"]);
-    assert_eq!(missing_reference.status.code(), Some(2));
+    assert_eq!(missing_reference.status.code(), Some(1));
     assert!(
         String::from_utf8(missing_reference.stderr)
             .unwrap()
@@ -1436,7 +1445,7 @@ fn static_semantics_require_a_reference_and_bounded_scored_points() {
     let yaml = yaml.replacen("points: 50.0", "points: 110.0", 1);
     fs::write(yaml_path, yaml).unwrap();
     let invalid_points = run(scored.path(), &["check"]);
-    assert_eq!(invalid_points.status.code(), Some(2));
+    assert_eq!(invalid_points.status.code(), Some(1));
     assert!(
         String::from_utf8(invalid_points.stderr)
             .unwrap()

@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    CheckerSpec, ExecutionHarnessV1, ExpectedVerdict, NATIVE_PACKAGE_RESERVED_PATHS, ProblemType,
-    ReleaseManifestV1, validate_relative_path,
+    CheckerSpec, ExecutionHarnessV1, ExpectedScoreRange, ExpectedVerdict,
+    NATIVE_PACKAGE_RESERVED_PATHS, ProblemType, ReleaseManifestV1, ReleaseManifestV2,
+    SolutionRoleV2, VersionedReleaseManifest, validate_relative_path,
 };
 
 const MIN_TIME_LIMIT_MS: u64 = 10;
@@ -32,6 +33,618 @@ pub struct ValidationIssue {
     pub message: String,
     #[serde(default)]
     pub path: Option<String>,
+}
+
+/// Canonical semantic validator shared by every manifest consumer.
+///
+/// Callers must not special-case a manifest version. Keeping the dispatch here
+/// guarantees that `check`, package, push, import/export and Studio compilation
+/// apply the same release-blocking rules.
+pub fn validate_versioned_manifest(manifest: &VersionedReleaseManifest) -> Vec<ValidationIssue> {
+    let mut issues = match manifest {
+        VersionedReleaseManifest::V1(manifest) => validate_manifest(manifest),
+        VersionedReleaseManifest::V2(manifest) => validate_manifest_v2(manifest),
+    };
+    issues.sort_by(|left, right| {
+        (
+            left.code.as_str(),
+            left.path.as_deref().unwrap_or_default(),
+            left.message.as_str(),
+        )
+            .cmp(&(
+                right.code.as_str(),
+                right.path.as_deref().unwrap_or_default(),
+                right.message.as_str(),
+            ))
+    });
+    issues
+}
+
+pub fn validate_manifest_v2(manifest: &ReleaseManifestV2) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if let Err(error) = manifest.validate_references() {
+        issues.push(error_issue("manifest.references", error.to_string()));
+    }
+    if !manifest.title.contains_key(&manifest.default_locale) {
+        issues.push(error_issue(
+            "statement.default_title_missing",
+            format!("default locale {} has no title", manifest.default_locale),
+        ));
+    }
+    if !manifest.statements.contains_key(&manifest.default_locale) {
+        issues.push(error_issue(
+            "statement.default_statement_missing",
+            format!(
+                "default locale {} has no statement",
+                manifest.default_locale
+            ),
+        ));
+    }
+    let limits = &manifest.testing.limits;
+    if !(MIN_TIME_LIMIT_MS..=MAX_TIME_LIMIT_MS).contains(&limits.time_ms)
+        || !(MIN_MEMORY_LIMIT_MIB..=MAX_MEMORY_LIMIT_MIB).contains(&limits.memory_mib)
+        || !(MIN_OUTPUT_LIMIT_KIB..=MAX_OUTPUT_LIMIT_KIB).contains(&limits.output_kib)
+    {
+        issues.push(error_issue(
+            "judging.invalid_limits",
+            format!(
+                "limits must be within time {MIN_TIME_LIMIT_MS}..={MAX_TIME_LIMIT_MS} ms, memory {MIN_MEMORY_LIMIT_MIB}..={MAX_MEMORY_LIMIT_MIB} MiB, and output {MIN_OUTPUT_LIMIT_KIB}..={MAX_OUTPUT_LIMIT_KIB} KiB"
+            ),
+        ));
+    }
+    if manifest.testing.tests.is_empty() {
+        issues.push(error_issue(
+            "tests.empty",
+            "at least one test is required".into(),
+        ));
+    }
+
+    validate_native_package_paths_v2(manifest, &mut issues);
+    validate_tests_v2(manifest, &mut issues);
+    validate_groups_v2(manifest, &mut issues);
+    validate_program_matrix_v2(manifest, &mut issues);
+    validate_checker_matrix_v2(manifest, &mut issues);
+    validate_problem_type_v2(manifest, &mut issues);
+    validate_output_submissions_v2(manifest, &mut issues);
+    validate_publication_v2(manifest, &mut issues);
+    validate_provenance_v2(manifest, &mut issues);
+    issues
+}
+
+fn validate_native_package_paths_v2(
+    manifest: &ReleaseManifestV2,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let reserved = NATIVE_PACKAGE_RESERVED_PATHS
+        .iter()
+        .map(|path| path.to_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut portable_paths = BTreeSet::new();
+    for file in &manifest.files {
+        let portable_path = file.path.to_lowercase();
+        if reserved.contains(&portable_path) {
+            issues.push(ValidationIssue {
+                code: "files.native_package_reserved_path".into(),
+                severity: IssueSeverity::Error,
+                message: "manifest file collides with Reporch Native package metadata".into(),
+                path: Some(file.path.clone()),
+            });
+        }
+        if !portable_paths.insert(portable_path) {
+            issues.push(ValidationIssue {
+                code: "files.portable_path_collision".into(),
+                severity: IssueSeverity::Error,
+                message: "manifest paths collide on case-insensitive supported platforms".into(),
+                path: Some(file.path.clone()),
+            });
+        }
+    }
+}
+
+fn validate_tests_v2(manifest: &ReleaseManifestV2, issues: &mut Vec<ValidationIssue>) {
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let file_digests = manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.sha256.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut input_digests = BTreeMap::new();
+    for test in &manifest.testing.tests {
+        if test.name.trim().is_empty()
+            || test.name.len() > 120
+            || !ids.insert(test.id)
+            || !names.insert(test.name.as_str())
+        {
+            issues.push(error_issue(
+                "tests.duplicate_or_invalid_identity",
+                "test identifiers and non-empty names must be unique".into(),
+            ));
+        }
+        if manifest.testing.detect_duplicates
+            && let Some(digest) = file_digests.get(test.input_file.as_str())
+            && let Some(first) = input_digests.insert(*digest, test.name.as_str())
+        {
+            issues.push(error_issue(
+                "tests.duplicate_input",
+                format!(
+                    "tests {first} and {} contain byte-identical input",
+                    test.name
+                ),
+            ));
+        }
+        if matches!(
+            manifest.problem_type,
+            ProblemType::Standard
+                | ProblemType::Scored
+                | ProblemType::Library
+                | ProblemType::Grader
+        ) && test.answer_file.is_none()
+        {
+            issues.push(error_issue(
+                "tests.answer_missing",
+                format!("test {} requires an answer file", test.name),
+            ));
+        }
+        let generated_origin = matches!(test.origin, crate::TestCaseOriginV2::Generated);
+        if generated_origin != test.generated.is_some() {
+            issues.push(error_issue(
+                "tests.generator_binding_invalid",
+                format!(
+                    "generated test {} must bind exactly one deterministic generator recipe",
+                    test.name
+                ),
+            ));
+        }
+        if manifest.problem_type == ProblemType::Scored && test.group_ids.is_empty() {
+            issues.push(error_issue(
+                "tests.scored_group_missing",
+                format!("scored test {} must belong to a group", test.name),
+            ));
+        }
+        if let Some(points) = test.points
+            && (!points.is_finite() || !(0.0..=100.0).contains(&points))
+        {
+            issues.push(error_issue(
+                "tests.invalid_points",
+                format!(
+                    "test {} points must be a finite value from 0 to 100",
+                    test.name
+                ),
+            ));
+        }
+    }
+}
+
+fn validate_groups_v2(manifest: &ReleaseManifestV2, issues: &mut Vec<ValidationIssue>) {
+    let groups = manifest
+        .testing
+        .groups
+        .iter()
+        .map(|group| (group.id, group))
+        .collect::<BTreeMap<_, _>>();
+    if groups.len() != manifest.testing.groups.len() {
+        issues.push(error_issue(
+            "groups.duplicate_id",
+            "test group identifiers must be unique".into(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for group in groups.values() {
+        if group.name.trim().is_empty()
+            || group.name.len() > 120
+            || !names.insert(group.name.as_str())
+        {
+            issues.push(error_issue(
+                "groups.duplicate_or_invalid_name",
+                "test group names must be non-empty and unique".into(),
+            ));
+        }
+        if !group.points.is_finite() || !(0.0..=100.0).contains(&group.points) {
+            issues.push(error_issue(
+                "groups.invalid_points",
+                format!(
+                    "group {} points must be a finite value from 0 to 100",
+                    group.name
+                ),
+            ));
+        }
+        if group.depends_on.contains(&group.id)
+            || group
+                .depends_on
+                .iter()
+                .any(|dependency| !groups.contains_key(dependency))
+        {
+            issues.push(error_issue(
+                "groups.invalid_dependency",
+                format!("group {} has an invalid dependency", group.name),
+            ));
+        }
+    }
+    if groups.len() <= MAX_TEST_GROUPS
+        && groups
+            .values()
+            .map(|group| group.depends_on.len())
+            .sum::<usize>()
+            <= MAX_TEST_GROUP_EDGES
+    {
+        let mut remaining = groups
+            .iter()
+            .map(|(id, group)| {
+                (
+                    *id,
+                    group.depends_on.iter().copied().collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        loop {
+            let ready = remaining
+                .iter()
+                .filter(|(_, dependencies)| dependencies.is_empty())
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                break;
+            }
+            for id in ready {
+                remaining.remove(&id);
+                for dependencies in remaining.values_mut() {
+                    dependencies.remove(&id);
+                }
+            }
+        }
+        if !remaining.is_empty() {
+            issues.push(error_issue(
+                "groups.dependency_cycle",
+                "test group dependency graph contains a cycle".into(),
+            ));
+        }
+    } else {
+        issues.push(error_issue(
+            "groups.resource_limit",
+            format!(
+                "test groups are limited to {MAX_TEST_GROUPS} nodes and {MAX_TEST_GROUP_EDGES} dependency edges"
+            ),
+        ));
+    }
+    if manifest.problem_type == ProblemType::Scored {
+        let total = groups.values().map(|group| group.points).sum::<f64>();
+        if !total.is_finite() || (total - 100.0).abs() > 1e-9 {
+            issues.push(error_issue(
+                "groups.points_total",
+                format!("scored problem group points must total 100, got {total}"),
+            ));
+        }
+        let assigned = manifest
+            .testing
+            .tests
+            .iter()
+            .flat_map(|test| test.group_ids.iter())
+            .chain(
+                manifest
+                    .testing
+                    .generators
+                    .iter()
+                    .flat_map(|generator| generator.recipes.iter())
+                    .flat_map(|recipe| recipe.group_ids.iter()),
+            )
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for group in groups.values() {
+            if !assigned.contains(&group.id) {
+                issues.push(error_issue(
+                    "groups.without_tests",
+                    format!("scoring group {} has no tests", group.name),
+                ));
+            }
+        }
+    }
+}
+
+fn validate_program_matrix_v2(manifest: &ReleaseManifestV2, issues: &mut Vec<ValidationIssue>) {
+    let mut accepted_references = Vec::new();
+    let mut has_negative = false;
+    let mut solution_names = BTreeSet::new();
+    for solution in &manifest.testing.solutions {
+        if solution.program.name.trim().is_empty()
+            || !solution_names.insert(solution.program.name.as_str())
+        {
+            issues.push(error_issue(
+                "solutions.invalid_metadata",
+                "solution names must be non-empty and unique".into(),
+            ));
+        }
+        validate_expected_score(
+            solution.expected_verdict,
+            solution.expected_score.as_ref(),
+            "solutions",
+            issues,
+        );
+        for expectation in &solution.group_expectations {
+            validate_expected_score(
+                expectation.verdict,
+                expectation.score.as_ref(),
+                "solutions.group_expectations",
+                issues,
+            );
+        }
+        if solution.role == SolutionRoleV2::Reference {
+            if solution.expected_verdict != ExpectedVerdict::Accepted {
+                issues.push(error_issue(
+                    "solutions.reference_not_accepted",
+                    format!(
+                        "reference solution {} must expect accepted",
+                        solution.program.name
+                    ),
+                ));
+            }
+            accepted_references.push(solution);
+        }
+        if solution.role == SolutionRoleV2::KnownWrong
+            && solution.expected_verdict == ExpectedVerdict::Accepted
+        {
+            issues.push(error_issue(
+                "solutions.known_wrong_accepted",
+                format!(
+                    "known-wrong solution {} cannot expect accepted",
+                    solution.program.name
+                ),
+            ));
+        }
+        has_negative |= solution.expected_verdict != ExpectedVerdict::Accepted;
+    }
+    if manifest.problem_type != ProblemType::OutputOnly {
+        if accepted_references.len() != 1 {
+            issues.push(error_issue(
+                "solutions.reference_count",
+                "exactly one accepted reference solution is required".into(),
+            ));
+        }
+        if !has_negative {
+            issues.push(error_issue(
+                "solutions.negative_missing",
+                "at least one non-accepted solution is required for the verdict matrix".into(),
+            ));
+        }
+    }
+}
+
+fn validate_checker_matrix_v2(manifest: &ReleaseManifestV2, issues: &mut Vec<ValidationIssue>) {
+    match &manifest.testing.checker.checker {
+        CheckerSpec::Floating {
+            absolute_error,
+            relative_error,
+        } => {
+            let absolute = absolute_error.parse::<f64>().ok();
+            let relative = relative_error.parse::<f64>().ok();
+            if absolute.is_none_or(|value| !value.is_finite() || value < 0.0)
+                || relative.is_none_or(|value| !value.is_finite() || value < 0.0)
+                || absolute == Some(0.0) && relative == Some(0.0)
+            {
+                issues.push(error_issue(
+                    "checker.invalid_float_tolerance",
+                    "floating checker tolerances must be finite and non-negative, with at least one greater than zero"
+                        .into(),
+                ));
+            }
+        }
+        CheckerSpec::Custom { language, .. } if language.trim().is_empty() => {
+            issues.push(error_issue(
+                "checker.language_missing",
+                "custom checkers require an explicit toolchain language".into(),
+            ));
+        }
+        _ => {}
+    }
+    let units = &manifest.testing.checker.unit_tests;
+    if matches!(manifest.testing.checker.checker, CheckerSpec::Custom { .. })
+        && (!units.iter().any(|unit| unit.expected_accepted)
+            || !units.iter().any(|unit| !unit.expected_accepted))
+    {
+        issues.push(error_issue(
+            "checker.unit_matrix_incomplete",
+            "custom checker unit tests require both an accepted and rejected output".into(),
+        ));
+    }
+    let validators_present = manifest.testing.validators.primary.is_some()
+        || !manifest.testing.validators.extra.is_empty();
+    if validators_present
+        && (!manifest
+            .testing
+            .validators
+            .unit_tests
+            .iter()
+            .any(|unit| unit.expected_valid)
+            || !manifest
+                .testing
+                .validators
+                .unit_tests
+                .iter()
+                .any(|unit| !unit.expected_valid))
+    {
+        issues.push(error_issue(
+            "validator.unit_matrix_incomplete",
+            "validators require both valid and invalid unit inputs".into(),
+        ));
+    }
+}
+
+fn validate_problem_type_v2(manifest: &ReleaseManifestV2, issues: &mut Vec<ValidationIssue>) {
+    match manifest.problem_type {
+        ProblemType::Interactive if manifest.execution.interactive.is_none() => {
+            issues.push(error_issue(
+                "interactive.interactor_missing",
+                "interactive problems require an interactor".into(),
+            ))
+        }
+        ProblemType::Library | ProblemType::Grader if manifest.execution.harness.is_none() => {
+            issues.push(error_issue(
+                "harness.missing",
+                "library/grader problems require a language harness".into(),
+            ));
+        }
+        ProblemType::Standard | ProblemType::Scored | ProblemType::OutputOnly
+            if manifest.execution.interactive.is_some() || manifest.execution.harness.is_some() =>
+        {
+            issues.push(error_issue(
+                "execution.unexpected",
+                "this problem type cannot declare an interactor or grader/library harness".into(),
+            ));
+        }
+        _ => {}
+    }
+    if let Some(harness) = &manifest.execution.harness {
+        let expected = match manifest.problem_type {
+            ProblemType::Library => Some(crate::HarnessKindV2::Library),
+            ProblemType::Grader => Some(crate::HarnessKindV2::Grader),
+            _ => None,
+        };
+        if expected.is_some_and(|kind| kind != harness.kind) {
+            issues.push(error_issue(
+                "harness.kind_mismatch",
+                "harness kind does not match the problem type".into(),
+            ));
+        }
+    }
+}
+
+fn validate_output_submissions_v2(manifest: &ReleaseManifestV2, issues: &mut Vec<ValidationIssue>) {
+    if manifest.problem_type != ProblemType::OutputOnly {
+        if !manifest.output_submissions.is_empty() {
+            issues.push(error_issue(
+                "output_submissions.unexpected",
+                "output submissions are only valid for output-only problems".into(),
+            ));
+        }
+        return;
+    }
+    if !manifest.testing.solutions.is_empty() {
+        issues.push(error_issue(
+            "output_submissions.code_solutions_unexpected",
+            "output-only problems use output submissions instead of code solutions".into(),
+        ));
+    }
+    let expected_tests = manifest
+        .testing
+        .tests
+        .iter()
+        .map(|test| test.id)
+        .collect::<BTreeSet<_>>();
+    let mut names = BTreeSet::new();
+    for submission in &manifest.output_submissions {
+        if submission.name.trim().is_empty()
+            || submission.name.len() > 120
+            || !names.insert(submission.name.as_str())
+        {
+            issues.push(error_issue(
+                "output_submissions.invalid_name",
+                "output submission names must be non-empty and unique".into(),
+            ));
+        }
+        if submission.outputs.keys().copied().collect::<BTreeSet<_>>() != expected_tests {
+            issues.push(error_issue(
+                "output_submissions.incomplete_test_coverage",
+                format!(
+                    "output submission {} must provide exactly one output for every test",
+                    submission.name
+                ),
+            ));
+        }
+        validate_expected_score_v2(
+            submission.expected_verdict,
+            submission.expected_score.as_ref(),
+            "output_submissions",
+            issues,
+        );
+    }
+    if !manifest
+        .output_submissions
+        .iter()
+        .any(|submission| submission.expected_verdict == ExpectedVerdict::Accepted)
+    {
+        issues.push(error_issue(
+            "output_submissions.accepted_missing",
+            "at least one accepted reference output submission is required".into(),
+        ));
+    }
+    if !manifest
+        .output_submissions
+        .iter()
+        .any(|submission| submission.expected_verdict != ExpectedVerdict::Accepted)
+    {
+        issues.push(error_issue(
+            "output_submissions.negative_missing",
+            "at least one non-accepted output submission is required".into(),
+        ));
+    }
+}
+
+fn validate_expected_score_v2(
+    verdict: ExpectedVerdict,
+    score: Option<&ExpectedScoreRange>,
+    prefix: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    validate_expected_score(verdict, score, prefix, issues);
+}
+
+fn validate_publication_v2(manifest: &ReleaseManifestV2, issues: &mut Vec<ValidationIssue>) {
+    if let Some(publication) = &manifest.publication {
+        if !publication
+            .statement_sections
+            .contains_key(&manifest.default_locale)
+        {
+            issues.push(error_issue(
+                "publication.default_statement_sections_missing",
+                format!(
+                    "default locale {} has no publication statement sections",
+                    manifest.default_locale
+                ),
+            ));
+        }
+        for locale in publication.statement_sections.keys() {
+            if !manifest.title.contains_key(locale) || !manifest.statements.contains_key(locale) {
+                issues.push(error_issue(
+                    "publication.locale_statement_missing",
+                    format!("publication locale {locale} has no title or statement"),
+                ));
+            }
+        }
+    }
+}
+
+fn validate_provenance_v2(manifest: &ReleaseManifestV2, issues: &mut Vec<ValidationIssue>) {
+    if manifest.policy_version.trim().is_empty() || manifest.policy_version.len() > 128 {
+        issues.push(error_issue(
+            "manifest.invalid_policy_version",
+            "policy version must be non-empty and at most 128 bytes".into(),
+        ));
+    }
+    let mut source_ids = BTreeSet::new();
+    for source in &manifest.sources {
+        let valid_url = url::Url::parse(&source.canonical_url)
+            .ok()
+            .is_some_and(|url| {
+                url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.fragment().is_none()
+            });
+        if source.provider.trim().is_empty()
+            || source.external_id.trim().is_empty()
+            || !source_ids.insert((source.provider.as_str(), source.external_id.as_str()))
+            || !valid_url
+            || source.license_name.trim().is_empty()
+            || source.attribution.trim().is_empty()
+        {
+            issues.push(error_issue(
+                "sources.invalid_attribution",
+                "external sources require a unique provider/id, credential-free HTTPS URL, license, and attribution"
+                    .into(),
+            ));
+        }
+    }
 }
 
 pub fn validate_manifest(manifest: &ReleaseManifestV1) -> Vec<ValidationIssue> {
@@ -656,10 +1269,13 @@ fn validate_groups(manifest: &ReleaseManifestV1, issues: &mut Vec<ValidationIssu
         }
     }
     for group in groups.values() {
-        if !group.points.is_finite() || group.points < 0.0 {
+        if !group.points.is_finite() || !(0.0..=100.0).contains(&group.points) {
             issues.push(error_issue(
                 "groups.invalid_points",
-                format!("group {} has invalid points", group.id),
+                format!(
+                    "group {} points must be a finite value from 0 to 100",
+                    group.id
+                ),
             ));
         }
         for dependency in &group.depends_on {
@@ -851,16 +1467,19 @@ fn validate_problem_type(manifest: &ReleaseManifestV1, issues: &mut Vec<Validati
         absolute_error,
         relative_error,
     } = &manifest.judging.checker
-        && ![absolute_error, relative_error].iter().all(|value| {
-            value
-                .parse::<f64>()
-                .is_ok_and(|parsed| parsed.is_finite() && parsed >= 0.0)
-        })
     {
-        issues.push(error_issue(
-            "checker.invalid_float_tolerance",
-            "floating checker tolerances must be finite decimal numbers".into(),
-        ));
+        let absolute = absolute_error.parse::<f64>().ok();
+        let relative = relative_error.parse::<f64>().ok();
+        if absolute.is_none_or(|value| !value.is_finite() || value < 0.0)
+            || relative.is_none_or(|value| !value.is_finite() || value < 0.0)
+            || absolute == Some(0.0) && relative == Some(0.0)
+        {
+            issues.push(error_issue(
+                "checker.invalid_float_tolerance",
+                "floating checker tolerances must be finite and non-negative, with at least one greater than zero"
+                    .into(),
+            ));
+        }
     }
     if let CheckerSpec::Custom { language, .. } = &manifest.judging.checker {
         if language.trim().is_empty() {
@@ -1478,6 +2097,7 @@ mod tests {
         value.judging.checker = CheckerSpec::Custom {
             source_path: "checker.py".into(),
             language: "python3".into(),
+            protocol: crate::CheckerProtocolV1::Icpc202509,
         };
         assert!(
             validate_manifest(&value)

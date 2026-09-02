@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use studio_core::CheckerSpec;
+use studio_core::{CheckerProtocolV1, CheckerSpec};
 
 use crate::local_sandbox::{LocalSandboxOptions, LocalSandboxResult, OciRuntime};
 
@@ -47,6 +47,88 @@ pub struct ProgramRequest<'a> {
     pub arguments: &'a [String],
     pub stdin_path: Option<&'a str>,
     pub options: &'a AuthoringRunOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomCheckerVerdict {
+    Accepted,
+    WrongAnswer,
+    JudgeError,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomCheckerResult {
+    pub verdict: CustomCheckerVerdict,
+    pub execution: LocalSandboxResult,
+}
+
+/// Run a custom checker according to its versioned process contract.
+///
+/// ICPC 2025-09 invokes `checker input answer feedback_dir` and supplies the
+/// team output on stdin. Exit 42 means accepted, 43 means wrong answer, and
+/// every other status is a judge error. Historical Reporch manifests preserve
+/// their former `input output answer`/exit-0 contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_custom_checker(
+    project_directory: &Path,
+    source_path: &str,
+    language: &str,
+    protocol: CheckerProtocolV1,
+    input_path: &str,
+    answer_path: &str,
+    output_path: &str,
+    options: &AuthoringRunOptions,
+) -> Result<CustomCheckerResult> {
+    // Validate every project-backed argument before it reaches the guest. The
+    // returned VM paths are not required here because guest jobs start in the
+    // read-only /workspace directory.
+    let root = project_directory
+        .canonicalize()
+        .context("resolve checker project directory")?;
+    for path in [input_path, answer_path, output_path] {
+        let _ = checked_workspace_file(&root, path)?;
+    }
+    let (arguments, stdin_path) = match protocol {
+        CheckerProtocolV1::Icpc202509 => (
+            vec![
+                input_path.to_owned(),
+                answer_path.to_owned(),
+                "/run/reporch".to_owned(),
+            ],
+            Some(output_path),
+        ),
+        CheckerProtocolV1::ReporchLegacyV0 => (
+            vec![
+                input_path.to_owned(),
+                output_path.to_owned(),
+                answer_path.to_owned(),
+            ],
+            None,
+        ),
+    };
+    let execution = run_program(&ProgramRequest {
+        project_directory: &root,
+        source_path,
+        language,
+        arguments: &arguments,
+        stdin_path,
+        options,
+    })
+    .await?;
+    let verdict = custom_checker_verdict(protocol, execution.exit_code);
+    Ok(CustomCheckerResult { verdict, execution })
+}
+
+fn custom_checker_verdict(protocol: CheckerProtocolV1, exit_code: i32) -> CustomCheckerVerdict {
+    match protocol {
+        CheckerProtocolV1::Icpc202509 => match exit_code {
+            42 => CustomCheckerVerdict::Accepted,
+            43 => CustomCheckerVerdict::WrongAnswer,
+            _ => CustomCheckerVerdict::JudgeError,
+        },
+        CheckerProtocolV1::ReporchLegacyV0 if exit_code == 0 => CustomCheckerVerdict::Accepted,
+        CheckerProtocolV1::ReporchLegacyV0 => CustomCheckerVerdict::WrongAnswer,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -487,4 +569,40 @@ fn parse_tolerance(value: &str, name: &str) -> Result<f64> {
         "{name} checker tolerance must be finite and non-negative"
     );
     Ok(value)
+}
+
+#[cfg(test)]
+mod checker_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn icpc_checker_exit_codes_are_exact_and_fail_closed() {
+        assert_eq!(
+            custom_checker_verdict(CheckerProtocolV1::Icpc202509, 42),
+            CustomCheckerVerdict::Accepted
+        );
+        assert_eq!(
+            custom_checker_verdict(CheckerProtocolV1::Icpc202509, 43),
+            CustomCheckerVerdict::WrongAnswer
+        );
+        for exit_code in [0, 1, 41, 44, 128, 255] {
+            assert_eq!(
+                custom_checker_verdict(CheckerProtocolV1::Icpc202509, exit_code),
+                CustomCheckerVerdict::JudgeError,
+                "unexpected ICPC checker exit {exit_code} must be a judge error"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_checker_exit_codes_remain_backward_compatible() {
+        assert_eq!(
+            custom_checker_verdict(CheckerProtocolV1::ReporchLegacyV0, 0),
+            CustomCheckerVerdict::Accepted
+        );
+        assert_eq!(
+            custom_checker_verdict(CheckerProtocolV1::ReporchLegacyV0, 1),
+            CustomCheckerVerdict::WrongAnswer
+        );
+    }
 }

@@ -284,7 +284,22 @@ pub enum CheckerSpec {
     Custom {
         source_path: String,
         language: String,
+        /// Process contract used by the custom checker.
+        ///
+        /// Manifests written before 1.0 omitted this field and therefore keep
+        /// their historical Reporch invocation. Newly-created checkers use the
+        /// ICPC 2025-09 contract explicitly.
+        #[serde(default)]
+        protocol: CheckerProtocolV1,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckerProtocolV1 {
+    Icpc202509,
+    #[default]
+    ReporchLegacyV0,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]

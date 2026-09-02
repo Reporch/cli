@@ -299,6 +299,11 @@ pub struct CheckerOptions {
 #[derive(Debug, Subcommand)]
 enum CheckerCommand {
     ListStandard,
+    /// Inspect or change the process contract for a custom checker.
+    Protocol {
+        #[command(subcommand)]
+        command: CheckerProtocolCommand,
+    },
     Set {
         #[arg(long, value_enum)]
         kind: CheckerKind,
@@ -330,6 +335,32 @@ enum CheckerCommand {
         #[command(flatten)]
         runtime: RuntimeOptions,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckerProtocolCommand {
+    Show,
+    Set {
+        #[arg(value_enum)]
+        protocol: CheckerProtocolChoice,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CheckerProtocolChoice {
+    #[value(name = "icpc-2025-09")]
+    Icpc202509,
+    #[value(name = "reporch-legacy-v0")]
+    ReporchLegacyV0,
+}
+
+impl From<CheckerProtocolChoice> for studio_core::CheckerProtocolV1 {
+    fn from(value: CheckerProtocolChoice) -> Self {
+        match value {
+            CheckerProtocolChoice::Icpc202509 => Self::Icpc202509,
+            CheckerProtocolChoice::ReporchLegacyV0 => Self::ReporchLegacyV0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1615,6 +1646,41 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
             &["exact", "token", "case-insensitive", "floating", "custom"],
             "exact, token, case-insensitive, floating, custom",
         ),
+        CheckerCommand::Protocol { command } => match command {
+            CheckerProtocolCommand::Show => {
+                let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+                let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
+                let CheckerSpec::Custom { protocol, .. } = spec.judging.checker else {
+                    bail!("checker protocol is available only for a custom checker")
+                };
+                output.emit(
+                    "checker protocol show",
+                    &protocol,
+                    &format!("Custom checker protocol: {protocol:?}"),
+                )
+            }
+            CheckerProtocolCommand::Set { protocol } => {
+                let protocol = studio_core::CheckerProtocolV1::from(protocol);
+                let spec = reporch_cli::local_project::update_authoring_spec(
+                    Path::new("."),
+                    |_, spec| {
+                        let CheckerSpec::Custom {
+                            protocol: current, ..
+                        } = &mut spec.judging.checker
+                        else {
+                            bail!("checker protocol is available only for a custom checker")
+                        };
+                        *current = protocol;
+                        Ok(())
+                    },
+                )?;
+                output.emit(
+                    "checker protocol set",
+                    &spec.judging.checker,
+                    &format!("Custom checker protocol set to {protocol:?}"),
+                )
+            }
+        },
         CheckerCommand::Set {
             kind,
             source,
@@ -1634,6 +1700,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                 CheckerKind::Custom => CheckerSpec::Custom {
                     source_path: source.clone().context("--source is required")?,
                     language: language.clone().context("--language is required")?,
+                    protocol: studio_core::CheckerProtocolV1::Icpc202509,
                 },
             };
             let spec =
@@ -1706,29 +1773,26 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
+                        protocol,
                     } = &spec.judging.checker
                     {
-                        let arguments = vec![
-                            unit.input_file.clone(),
-                            unit.output_file.clone(),
-                            unit.answer_file.clone(),
-                        ];
-                        let result = reporch_cli::authoring_runtime::run_program(
-                            &reporch_cli::authoring_runtime::ProgramRequest {
-                                project_directory: &root,
-                                source_path,
-                                language,
-                                arguments: &arguments,
-                                stdin_path: None,
-                                options: &run_options,
-                            },
+                        let result = reporch_cli::authoring_runtime::run_custom_checker(
+                            &root,
+                            source_path,
+                            language,
+                            *protocol,
+                            &unit.input_file,
+                            &unit.answer_file,
+                            &unit.output_file,
+                            &run_options,
                         )
                         .await?;
                         (
-                            result.exit_code == 0,
-                            result.exit_code,
-                            result.duration_ms,
-                            result.stderr,
+                            result.verdict
+                                == reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted,
+                            result.execution.exit_code,
+                            result.execution.duration_ms,
+                            result.execution.stderr,
                         )
                     } else {
                         let answer = read_project_bytes(&root, &unit.answer_file)?;
@@ -2719,25 +2783,21 @@ async fn checker_accepts_path(
         CheckerSpec::Custom {
             source_path,
             language,
+            protocol,
         } => {
             let _ = read_project_bytes(root, input_path)?;
-            let arguments = vec![
-                input_path.to_owned(),
-                actual_path.to_owned(),
-                answer_path.to_owned(),
-            ];
-            let result = reporch_cli::authoring_runtime::run_program(
-                &reporch_cli::authoring_runtime::ProgramRequest {
-                    project_directory: root,
-                    source_path,
-                    language,
-                    arguments: &arguments,
-                    stdin_path: None,
-                    options,
-                },
+            let result = reporch_cli::authoring_runtime::run_custom_checker(
+                root,
+                source_path,
+                language,
+                *protocol,
+                input_path,
+                answer_path,
+                actual_path,
+                options,
             )
             .await?;
-            Ok(result.exit_code == 0)
+            Ok(result.verdict == reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted)
         }
         _ => reporch_cli::authoring_runtime::standard_checker_matches(checker, &answer, &actual),
     }

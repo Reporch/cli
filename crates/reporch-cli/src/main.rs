@@ -31,12 +31,13 @@ use reporch_cli::{NativeAuthOptions, device_auth_config};
 #[cfg(test)]
 use studio_core::ReleaseManifestV1;
 use studio_core::{
-    PackageProfile, ProblemType, VersionedReleaseManifest, compatibility_report, validate_manifest,
+    PackageProfile, ProblemType, ValidationIssue, VersionedReleaseManifest, compatibility_report,
+    validate_versioned_manifest,
 };
-use studio_native_auth::qualification_keyring_canary;
+use studio_native_auth::qualification_native_file_canary;
 
 const CLI_STACK_BYTES: usize = 8 * 1024 * 1024;
-use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
+use studio_native_auth::{NativeAuthClient, NativeFileTokenStore};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -370,12 +371,31 @@ impl SandboxOptions {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    /// Sign in using OAuth Device Authorization and store credentials in the OS keychain.
+    /// Sign in using sender-constrained OAuth Device Authorization.
     Login(NativeAuthOptions),
-    /// Inspect the local keychain session without making a network request.
+    /// Inspect the permission-restricted local session without network or keychain access.
     Status(NativeAuthOptions),
     /// Revoke the refresh token when possible and always remove the local credential.
     Logout(NativeAuthOptions),
+    /// Replace the legacy Keychain bearer session with a fresh DPoP login.
+    MigrateKeychain(NativeAuthOptions),
+    /// List or revoke sender-constrained device sessions for the current account.
+    Devices {
+        #[command(subcommand)]
+        command: AuthDevicesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthDevicesCommand {
+    /// List the current account's CLI device sessions.
+    List(studio_remote::RemoteConnectionOptions),
+    /// Revoke one device session by its public UUID.
+    Revoke {
+        #[command(flatten)]
+        connection: studio_remote::RemoteConnectionOptions,
+        device_id: Uuid,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -445,6 +465,15 @@ enum ProjectCommand {
     Status,
     /// Compare reporch.yaml and local files with the generated manifest.
     Diff,
+    /// Find or remove file-inventory entries that are no longer referenced.
+    Prune {
+        /// Apply inventory changes. Without this flag the command is a dry run.
+        #[arg(long)]
+        apply: bool,
+        /// Move corresponding regular files to recoverable `.reporch/prune-trash` storage.
+        #[arg(long, requires = "apply")]
+        delete_files: bool,
+    },
     /// Create a private Studio project through native OAuth.
     Create(studio_remote::CreateOptions),
     /// Pull an immutable Studio commit and every digest-bound file.
@@ -809,6 +838,33 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             AuthCommand::Login(options) => auth_login(&options, no_input, output).await,
             AuthCommand::Status(options) => auth_status(&options, output).await,
             AuthCommand::Logout(options) => auth_logout(&options, profile.as_deref(), output).await,
+            AuthCommand::MigrateKeychain(options) => {
+                auth_migrate_keychain(&options, no_input, output).await
+            }
+            AuthCommand::Devices { command } => match command {
+                AuthDevicesCommand::List(connection) => {
+                    let sessions =
+                        studio_remote::list_device_sessions_operation(&connection).await?;
+                    output.emit(
+                        "auth devices list",
+                        &sessions,
+                        &format!("{} device session(s)", sessions.items.len()),
+                    )
+                }
+                AuthDevicesCommand::Revoke {
+                    connection,
+                    device_id,
+                } => {
+                    let result =
+                        studio_remote::revoke_device_session_operation(&connection, device_id)
+                            .await?;
+                    output.emit(
+                        "auth devices revoke",
+                        &result,
+                        &format!("Revoked device session {}", result.id),
+                    )
+                }
+            },
         },
         Command::Project { command } => match command {
             ProjectCommand::Init(options) => execute_project_init(options, "project init", output),
@@ -878,6 +934,39 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ProjectCommand::Status => emit_project_status("project status", output),
             ProjectCommand::Diff => emit_project_diff("project diff", output),
+            ProjectCommand::Prune {
+                apply,
+                delete_files,
+            } => {
+                let result = reporch_cli::local_project_v2::prune_project(
+                    Path::new("."),
+                    apply,
+                    delete_files,
+                )?;
+                let human = if !apply {
+                    format!(
+                        "Dry run: {} unreferenced inventory entry(s). Run `reporch project prune --apply` to remove inventory entries.",
+                        result.inventory_removed.len()
+                    )
+                } else if delete_files {
+                    format!(
+                        "Removed {} inventory entry(s) and moved {} file(s) to recoverable trash at {}.",
+                        result.inventory_removed.len(),
+                        result.files_trashed.len(),
+                        result
+                            .trash_directory
+                            .as_deref()
+                            .map_or_else(|| "(none)".into(), |path| path.display().to_string())
+                    )
+                } else {
+                    format!(
+                        "Removed {} inventory entry(s); {} file(s) remain on disk.",
+                        result.inventory_removed.len(),
+                        result.files_preserved.len()
+                    )
+                };
+                output.emit("project prune", &result, &human)
+            }
             ProjectCommand::Create(options) => {
                 let project = studio_remote::create_operation(&options).await?;
                 output.emit(
@@ -1685,7 +1774,8 @@ fn check_project(output: &CliOutput) -> Result<()> {
         let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
         let manifest =
             reporch_cli::local_project_v2::compile_authoring_spec(&root, &spec, Uuid::nil())?;
-        validate_v2_static_semantics(&manifest)?;
+        let versioned = VersionedReleaseManifest::V2(Box::new(manifest.clone()));
+        let issues = validate_versioned_manifest(&versioned);
         let digest = manifest.digest()?;
         let validator_count = usize::from(manifest.testing.validators.primary.is_some())
             + manifest.testing.validators.extra.len();
@@ -1703,7 +1793,8 @@ fn check_project(output: &CliOutput) -> Result<()> {
             "problem_type": spec.problem_type,
             "file_count": manifest.files.len(),
             "digest": digest,
-            "valid": true,
+            "valid": issues.is_empty(),
+            "issues": issues,
             "validation_scope": "static",
             "execution_performed": false,
             "unexecuted": {
@@ -1716,6 +1807,13 @@ fn check_project(output: &CliOutput) -> Result<()> {
             },
             "next_step": "reporch verify",
         });
+        if !issues.is_empty() {
+            return Err(cli_output::domain_error(
+                "check.failed",
+                check_failure_message(&issues),
+                &data,
+            ));
+        }
         return output.emit(
             "check",
             &data,
@@ -1729,6 +1827,8 @@ fn check_project(output: &CliOutput) -> Result<()> {
     }
     let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
     let manifest = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let versioned = VersionedReleaseManifest::V1(Box::new(manifest.clone()));
+    let issues = validate_versioned_manifest(&versioned);
     let digest = manifest.digest()?;
     let validator_count = usize::from(manifest.judging.validator_path.is_some())
         + manifest.judging.extra_validator_paths.len()
@@ -1745,7 +1845,8 @@ fn check_project(output: &CliOutput) -> Result<()> {
         "problem_type": spec.problem_type,
         "file_count": manifest.files.len(),
         "digest": digest,
-        "valid": true,
+        "valid": issues.is_empty(),
+        "issues": issues,
         "validation_scope": "static",
         "execution_performed": false,
         "unexecuted": {
@@ -1758,6 +1859,13 @@ fn check_project(output: &CliOutput) -> Result<()> {
         },
         "next_step": "reporch verify",
     });
+    if !issues.is_empty() {
+        return Err(cli_output::domain_error(
+            "check.failed",
+            check_failure_message(&issues),
+            &data,
+        ));
+    }
     output.emit(
         "check",
         &data,
@@ -1770,81 +1878,18 @@ fn check_project(output: &CliOutput) -> Result<()> {
     )
 }
 
-fn validate_v2_static_semantics(manifest: &studio_core::ReleaseManifestV2) -> Result<()> {
-    if manifest.problem_type == ProblemType::Scored {
-        for group in &manifest.testing.groups {
-            ensure!(
-                group.points.is_finite() && (0.0..=100.0).contains(&group.points),
-                "scored group `{}` points must be a finite value from 0 to 100, got {}",
-                group.name,
-                group.points
-            );
-        }
-        let total = manifest
-            .testing
-            .groups
-            .iter()
-            .map(|group| group.points)
-            .sum::<f64>();
-        ensure!(
-            (total - 100.0).abs() <= 1e-9,
-            "scored problem group points must total 100, got {total}; inspect with `reporch test group list` and remove or update starter groups"
-        );
-
-        let assigned_groups = manifest
-            .testing
-            .tests
-            .iter()
-            .flat_map(|test| test.group_ids.iter().copied())
-            .chain(
-                manifest
-                    .testing
-                    .generators
-                    .iter()
-                    .flat_map(|generator| generator.recipes.iter())
-                    .flat_map(|recipe| recipe.group_ids.iter().copied()),
-            )
-            .collect::<std::collections::BTreeSet<_>>();
-        for group in &manifest.testing.groups {
-            ensure!(
-                assigned_groups.contains(&group.id),
-                "scored group `{}` has no manual tests or generator recipes; assign one before verification",
-                group.name
-            );
+fn check_failure_message(issues: &[ValidationIssue]) -> String {
+    let mut message = format!("static check failed with {} issue(s)", issues.len());
+    for issue in issues {
+        message.push_str(&format!("\n- [{}] {}", issue.code, issue.message));
+        if let Some(path) = issue.path.as_deref() {
+            message.push_str(&format!(" ({path})"));
         }
     }
-
-    let mut reference_count = 0_usize;
-    for solution in &manifest.testing.solutions {
-        if solution.role == studio_core::SolutionRoleV2::Reference {
-            reference_count += 1;
-        }
-        ensure!(
-            !matches!(
-                solution.role,
-                studio_core::SolutionRoleV2::Reference | studio_core::SolutionRoleV2::Oracle
-            ) || solution.expected_verdict == studio_core::ExpectedVerdict::Accepted,
-            "solution `{}` is a reference/oracle but its expected verdict is not accepted",
-            solution.program.name
-        );
-        ensure!(
-            solution.role != studio_core::SolutionRoleV2::KnownWrong
-                || solution.expected_verdict != studio_core::ExpectedVerdict::Accepted,
-            "solution `{}` is known-wrong but its expected verdict is accepted",
-            solution.program.name
-        );
-    }
-    ensure!(
-        reference_count <= 1,
-        "exactly one solution may have role reference; found {reference_count}"
+    message.push_str(
+        "\nInspect the current structure with `reporch test group list`, `reporch test case list`, and `reporch solution matrix`, then run `reporch check` again.",
     );
-    if manifest.problem_type != ProblemType::OutputOnly {
-        ensure!(
-            reference_count == 1,
-            "one accepted reference solution is required; set it with `reporch solution update <name> --role reference --expected accepted`"
-        );
-    }
-    Ok(())
+    message
 }
 
 fn local_project_status(directory: &Path) -> Result<reporch_cli::local_project::ProjectStatusV1> {
@@ -1949,6 +1994,11 @@ fn command_name(command: &Command) -> &'static str {
             AuthCommand::Login(_) => "auth login",
             AuthCommand::Status(_) => "auth status",
             AuthCommand::Logout(_) => "auth logout",
+            AuthCommand::MigrateKeychain(_) => "auth migrate-keychain",
+            AuthCommand::Devices { command } => match command {
+                AuthDevicesCommand::List(_) => "auth devices list",
+                AuthDevicesCommand::Revoke { .. } => "auth devices revoke",
+            },
         },
         Command::Project { command } => match command {
             ProjectCommand::Init(_) => "project init",
@@ -1958,6 +2008,7 @@ fn command_name(command: &Command) -> &'static str {
             ProjectCommand::Open { .. } => "project open",
             ProjectCommand::Status => "project status",
             ProjectCommand::Diff => "project diff",
+            ProjectCommand::Prune { .. } => "project prune",
             ProjectCommand::Create(_) => "project create",
             ProjectCommand::Pull(_) => "project pull",
             ProjectCommand::Push(_) => "project push",
@@ -2107,9 +2158,9 @@ async fn submit_project(options: SubmitOptions, output: &CliOutput) -> Result<()
 }
 
 async fn qualification_self_test() -> Result<()> {
-    qualification_keyring_canary()
+    qualification_native_file_canary()
         .await
-        .context("OS credential-store canary")?;
+        .context("native credential-file canary")?;
 
     let temporary = tempfile::tempdir().context("create qualification fixture directory")?;
     let (validated_problem_types, package_profiles, compatibility_report_count) =
@@ -2123,6 +2174,7 @@ async fn qualification_self_test() -> Result<()> {
             "target_os": std::env::consts::OS,
             "target_arch": std::env::consts::ARCH,
             "credential_store_round_trip": true,
+            "credential_store_kind": "native_file_dpop",
             "generated_manifest_valid": true,
             "generated_authoring_spec_valid": true,
             "problem_types": validated_problem_types,
@@ -2200,6 +2252,14 @@ fn qualification_authoring_matrix(
 }
 
 async fn auth_login(options: &NativeAuthOptions, no_input: bool, output: &CliOutput) -> Result<()> {
+    let status = authenticate_native(options, no_input).await?;
+    output.emit("auth login", &status, "Signed in to Reporch")
+}
+
+async fn authenticate_native(
+    options: &NativeAuthOptions,
+    no_input: bool,
+) -> Result<studio_native_auth::NativeSessionStatus> {
     ensure!(
         !no_input,
         "interactive input is disabled for this command; rerun `reporch auth login` without --no-input"
@@ -2228,18 +2288,50 @@ async fn auth_login(options: &NativeAuthOptions, no_input: bool, output: &CliOut
     }
 
     let status = client
-        .finish_device_authorization(&prompt, &KeyringTokenStore)
+        .finish_device_authorization(&prompt, &NativeFileTokenStore::discover()?)
         .await
         .context("finish device authorization")?;
-    output.emit("auth login", &status, "Signed in to Reporch")
+    Ok(status)
+}
+
+async fn auth_migrate_keychain(
+    options: &NativeAuthOptions,
+    no_input: bool,
+    output: &CliOutput,
+) -> Result<()> {
+    ensure!(
+        !no_input,
+        "auth migrate-keychain requires interactive OS credential access and a fresh browser login"
+    );
+    eprintln!(
+        "The operating system may ask permission to inspect and remove the legacy Reporch credential. A fresh DPoP login will follow."
+    );
+    let legacy_removed = studio_native_auth::remove_legacy_keyring_credential(
+        &options.issuer,
+        "reporch-studio-cli",
+        options.allow_insecure_http,
+    )
+    .await
+    .context("remove the legacy Keychain credential")?;
+    let status = authenticate_native(options, false).await?;
+    let result = serde_json::json!({
+        "schema": "reporch.auth-keychain-migration-result.v1",
+        "legacy_removed": legacy_removed,
+        "fresh_dpop_session": status,
+    });
+    output.emit(
+        "auth migrate-keychain",
+        &result,
+        "Legacy credential migration completed with a fresh DPoP session",
+    )
 }
 
 async fn auth_status(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
     let config = device_auth_config(options)?;
     let status = config
-        .local_session_status(&KeyringTokenStore)
+        .local_session_status(&NativeFileTokenStore::discover()?)
         .await
-        .context("read the OS credential store")?;
+        .context("read the protected native credential file")?;
     let human = if status.authenticated {
         "Signed in"
     } else {
@@ -2259,27 +2351,15 @@ async fn auth_logout(
         eprintln!("Could not clear stored remote fallback consent: {error}");
     }
     let config = device_auth_config(options)?;
-    let remote_result = match NativeAuthClient::discover(config.clone()).await {
-        Ok(client) => client.logout(&KeyringTokenStore).await,
-        Err(error) => {
-            eprintln!("Remote revocation is unavailable: {error}");
-            config.clear_local_session(&KeyringTokenStore).await?;
-            let result = serde_json::json!({
-                "schema": "reporch.auth-logout-result.v1",
-                "local_removed": true,
-                "remote_revoked": false,
-            });
-            return output.emit("auth logout", &result, "Local Studio credential removed");
-        }
-    };
-    let remote_revoked = match remote_result {
-        Ok(value) => value,
-        Err(error) => {
-            config.clear_local_session(&KeyringTokenStore).await?;
-            eprintln!("Remote revocation failed: {error}");
-            false
-        }
-    };
+    let store = NativeFileTokenStore::discover()?;
+    let client = NativeAuthClient::discover(config.clone())
+        .await
+        .context(
+            "discover the revocation endpoint; the local credential was preserved so logout can be retried",
+        )?;
+    let remote_revoked = client.logout(&store).await.context(
+        "revoke the remote device session; the local credential was preserved so logout can be retried",
+    )?;
     let result = serde_json::json!({
         "schema": "reporch.auth-logout-result.v1",
         "local_removed": true,
@@ -2580,11 +2660,7 @@ fn resolve_manifest_path(path: Option<PathBuf>) -> Result<PathBuf> {
 
 fn validate(path: &Path, print_digest: bool, output: &CliOutput) -> Result<()> {
     let manifest = read_versioned_manifest(path)?;
-    manifest.validate_references()?;
-    let issues = match &manifest {
-        VersionedReleaseManifest::V1(manifest) => validate_manifest(manifest),
-        VersionedReleaseManifest::V2(_) => Vec::new(),
-    };
+    let issues = validate_versioned_manifest(&manifest);
     if !issues.is_empty() {
         bail!(
             "manifest validation failed with {} issue(s): {}",

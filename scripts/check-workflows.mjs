@@ -112,18 +112,13 @@ assert.match(
 );
 assert.match(
   release,
-  /REPORCH_RELEASE_SIGNING_REQUIRED: \$\{\{ needs\.verify-source\.outputs\.prerelease == 'true' && '0' \|\| '1' \}\}/,
-  "stable releases must continue to require native OS signatures"
+  /else\s+codesign --force --options runtime --sign -[\s\S]*?--entitlements installers\/macos\/reporch\.entitlements/,
+  "unsigned npm Apple binaries must retain the virtualization entitlement through ad-hoc signing"
 );
-assert.match(
+assert.doesNotMatch(
   release,
-  /elif \[ "\$IS_PRERELEASE" = true \]; then\s+codesign --force --options runtime --sign -/,
-  "unsigned Apple prereleases must retain the virtualization entitlement through ad-hoc signing"
-);
-assert.match(
-  release,
-  /Windows code-signing certificate is required for a stable release/,
-  "stable Windows releases must fail closed without a code-signing certificate"
+  /Windows code-signing certificate is required/,
+  "the npm-only release must not claim an unavailable Windows publisher signature"
 );
 const ci = readFileSync(".github/workflows/ci.yml", "utf8");
 assert.match(ci, /actionlint_1\.7\.12_darwin_arm64\.tar\.gz/);
@@ -132,12 +127,16 @@ assert.match(ci, /shasum -a 256 --check/);
 const publisher = readFileSync("scripts/publish-npm-release.mjs", "utf8");
 assert.match(publisher, /"--tag",\s*npmTag/);
 assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prerelease/);
-assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --latest/);
+assert.doesNotMatch(
+  release,
+  /gh release edit "\$RELEASE_TAG" --draft=false --latest/,
+  "stable releases must remain drafts until the explicit promotion script succeeds"
+);
 assert.match(release, /qualify-published-artifacts:/);
 assert.match(
   release,
   /scripts\/qualify-installed-auth\.mjs/,
-  "every future release must exercise installed Device OAuth and the OS credential store"
+  "every future release must exercise installed Device OAuth and the protected native credential file"
 );
 assert.match(
   release,
@@ -149,8 +148,11 @@ assert.match(
   /name: installed-auth-\$\{\{ matrix\.target \}\}/,
   "installed authentication evidence must be retained per release target"
 );
-assert.match(release, /start-beta-window:/);
-assert.match(release, /node scripts\/verify-stability-window\.mjs/);
+assert.doesNotMatch(release, /start-beta-window:/);
+assert.doesNotMatch(release, /node scripts\/verify-stability-window\.mjs/);
+const stablePromotion = readFileSync("scripts/promote-stable-release.mjs", "utf8");
+assert.match(stablePromotion, /\["dist-tag", "add", `\$\{name\}@\$\{version\}`, "latest"\]/);
+assert.match(stablePromotion, /\["release", "edit", tag, "--draft=false", "--latest"\]/);
 const stability = readFileSync(".github/workflows/rc-stability.yml", "utf8");
 assert.match(stability, /schedule:/);
 assert.match(stability, /@reporch\/cli@\$VERSION/);
@@ -171,14 +173,14 @@ const windowsVmQualificationScript = readFileSync("scripts/qualify-windows-vm.ps
 const runtimeRelease = readFileSync(".github/workflows/release-runtime.yml", "utf8");
 const runtimeCandidates = readFileSync("scripts/build-runtime-candidates.sh", "utf8");
 const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml", "utf8");
-assert.match(runtimeRelease, /RUNTIME_SEQUENCE: "23"/);
-assert.match(runtimeRelease, /RUNTIME_VERSION: 1\.0\.0-rc\.8/);
+assert.match(runtimeRelease, /RUNTIME_SEQUENCE: "24"/);
+assert.match(runtimeRelease, /RUNTIME_VERSION: 1\.0\.0-rc\.10/);
 assert.match(runtimeRelease, /test "\$RUNTIME_TAG" = "reporch-runtime-v1-seq\$RUNTIME_SEQUENCE"/);
 assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates" "\$RUNTIME_SEQUENCE" "\$RUNTIME_VERSION"/);
 assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates-rebuild" "\$RUNTIME_SEQUENCE" "\$RUNTIME_VERSION"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
-assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq23/);
+assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq24/);
 assert.match(
   runtimeCandidates,
   /"\$target" "\$runtime_sequence" "\$runtime_version" "\$minimum_os"/,
@@ -220,7 +222,7 @@ for (const target of [
 assert.match(publishedE2e, /gh attestation verify/);
 assert.match(
   appleVmQualification,
-  /\.sequence == 23/,
+  /\.sequence == 24/,
   "Apple qualification must reject a stale signed runtime sequence"
 );
 assert.match(
@@ -240,12 +242,12 @@ assert.match(
 );
 assert.match(
   linuxVmQualificationScript,
-  /\.data\.installed_sequence == 23/,
+  /\.data\.installed_sequence == 24/,
   "Linux qualification must reject a stale signed runtime sequence"
 );
 assert.match(
   windowsVmQualificationScript,
-  /installed_sequence -eq 23/,
+  /installed_sequence -eq 24/,
   "Windows qualification must reject a stale signed runtime sequence"
 );
 assert.match(
@@ -276,18 +278,25 @@ assert.match(
   "Windows evidence checksum manifests must use portable LF line endings"
 );
 assert.match(publishedE2e, /scripts\/qualify-installed-auth\.mjs/);
-assert.match(publishedE2e, /dbus-run-session/);
-assert.match(publishedE2e, /credential_store_round_trip/);
+assert.doesNotMatch(publishedE2e, /dbus-run-session/);
+assert.match(publishedE2e, /native_credential_restore/);
+assert.match(publishedE2e, /refresh_rotation/);
+assert.match(publishedE2e, /auth_status_p95_ms/);
 assert.match(
   publishedE2e,
   /\.compatibility_report_count == 30/,
   "published artifacts must prove the complete type/profile compatibility matrix"
 );
 assert.match(publishedE2e, /authenticated_studio_request/);
-assert.match(publishedE2e, /retention-days: 90/);
+assert.match(publishedE2e, /device_session_management/);
+assert.match(publishedE2e, /retention-days: 1/);
 const installedAuth = readFileSync("scripts/qualify-installed-auth.mjs", "utf8");
 assert.match(installedAuth, /server\.listen\(0, "127\.0\.0\.1"/);
-assert.match(installedAuth, /request\.headers\.authorization !== `Bearer \$\{accessToken\}`/);
+assert.match(
+  installedAuth,
+  /request\.headers\.authorization !== `DPoP \$\{refreshedAccessToken\}`/,
+);
+assert.match(installedAuth, /validateDpop/);
 assert.match(installedAuth, /REPORCH_STUDIO_ALLOW_INSECURE_HTTP: "true"/);
 assert.match(installedAuth, /delete environment\[key\]/);
 assert.match(installedAuth, /key\.startsWith\("REPORCH_"\)/);

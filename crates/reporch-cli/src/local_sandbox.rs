@@ -241,6 +241,9 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
         }
         Err(error) => return Err(error),
     };
+    if result.termination == reporch_runtime_core::GuestTerminationV2::TimedOut {
+        return Err(RuntimeError::ExecutionTimedOut.into());
+    }
     if result.stdout.truncated || result.stderr.truncated {
         bail!(
             "local sandbox output exceeded {} bytes per stream",
