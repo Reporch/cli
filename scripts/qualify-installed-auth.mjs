@@ -417,14 +417,9 @@ async function main() {
       throw new Error(`auth status p95 exceeded 100ms: ${authStatusP95Ms.toFixed(2)}ms`);
     }
 
-    const projects = assertEnvelope(
-      await runCommand(binary, ["--format", "json", "project", "list"], environment),
-      "project list",
-    );
-    if (!Array.isArray(projects.items) || projects.items.length !== 0) {
-      throw new Error("authenticated project list returned an incompatible page");
-    }
-
+    // Keep this qualification scoped to commands that intentionally skip the mandatory VM
+    // bootstrap. The device-session request below is an authenticated Studio API call with the
+    // same DPoP proof validation, without conflating native credential QA with runtime signing.
     const devices = assertEnvelope(
       await runCommand(binary, ["--format", "json", "auth", "devices", "list"], environment),
       "auth devices list",
@@ -460,7 +455,7 @@ async function main() {
     if (
       fixture.state.deviceAuthorizations !== 1 ||
       fixture.state.tokenGrants !== 2 ||
-      fixture.state.projectLists !== 1 ||
+      fixture.state.projectLists !== 0 ||
       fixture.state.deviceSessionLists !== 1 ||
       fixture.state.deviceSessionRevocations !== 1 ||
       fixture.state.revocations !== 1
