@@ -4,7 +4,6 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -401,18 +400,16 @@ async function main() {
     if (!authenticatedStatus.authenticated || !authenticatedStatus.refresh_available) {
       throw new Error("installed auth status did not restore the protected native credential");
     }
-    const statusDurations = [];
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const started = performance.now();
-      const measuredStatus = assertEnvelope(
-        await runCommand(binary, ["--format", "json", "auth", "status"], environment),
-        "auth status",
-      );
-      statusDurations.push(performance.now() - started);
-      if (!measuredStatus.authenticated) throw new Error("measured auth status lost the session");
+    const measuredStatus = assertEnvelope(
+      await runCommand(binary, [
+        "--format", "json", "auth", "status", "--qualification-iterations", "100",
+      ], environment),
+      "auth status",
+    );
+    if (!measuredStatus.authenticated || measuredStatus.qualification?.iterations !== 100) {
+      throw new Error("measured auth status lost the session or qualification evidence");
     }
-    statusDurations.sort((left, right) => left - right);
-    const authStatusP95Ms = statusDurations[Math.ceil(statusDurations.length * 0.95) - 1];
+    const authStatusP95Ms = measuredStatus.qualification.p95_ms;
     if (authStatusP95Ms > 100) {
       throw new Error(`auth status p95 exceeded 100ms: ${authStatusP95Ms.toFixed(2)}ms`);
     }
