@@ -131,7 +131,11 @@ assert.match(
 );
 const publisher = readFileSync("scripts/publish-npm-release.mjs", "utf8");
 assert.match(publisher, /"--tag",\s*npmTag/);
-assert.match(release, /gh release edit "\$RELEASE_TAG" --draft=false --prerelease/);
+assert.match(
+  release,
+  /gh release edit "\$RELEASE_TAG" --repo "\$GH_REPO" --draft=false --prerelease/,
+  "the checkout-free finalizer must address the repository explicitly"
+);
 assert.doesNotMatch(
   release,
   /gh release edit "\$RELEASE_TAG" --draft=false --latest/,
