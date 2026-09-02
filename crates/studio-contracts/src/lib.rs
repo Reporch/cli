@@ -61,8 +61,37 @@ pub struct StudioCapabilitiesV1 {
     pub api_versions: Vec<String>,
     pub authoring_spec_versions: Vec<String>,
     pub release_manifest_versions: Vec<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
     pub minimum_cli_version: String,
     pub maximum_cli_major: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceSessionV1 {
+    pub id: Uuid,
+    pub client_id: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceSessionPageV1 {
+    pub schema: String,
+    pub items: Vec<DeviceSessionV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceSessionRevocationV1 {
+    pub schema: String,
+    pub id: Uuid,
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

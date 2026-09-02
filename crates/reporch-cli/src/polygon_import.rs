@@ -574,6 +574,7 @@ fn import_sidecar_free_package(
         |program| CheckerSpec::Custom {
             source_path: program.source_path.clone(),
             language: program.language.clone(),
+            protocol: studio_core::CheckerProtocolV1::ReporchLegacyV0,
         },
     );
     losses.extend(checker_losses);

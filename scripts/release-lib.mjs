@@ -54,7 +54,7 @@ export function npmTagForVersion(version) {
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/.test(version)) {
     throw new Error(`invalid release version: ${version}`);
   }
-  return version.includes("-") ? "next" : "latest";
+  return version.includes("-") ? "next" : "candidate";
 }
 
 export function sha256(path) {

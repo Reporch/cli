@@ -999,6 +999,41 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
             &["exact", "token", "case-insensitive", "floating", "custom"],
             "exact, token, case-insensitive, floating, custom",
         ),
+        CheckerCommand::Protocol { command } => match command {
+            CheckerProtocolCommand::Show => {
+                let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+                let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+                let CheckerSpec::Custom { protocol, .. } = spec.testing.checker.checker else {
+                    bail!("checker protocol is available only for a custom checker")
+                };
+                output.emit(
+                    "checker protocol show",
+                    &protocol,
+                    &format!("Custom checker protocol: {protocol:?}"),
+                )
+            }
+            CheckerProtocolCommand::Set { protocol } => {
+                let protocol = studio_core::CheckerProtocolV1::from(protocol);
+                let spec = reporch_cli::local_project_v2::update_authoring_spec(
+                    Path::new("."),
+                    |_, spec| {
+                        let CheckerSpec::Custom {
+                            protocol: current, ..
+                        } = &mut spec.testing.checker.checker
+                        else {
+                            bail!("checker protocol is available only for a custom checker")
+                        };
+                        *current = protocol;
+                        Ok(())
+                    },
+                )?;
+                output.emit(
+                    "checker protocol set",
+                    &spec.testing.checker.checker,
+                    &format!("Custom checker protocol set to {protocol:?}"),
+                )
+            }
+        },
         CheckerCommand::Set {
             kind,
             source,
@@ -1018,6 +1053,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                 CheckerKind::Custom => CheckerSpec::Custom {
                     source_path: source.clone().context("--source is required")?,
                     language: language.clone().context("--language is required")?,
+                    protocol: studio_core::CheckerProtocolV1::Icpc202509,
                 },
             };
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
@@ -1105,29 +1141,26 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
+                        protocol,
                     } = &spec.testing.checker.checker
                     {
-                        let arguments = vec![
-                            unit.input_file.clone(),
-                            unit.output_file.clone(),
-                            unit.answer_file.clone(),
-                        ];
-                        let result = reporch_cli::authoring_runtime::run_program(
-                            &reporch_cli::authoring_runtime::ProgramRequest {
-                                project_directory: &root,
-                                source_path,
-                                language,
-                                arguments: &arguments,
-                                stdin_path: None,
-                                options: &run_options,
-                            },
+                        let result = reporch_cli::authoring_runtime::run_custom_checker(
+                            &root,
+                            source_path,
+                            language,
+                            *protocol,
+                            &unit.input_file,
+                            &unit.answer_file,
+                            &unit.output_file,
+                            &run_options,
                         )
                         .await?;
                         (
-                            result.exit_code == 0,
-                            result.exit_code,
-                            result.duration_ms,
-                            result.stderr,
+                            result.verdict
+                                == reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted,
+                            result.execution.exit_code,
+                            result.execution.duration_ms,
+                            result.execution.stderr,
                         )
                     } else {
                         let answer = read_project_bytes(&root, &unit.answer_file)?;
@@ -1531,6 +1564,7 @@ struct StressCandidateResult {
     expected_counterexample: bool,
     counterexample_seed: Option<u64>,
     input_path: Option<String>,
+    counterexample_sha256: Option<String>,
     passed: bool,
 }
 
@@ -1698,6 +1732,7 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
         .tempdir_in(&scratch_parent)?;
     let mut first_mismatch =
         std::collections::BTreeMap::<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>::new();
+    let mut last_progress = std::time::Instant::now();
     for ordinal in 0..suite.cases {
         let seed = suite
             .seed_start
@@ -1771,6 +1806,20 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
                 );
             }
         }
+        let completed = ordinal + 1;
+        if completed == suite.cases
+            || completed % 10 == 0
+            || last_progress.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            output.progress(
+                "stress run",
+                &format!(
+                    "Stress suite {}: {completed}/{} seed(s) checked",
+                    suite.name, suite.cases
+                ),
+            );
+            last_progress = std::time::Instant::now();
+        }
     }
     let mut results = Vec::new();
     for candidate in candidates {
@@ -1778,7 +1827,7 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
         let expected_counterexample =
             candidate.expected_verdict != studio_core::ExpectedVerdict::Accepted;
         let passed = mismatch.is_some() == expected_counterexample;
-        let (counterexample_seed, input_path) =
+        let (counterexample_seed, input_path, counterexample_sha256) =
             if let Some((seed, input, oracle, actual)) = mismatch {
                 let base = format!("stress-failures/{}-{seed}", suite.name);
                 write_project_bytes_once_or_same(&root, &format!("{base}.in"), &input)?;
@@ -1788,15 +1837,20 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
                     &format!("{base}.{}.out", candidate.program.name),
                     &actual,
                 )?;
-                (Some(seed), Some(format!("{base}.in")))
+                (
+                    Some(seed),
+                    Some(format!("{base}.in")),
+                    Some(hex::encode(Sha256::digest(&input))),
+                )
             } else {
-                (None, None)
+                (None, None, None)
             };
         results.push(StressCandidateResult {
             candidate: candidate.program.name.clone(),
             expected_counterexample,
             counterexample_seed,
             input_path,
+            counterexample_sha256,
             passed,
         });
     }
@@ -1848,6 +1902,7 @@ async fn stress_outputs_match(
     let CheckerSpec::Custom {
         source_path,
         language,
+        protocol,
     } = checker
     else {
         return reporch_cli::authoring_runtime::standard_checker_matches(
@@ -1867,23 +1922,20 @@ async fn stress_outputs_match(
             .context("stress checker scratch path is not valid Unicode")?
             .to_owned())
     };
-    let arguments = vec![
-        input_path.to_owned(),
-        relative(&candidate_path)?,
-        relative(&oracle_path)?,
-    ];
-    let result = reporch_cli::authoring_runtime::run_program(
-        &reporch_cli::authoring_runtime::ProgramRequest {
-            project_directory: root,
-            source_path,
-            language,
-            arguments: &arguments,
-            stdin_path: None,
-            options,
-        },
+    let candidate_path = relative(&candidate_path)?;
+    let oracle_path = relative(&oracle_path)?;
+    let result = reporch_cli::authoring_runtime::run_custom_checker(
+        root,
+        source_path,
+        language,
+        *protocol,
+        input_path,
+        &oracle_path,
+        &candidate_path,
+        options,
     )
     .await?;
-    Ok(result.exit_code == 0)
+    Ok(result.verdict == reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted)
 }
 
 #[allow(clippy::too_many_arguments)]

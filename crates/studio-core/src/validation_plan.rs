@@ -211,6 +211,7 @@ mod tests {
         manifest.judging.checker = CheckerSpec::Custom {
             source_path: "checker.cpp".into(),
             language: "cpp".into(),
+            protocol: crate::CheckerProtocolV1::Icpc202509,
         };
 
         let plan = validation_plan(&manifest);

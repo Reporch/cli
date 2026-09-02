@@ -9,7 +9,7 @@ permissions:
   attestations: write
 
 concurrency:
-  group: release-runtime-v1-seq23
+  group: release-runtime-v1-seq24
   cancel-in-progress: false
 
 jobs:
@@ -20,9 +20,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RUNTIME_SEQUENCE: "23"
-      RUNTIME_VERSION: 1.0.0-rc.8
-      RUNTIME_TAG: reporch-runtime-v1-seq23
+      RUNTIME_SEQUENCE: "24"
+      RUNTIME_VERSION: 1.0.0-rc.10
+      RUNTIME_TAG: reporch-runtime-v1-seq24
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

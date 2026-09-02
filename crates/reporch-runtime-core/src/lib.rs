@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 pub use reporch_runtime_protocol::{
     ContentObjectV1, GuestHandshakeV1, GuestJobV1, GuestOperationV1, GuestOutputEncodingV1,
-    GuestOutputV1, GuestResultV1, JOB_SCHEMA, PROTOCOL_VERSION, ResourceLimitsV1,
+    GuestOutputV1, GuestResultV1, GuestResultV2, GuestTerminationV2, JOB_SCHEMA, PROTOCOL_VERSION,
+    ResourceLimitsV1,
 };
 
 pub const BUNDLE_MANIFEST_SCHEMA: &str = "reporch.runtime-bundle-manifest.v1";
@@ -498,6 +499,8 @@ pub enum RuntimeError {
     GuestBootFailed(String),
     #[error("runtime guest stopped responding")]
     GuestUnresponsive,
+    #[error("runtime workload exceeded its configured timeout")]
+    ExecutionTimedOut,
     #[error("runtime protocol is incompatible")]
     ProtocolIncompatible,
     #[error("runtime cleanup failed: {0}")]
@@ -517,6 +520,7 @@ impl RuntimeError {
             Self::ServiceUnavailable(_) => "runtime.service_unavailable",
             Self::GuestBootFailed(_) => "runtime.guest_boot_failed",
             Self::GuestUnresponsive => "runtime.guest_unresponsive",
+            Self::ExecutionTimedOut => "runtime.execution_timed_out",
             Self::ProtocolIncompatible => "runtime.protocol_incompatible",
             Self::CleanupFailed(_) => "runtime.cleanup_failed",
             Self::RemoteFallbackNotAllowed => "runtime.remote_fallback_not_allowed",
@@ -667,8 +671,8 @@ mod tests {
             target,
             backend: target.native_backend(),
             minimum_os_version: "1".into(),
-            protocol_min: 1,
-            protocol_max: 1,
+            protocol_min: PROTOCOL_VERSION,
+            protocol_max: PROTOCOL_VERSION,
             generated_at: now - Duration::minutes(1),
             expires_at: now + Duration::days(30),
             signing_key_id: RUNTIME_SIGNING_KEY_ID.into(),

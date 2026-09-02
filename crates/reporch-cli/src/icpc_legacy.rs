@@ -634,6 +634,7 @@ fn import_external_legacy(
         .map_or(CheckerSpec::Token, |program| CheckerSpec::Custom {
             source_path: program.source_path.clone(),
             language: program.language.clone(),
+            protocol: studio_core::CheckerProtocolV1::Icpc202509,
         });
     let validator_tests = import_legacy_validator_tests(&paths, &tests, validator.is_some());
     let checker_tests = import_legacy_checker_tests(&paths, checker_program.is_some())?;

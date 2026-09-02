@@ -9,11 +9,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use unicode_normalization::UnicodeNormalization as _;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const HANDSHAKE_SCHEMA: &str = "reporch.guest-handshake.v1";
 pub const HOST_CHALLENGE_SCHEMA: &str = "reporch.host-challenge.v1";
 pub const JOB_SCHEMA: &str = "reporch.guest-job.v1";
-pub const RESULT_SCHEMA: &str = "reporch.guest-result.v1";
+pub const RESULT_SCHEMA: &str = "reporch.guest-result.v2";
 pub const SERVICE_REQUEST_SCHEMA: &str = "reporch.runtime-service-request.v1";
 pub const SERVICE_RESPONSE_SCHEMA: &str = "reporch.runtime-service-response.v1";
 pub const MAX_WIRE_FRAME_BYTES: usize = 12 * 1024 * 1024;
@@ -630,11 +630,26 @@ pub struct GuestResultV1 {
     pub job_id: Uuid,
     pub nonce: String,
     pub exit_code: i32,
+    pub termination: GuestTerminationV2,
     pub duration_ms: u64,
     pub stdout: GuestOutputV1,
     pub stderr: GuestOutputV1,
     pub artifacts: Vec<ContentObjectV1>,
 }
+
+/// Stable workload termination classification. A workload timeout is a normal
+/// judge result, never a transport/protocol failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestTerminationV2 {
+    Exited,
+    TimedOut,
+    Signalled,
+    OutputLimit,
+    InternalError,
+}
+
+pub type GuestResultV2 = GuestResultV1;
 
 impl GuestResultV1 {
     pub fn validate_for(&self, job: &GuestJobV1) -> Result<(), ProtocolError> {
@@ -928,6 +943,7 @@ mod tests {
             job_id: job.id,
             nonce: job.nonce.clone(),
             exit_code: 0,
+            termination: GuestTerminationV2::Exited,
             duration_ms: 1,
             stdout: GuestOutputV1::from_bytes(b"ok", false),
             stderr: GuestOutputV1::from_bytes(b"", false),

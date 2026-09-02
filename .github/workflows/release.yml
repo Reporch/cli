@@ -50,21 +50,6 @@ jobs:
           else
             test "$GITHUB_REF" = refs/heads/main
           fi
-          if [ "$version" = 1.0.0 ]; then
-            gh issue list --state all --limit 100 --json number,title,createdAt,closedAt \
-              > "$RUNNER_TEMP/beta-issues.json"
-            latest_number=$(jq -er '
-              [ .[]
-                | select(.title | test("^Reporch CLI 1\\.0\\.0-rc\\.[0-9A-Za-z.-]+ — 30-day stability window$"))
-              ]
-              | sort_by(.createdAt)
-              | last
-              | .number
-            ' "$RUNNER_TEMP/beta-issues.json")
-            gh issue view "$latest_number" --json comments > "$RUNNER_TEMP/beta-comments.json"
-            node scripts/verify-stability-window.mjs \
-              "$RUNNER_TEMP/beta-issues.json" "$RUNNER_TEMP/beta-comments.json"
-          fi
           {
             echo "version=$version"
             echo "tag=$tag"
@@ -109,22 +94,6 @@ jobs:
         with:
           node-version: "24.2.0"
           package-manager-cache: false
-      - name: Install Linux system packaging tools
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends rpm zstd
-      - name: Install pinned Windows packaging tools
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $toolPath = Join-Path $env:RUNNER_TEMP "wix-tools"
-          dotnet tool install wix --version 6.0.2 --tool-path $toolPath
-          $toolPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & (Join-Path $toolPath "wix.exe") --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test --locked --workspace --all-targets
       - run: cargo build --locked --release -p reporch-cli --target ${{ matrix.target }}
@@ -160,13 +129,10 @@ jobs:
                 codesign --force --options runtime --timestamp \
                   --entitlements installers/macos/reporch.entitlements \
                   --sign "$MAC_APPLICATION_IDENTITY" "${{ matrix.binary }}"
-              elif [ "$IS_PRERELEASE" = true ]; then
+              else
                 codesign --force --options runtime --sign - \
                   --entitlements installers/macos/reporch.entitlements \
                   "${{ matrix.binary }}"
-              else
-                echo "Developer ID application identity is required for a stable release" >&2
-                exit 1
               fi
               codesign --verify --strict --verbose=2 "${{ matrix.binary }}"
               ;;
@@ -175,9 +141,6 @@ jobs:
                 signtool sign /sha1 "$WINDOWS_CERT_SHA1" /fd SHA256 \
                   /tr http://timestamp.acs.microsoft.com /td SHA256 "${{ matrix.binary }}"
                 signtool verify /pa /all "${{ matrix.binary }}"
-              elif [ "$IS_PRERELEASE" != true ]; then
-                echo "Windows code-signing certificate is required for a stable release" >&2
-                exit 1
               fi
               ;;
           esac
@@ -197,30 +160,13 @@ jobs:
           node scripts/test-current-npm-package.mjs "${{ matrix.target }}" "${{ matrix.binary }}"
           mkdir -p "release-output/${{ matrix.target }}"
           cp "${{ matrix.binary }}" "release-output/${{ matrix.target }}/"
-          node scripts/pack-system-installer.mjs \
-            "$TARGET" "${{ matrix.binary }}" "release-output/runtime/$RUNTIME_TARGET" \
-            "release-output/system-installers/$TARGET"
-          case "$TARGET" in
-            *-apple-darwin)
-              package=$(find "release-output/system-installers/$TARGET" -maxdepth 1 -type f -name '*.pkg' -print)
-              test -n "$package"
-              if [ -n "$REPORCH_MAC_NOTARY_PROFILE" ]; then
-                xcrun notarytool submit "$package" --keychain-profile "$REPORCH_MAC_NOTARY_PROFILE" --wait
-                xcrun stapler staple "$package"
-                xcrun stapler validate "$package"
-              elif [ "$IS_PRERELEASE" != true ]; then
-                echo "Apple notarization profile is required for a stable release" >&2
-                exit 1
-              fi
-              ;;
-          esac
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-${{ matrix.target }}
           path: release-output
           include-hidden-files: true
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
 
   publish:
     if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
@@ -292,10 +238,6 @@ jobs:
           set -euo pipefail
           mkdir dist/release-assets
           cp dist/tarballs/*.tgz dist/native/*.tar.gz dist/native/*.zip \
-            release-input/system-installers/*/*.pkg \
-            release-input/system-installers/*/*.deb \
-            release-input/system-installers/*/*.rpm \
-            release-input/system-installers/*/*.msi \
             dist/reporch-cli.spdx.json dist/release-manifest.json \
             dist/npm-pack-manifest.json dist/native/native-release-manifest.json \
             dist/release-assets/
@@ -314,10 +256,10 @@ jobs:
             gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA"
           else
             release_flags=()
-            release_notes=$'Official Apache-2.0 Reporch CLI release.\n\nInstall with `npm install --global @reporch/cli`, or download the standalone archive for your target and verify it with `SHA256SUMS`. Every release asset has GitHub artifact provenance; manifests and an SPDX SBOM are included.'
+            release_notes=$'Official Apache-2.0 Reporch CLI release.\n\nInstall with `npm install --global @reporch/cli`, or download the standalone tar/zip for your target and verify it with `SHA256SUMS`. Every release asset has GitHub artifact provenance; manifests and an SPDX SBOM are included.\n\nThis release does not claim Apple Developer ID, notarization, or Windows Authenticode publisher signing. npm provenance and Reporch runtime signatures are the supported trust path.'
             if [ "$IS_PRERELEASE" = true ]; then
               release_flags+=(--prerelease)
-              release_notes+=$'\n\nRC notice: native OS distribution certificates are not configured yet. macOS binaries are ad-hoc signed to preserve the virtualization entitlement; Windows binaries and OS installers are not publisher-signed. Verify SHA-256 and GitHub artifact provenance before installing. Stable 1.0 remains blocked until Developer ID/notarization and Authenticode credentials are configured.'
+              release_notes+=$'\n\nRC notice: macOS binaries are ad-hoc signed to preserve the virtualization entitlement; Windows binaries are not publisher-signed.'
             fi
             gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" "${release_flags[@]}" \
               --title "Reporch CLI $VERSION" \
@@ -326,15 +268,6 @@ jobs:
           gh release upload "$RELEASE_TAG" dist/release-assets/* dist/SHA256SUMS --clobber
       - name: Publish exact npm tarballs with OIDC and provenance
         run: node scripts/publish-npm-release.mjs dist
-      - name: Publish GitHub release after npm verification
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$IS_PRERELEASE" = true ]; then
-            gh release edit "$RELEASE_TAG" --draft=false --prerelease
-          else
-            gh release edit "$RELEASE_TAG" --draft=false --latest
-          fi
 
   qualify-published-artifacts:
     if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR
@@ -438,20 +371,12 @@ jobs:
             ' "$evidence" >/dev/null
           }
           if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update
-            sudo apt-get install -y dbus-x11 gnome-keyring
-            export native npm_binary VERSION
-            # The single-quoted child script intentionally receives exported variables.
-            # shellcheck disable=SC2016
-            dbus-run-session -- bash -euo pipefail -c '
-              eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
-              "$native" qualification-self-test > "$RUNNER_TEMP/native-self-test.json"
-              "$npm_binary" qualification-self-test > "$RUNNER_TEMP/npm-self-test.json"
-              "$native" --format json auth status > "$RUNNER_TEMP/auth-status.json"
-              node "$GITHUB_WORKSPACE/scripts/qualify-installed-auth.mjs" \
-                --binary "$native" \
-                --evidence "$RUNNER_TEMP/installed-auth-e2e.json"
-            '
+            "$native" qualification-self-test > "$RUNNER_TEMP/native-self-test.json"
+            "$npm_binary" qualification-self-test > "$RUNNER_TEMP/npm-self-test.json"
+            "$native" --format json auth status > "$RUNNER_TEMP/auth-status.json"
+            node "$GITHUB_WORKSPACE/scripts/qualify-installed-auth.mjs" \
+              --binary "$native" \
+              --evidence "$RUNNER_TEMP/installed-auth-e2e.json"
             for evidence in "$RUNNER_TEMP/native-self-test.json" "$RUNNER_TEMP/npm-self-test.json"; do
               jq -e --arg version "$VERSION" '
                 .schema == "reporch.cli-installed-self-test.v1"
@@ -479,8 +404,11 @@ jobs:
           jq -e '
             .schema == "reporch.cli-installed-auth-e2e.v1"
             and .device_authorization == true
-            and .os_credential_restore == true
+            and .native_credential_restore == true
+            and .refresh_rotation == true
+            and .auth_status_p95_ms <= 100
             and .authenticated_studio_request == true
+            and .device_session_management == true
             and .remote_revocation == true
             and .local_credential_removal == true
             and .passed == true
@@ -552,7 +480,7 @@ jobs:
             --evidence (Join-Path $env:RUNNER_TEMP 'installed-auth-e2e.json')
           if ($LASTEXITCODE -ne 0) { throw 'installed OAuth qualification failed' }
           $authEvidence = Get-Content -Raw (Join-Path $env:RUNNER_TEMP 'installed-auth-e2e.json') | ConvertFrom-Json
-          if (!$authEvidence.passed -or !$authEvidence.device_authorization -or !$authEvidence.os_credential_restore -or !$authEvidence.authenticated_studio_request -or !$authEvidence.remote_revocation -or !$authEvidence.local_credential_removal) {
+          if (!$authEvidence.passed -or !$authEvidence.device_authorization -or !$authEvidence.native_credential_restore -or !$authEvidence.refresh_rotation -or $authEvidence.auth_status_p95_ms -gt 100 -or !$authEvidence.authenticated_studio_request -or !$authEvidence.device_session_management -or !$authEvidence.remote_revocation -or !$authEvidence.local_credential_removal) {
             throw 'installed OAuth qualification evidence mismatch'
           }
           & $native --format json project init --title 'RC qualification' --directory $project |
@@ -575,35 +503,38 @@ jobs:
           name: installed-auth-${{ matrix.target }}
           path: ${{ runner.temp }}/installed-auth-e2e.json
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 1
 
-  start-beta-window:
+  finalize-prerelease:
     if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR && needs.verify-source.outputs.prerelease == 'true'
     needs: [verify-source, qualify-published-artifacts]
     runs-on: ubuntu-24.04
     permissions:
-      issues: write
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      VERSION: ${{ needs.verify-source.outputs.version }}
+      RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
     steps:
-      - name: Start the auditable 30-day stability window after qualification
+      - name: Publish the already-qualified RC draft
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^1\.0\.0-rc\.[0-9A-Za-z.-]+$ ]]
-          title="Reporch CLI $VERSION — 30-day stability window"
-          gh issue list --state all --limit 100 --json number,title,state > "$RUNNER_TEMP/issues.json"
-          count=$(jq --arg title "$title" '[.[] | select(.title == $title)] | length' "$RUNNER_TEMP/issues.json")
-          test "$count" -le 1
-          if [ "$count" = 0 ]; then
-            started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            earliest=$(date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)
-            gh issue create --title "$title" --body "RC qualification completed in workflow run $GITHUB_RUN_ID.\n\nStart: $started\nEarliest eligible completion: $earliest\n\nDo not close this issue before 30 full days have elapsed. Close it only after confirming zero critical security, data-loss, or duplicate-publication incidents and attaching the daily/incident evidence. The stable 1.0.0 release workflow verifies the elapsed time, closed state, and at least 30 distinct passing daily monitor records."
-          else
-            number=$(jq -er --arg title "$title" '.[] | select(.title == $title) | .number' "$RUNNER_TEMP/issues.json")
-            state=$(jq -er --arg title "$title" '.[] | select(.title == $title) | .state' "$RUNNER_TEMP/issues.json")
-            test "$state" = OPEN
-            gh issue comment "$number" --body "Published-artifact qualification passed again in workflow run $GITHUB_RUN_ID."
-          fi
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease
+
+  preserve-stable-candidate:
+    if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR && needs.verify-source.outputs.prerelease == 'false'
+    needs: [verify-source, qualify-published-artifacts]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
+    steps:
+      - name: Keep stable candidate unlisted until explicit dist-tag promotion
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          echo "Exact 1.0 candidate qualified. npm candidate remains isolated; latest and the GitHub draft require explicit promotion."

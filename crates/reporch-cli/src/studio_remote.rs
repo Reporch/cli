@@ -20,12 +20,13 @@ use studio_contracts::{
     ApiErrorResponse, BeginFileUploadRequest, BeginFileUploadResponse, CommitDetailResponse,
     CommitFileDownloadResponse, CommitPage, CommitResponse, CommitWorkingCopyRequestV1,
     CreateCommitRequest, CreateProjectRequest, CreateReleaseRequest, CreateReviewDecisionRequest,
-    CreateWaiverRequest, EVENT_SCHEMA_V1, EnqueueValidationRequest, EventEnvelopeV1, FileEntryPage,
-    FileUploadResponse, FileUploadStatus, FileUploadStrategyV1, IdentityDirectoryPageV1,
-    ProjectMembershipPage, ProjectMembershipResponse, ProjectPage, ProjectResponse,
-    PublicationResponse, PublicationStatus, QuotaStatusV1, ReleaseDownloadResponse, ReleasePage,
-    ReleaseResponse, ReleaseStatus, ReviewPage, ReviewPoolPageV1, ReviewPoolRequestResponseV1,
-    ReviewResponse, RevokeWaiverRequest, RuntimePreviewOperationV1, RuntimePreviewRequestV1,
+    CreateWaiverRequest, DeviceSessionPageV1, DeviceSessionRevocationV1, EVENT_SCHEMA_V1,
+    EnqueueValidationRequest, EventEnvelopeV1, FileEntryPage, FileUploadResponse, FileUploadStatus,
+    FileUploadStrategyV1, IdentityDirectoryPageV1, ProjectMembershipPage,
+    ProjectMembershipResponse, ProjectPage, ProjectResponse, PublicationResponse,
+    PublicationStatus, QuotaStatusV1, ReleaseDownloadResponse, ReleasePage, ReleaseResponse,
+    ReleaseStatus, ReviewPage, ReviewPoolPageV1, ReviewPoolRequestResponseV1, ReviewResponse,
+    RevokeWaiverRequest, RuntimePreviewOperationV1, RuntimePreviewRequestV1,
     RuntimePreviewResultV1, RuntimePreviewStatusV1, StudioCapabilitiesV1, SubmitReviewRequest,
     ToolExecutionLimitsV1, UpdateWorkingCopyRequestV1, UpsertProjectMembershipRequest,
     ValidationRunDetailResponse, ValidationRunPage, ValidationRunResponse, ValidationRunStatus,
@@ -33,16 +34,15 @@ use studio_contracts::{
 };
 use studio_core::{
     ManifestFile, ProblemType, ProjectRole, ReviewDecisionKindV1, Sha256Digest, SubjectRef,
-    VersionedReleaseManifest, validate_manifest,
+    VersionedReleaseManifest,
 };
-use studio_native_auth::{KeyringTokenStore, NativeAuthClient};
+use studio_native_auth::{NativeAuthClient, NativeFileTokenStore};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use url::Host;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use crate::{NativeAuthOptions, device_auth_config};
 
@@ -615,7 +615,8 @@ pub struct RevokeWaiverOptions {
 struct StudioApiClient {
     http: reqwest::Client,
     api_base: Url,
-    access_token: Zeroizing<String>,
+    auth: Option<NativeAuthClient>,
+    credential_store: NativeFileTokenStore,
     dev_subject: Option<String>,
     allow_insecure_loopback: bool,
 }
@@ -629,17 +630,16 @@ impl StudioApiClient {
             options.dev_subject.as_deref(),
         )?;
         validate_connection_binding(&api_base, &options.auth, dev_subject.as_deref())?;
-        let access_token =
-            if dev_subject.is_some() {
-                Zeroizing::new(String::new())
-            } else {
-                let auth = NativeAuthClient::discover(device_auth_config(&options.auth)?)
+        let auth = if dev_subject.is_some() {
+            None
+        } else {
+            Some(
+                NativeAuthClient::discover(device_auth_config(&options.auth)?)
                     .await
-                    .context("discover Reporch native OAuth endpoints")?;
-                Zeroizing::new(auth.access_token(&KeyringTokenStore).await.context(
-                    "load or refresh the CLI credential; run `reporch auth login` first",
-                )?)
-            };
+                    .context("discover Reporch native OAuth endpoints")?,
+            )
+        };
+        let credential_store = NativeFileTokenStore::discover()?;
         let http = reqwest::ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -649,7 +649,8 @@ impl StudioApiClient {
         Ok(Self {
             http,
             api_base,
-            access_token,
+            auth,
+            credential_store,
             dev_subject,
             allow_insecure_loopback: options.auth.allow_insecure_http,
         })
@@ -661,32 +662,58 @@ impl StudioApiClient {
             .with_context(|| format!("build Studio API path {path}"))
     }
 
-    fn authenticated(&self, request: RequestBuilder) -> RequestBuilder {
-        let request = if let Some(subject) = &self.dev_subject {
-            request.header("x-studio-dev-subject", subject)
-        } else {
-            request.bearer_auth(self.access_token.as_str())
-        };
-        request
+    async fn authenticated(&self, request: RequestBuilder) -> Result<Response> {
+        let mut request = request
             .header("x-request-id", Uuid::now_v7().to_string())
-            .timeout(Duration::from_secs(30))
+            .build()
+            .context("build Studio API request")?;
+        if let Some(subject) = &self.dev_subject {
+            request.headers_mut().insert(
+                HeaderName::from_static("x-studio-dev-subject"),
+                HeaderValue::from_str(subject).context("encode development subject")?,
+            );
+        } else {
+            let auth = self
+                .auth
+                .as_ref()
+                .context("native OAuth client is missing")?;
+            let authorization = auth
+                .authorization(
+                    &self.credential_store,
+                    request.method().as_str(),
+                    request.url(),
+                )
+                .await
+                .context("load or refresh the CLI credential; run `reporch auth login` first")?;
+            request.headers_mut().insert(
+                reqwest::header::AUTHORIZATION,
+                HeaderValue::from_str(&authorization.authorization)
+                    .context("encode DPoP authorization")?,
+            );
+            if let Some(proof) = authorization.dpop_proof {
+                request.headers_mut().insert(
+                    HeaderName::from_static("dpop"),
+                    HeaderValue::from_str(&proof).context("encode DPoP proof")?,
+                );
+            }
+        }
+        self.http
+            .execute(request)
+            .await
+            .map_err(studio_api_transport_error)
     }
 
     async fn json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T> {
         let response = self
-            .authenticated(request)
-            .send()
-            .await
-            .map_err(studio_api_transport_error)?;
+            .authenticated(request.timeout(Duration::from_secs(30)))
+            .await?;
         decode_api_response(response).await
     }
 
     async fn empty(&self, request: RequestBuilder) -> Result<()> {
         let response = self
-            .authenticated(request)
-            .send()
-            .await
-            .map_err(studio_api_transport_error)?;
+            .authenticated(request.timeout(Duration::from_secs(30)))
+            .await?;
         if response.status().is_success() {
             return Ok(());
         }
@@ -818,6 +845,19 @@ impl StudioApiClient {
             .await
     }
 
+    async fn device_sessions(&self) -> Result<DeviceSessionPageV1> {
+        self.json(self.http.get(self.endpoint("auth/device-sessions")?))
+            .await
+    }
+
+    async fn revoke_device_session(&self, session_id: Uuid) -> Result<DeviceSessionRevocationV1> {
+        self.json(
+            self.http
+                .delete(self.endpoint(&format!("auth/device-sessions/{session_id}"))?),
+        )
+        .await
+    }
+
     async fn quota(&self) -> Result<QuotaStatusV1> {
         self.json(self.http.get(self.endpoint("quota")?)).await
     }
@@ -851,11 +891,13 @@ impl StudioApiClient {
                 .append_pair("cursor", &cursor.to_string());
         }
         let response = self
-            .authenticated(self.http.get(url).header(ACCEPT, "text/event-stream"))
-            .timeout(Duration::from_secs(30 * 60))
-            .send()
-            .await
-            .map_err(studio_api_transport_error)?;
+            .authenticated(
+                self.http
+                    .get(url)
+                    .header(ACCEPT, "text/event-stream")
+                    .timeout(Duration::from_secs(30 * 60)),
+            )
+            .await?;
         if !response.status().is_success() {
             let _: serde_json::Value = decode_api_response(response).await?;
             unreachable!("a successful error response cannot be decoded")
@@ -1585,6 +1627,25 @@ pub async fn capabilities_operation(
     Ok(capabilities)
 }
 
+pub async fn list_device_sessions_operation(
+    connection: &RemoteConnectionOptions,
+) -> Result<DeviceSessionPageV1> {
+    StudioApiClient::connect(connection)
+        .await?
+        .device_sessions()
+        .await
+}
+
+pub async fn revoke_device_session_operation(
+    connection: &RemoteConnectionOptions,
+    session_id: Uuid,
+) -> Result<DeviceSessionRevocationV1> {
+    StudioApiClient::connect(connection)
+        .await?
+        .revoke_device_session(session_id)
+        .await
+}
+
 pub async fn quota_operation(connection: &RemoteConnectionOptions) -> Result<QuotaStatusV1> {
     StudioApiClient::connect(connection).await?.quota().await
 }
@@ -1609,7 +1670,7 @@ pub async fn runtime_preview_operation(
             issuer: std::env::var("REPORCH_STUDIO_OIDC_ISSUER")
                 .unwrap_or_else(|_| DEFAULT_OIDC_ISSUER.into()),
             client_id: std::env::var("REPORCH_STUDIO_CLI_CLIENT_ID")
-                .unwrap_or_else(|_| "reporch-studio-cli".into()),
+                .unwrap_or_else(|_| "reporch-studio-cli-v1".into()),
             allow_insecure_http: std::env::var("REPORCH_STUDIO_ALLOW_INSECURE_HTTP")
                 .ok()
                 .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
@@ -2170,7 +2231,12 @@ pub async fn pull_operation(options: &PullOptions) -> Result<PullOperationResult
         commit.manifest.digest()? == commit.manifest_digest,
         "commit manifest digest mismatch"
     );
-    commit.manifest.validate_references()?;
+    let issues = studio_core::validate_versioned_manifest(&commit.manifest);
+    ensure!(
+        issues.is_empty(),
+        "commit manifest validation failed: {}",
+        serde_json::to_string(&issues)?
+    );
     let mut project_bytes = 0_u64;
     for file in commit.manifest.files() {
         ensure!(
@@ -2283,11 +2349,7 @@ pub async fn push_operation(options: &PushOptions) -> Result<PushOperationResult
         return push_authoring_operation(options).await;
     };
     let manifest = read_manifest(manifest_path)?;
-    manifest.validate_references()?;
-    let issues = match &manifest {
-        VersionedReleaseManifest::V1(manifest) => validate_manifest(manifest),
-        VersionedReleaseManifest::V2(_) => Vec::new(),
-    };
+    let issues = studio_core::validate_versioned_manifest(&manifest);
     if !issues.is_empty() {
         bail!(
             "manifest validation failed with {} issue(s): {}",
@@ -2340,6 +2402,12 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
     );
 
     let upload_manifest = compile_versioned_authoring_spec(&root, &spec, Uuid::nil())?;
+    let issues = studio_core::validate_versioned_manifest(&upload_manifest);
+    ensure!(
+        issues.is_empty(),
+        "working copy validation failed: {}",
+        serde_json::to_string(&issues)?
+    );
     ensure!(
         capabilities
             .release_manifest_versions
@@ -3478,6 +3546,19 @@ fn ensure_cli_compatible(capabilities: &StudioCapabilitiesV1) -> Result<()> {
         capabilities.maximum_cli_major,
         env!("CARGO_PKG_VERSION")
     );
+    for required in [
+        "checker_protocol_v1",
+        "dpop_cli_auth_v1",
+        "manifest_v2_validation",
+    ] {
+        if !capabilities
+            .features
+            .iter()
+            .any(|feature| feature == required)
+        {
+            return Err(studio_native_auth::NativeAuthError::ServerUpgradeRequired.into());
+        }
+    }
     Ok(())
 }
 
@@ -3983,6 +4064,11 @@ mod tests {
             api_versions: vec!["v1".into()],
             authoring_spec_versions: vec![reporch_format::AUTHORING_SPEC_SCHEMA_V1.into()],
             release_manifest_versions: vec![studio_core::RELEASE_MANIFEST_SCHEMA_V1.into()],
+            features: vec![
+                "checker_protocol_v1".into(),
+                "dpop_cli_auth_v1".into(),
+                "manifest_v2_validation".into(),
+            ],
             minimum_cli_version: env!("CARGO_PKG_VERSION").into(),
             maximum_cli_major: 1,
         };

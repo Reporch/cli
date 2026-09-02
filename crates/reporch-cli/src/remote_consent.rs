@@ -8,13 +8,13 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use studio_native_auth::{KeyringTokenStore, NativeAuthConfig};
+use studio_native_auth::{NativeAuthConfig, NativeFileTokenStore};
 use tempfile::NamedTempFile;
 
 const CONSENT_SCHEMA: &str = "reporch.remote-fallback-consents.v1";
 const MAX_CONSENT_BYTES: u64 = 64 * 1024;
 const DEFAULT_ISSUER: &str = "https://reporch.com/oauth";
-const DEFAULT_CLIENT_ID: &str = "reporch-studio-cli";
+const DEFAULT_CLIENT_ID: &str = "reporch-studio-cli-v1";
 
 #[derive(Clone, Debug, Default)]
 struct RemoteFallbackPolicy {
@@ -162,7 +162,7 @@ async fn credential_fingerprint(issuer: &str, client_id: &str) -> Result<String>
         allow_insecure_http,
     )?;
     config
-        .local_credential_fingerprint(&KeyringTokenStore)
+        .local_credential_fingerprint(&NativeFileTokenStore::discover()?)
         .await?
         .context("sign in to Reporch before allowing Studio remote fallback")
 }
