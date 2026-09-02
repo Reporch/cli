@@ -1,4 +1,4 @@
-name: RC stability monitor
+name: RC regression monitor
 
 on:
   schedule:
@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: rc-stability-monitor
@@ -41,31 +40,13 @@ jobs:
             > "$evidence/bootstrap.json"
 
       - id: target
-        name: Resolve the active RC stability window
+        name: Resolve the active npm next RC
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh issue list --state open --limit 100 --json number,title,createdAt \
-            > "$RUNNER_TEMP/open-beta-issues.json"
-          issue_number=$(jq -er '
-            [ .[]
-              | select(.title | test("^Reporch CLI 1\\.0\\.0-rc\\.[0-9A-Za-z.-]+ — 30-day stability window$"))
-            ]
-            | sort_by(.createdAt)
-            | last
-            | .number
-          ' "$RUNNER_TEMP/open-beta-issues.json")
-          title=$(jq -er --argjson number "$issue_number" \
-            '.[] | select(.number == $number) | .title' "$RUNNER_TEMP/open-beta-issues.json")
-          version=$(sed -E 's/^Reporch CLI ([^ ]+) — 30-day stability window$/\1/' <<<"$title")
+          version=$(npm view @reporch/cli dist-tags.next)
           [[ "$version" =~ ^1\.0\.0-rc\.[0-9A-Za-z.-]+$ ]]
-          test "$(npm view @reporch/cli dist-tags.next)" = "$version"
-          {
-            echo "issue_number=$issue_number"
-            echo "version=$version"
-          } >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - id: verify
         name: Verify the published RC and production compatibility boundary
@@ -159,29 +140,4 @@ jobs:
           name: rc-stability-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/rc-stability-evidence
           if-no-files-found: error
-          retention-days: 90
-
-      - name: Record the immutable daily result on the beta issue
-        if: always() && steps.target.outcome == 'success'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ steps.target.outputs.issue_number }}
-          VERSION: ${{ steps.target.outputs.version }}
-          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
-        run: |
-          set -euo pipefail
-          result=failed
-          test "$VERIFY_OUTCOME" != success || result=passed
-          observed_date=$(date -u +%Y-%m-%d)
-          marker="<!-- reporch-cli-stability:${observed_date}:${result}:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT} -->"
-          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --paginate \
-            > "$RUNNER_TEMP/stability-comments.json"
-          if jq -e --arg marker "$marker" '[.[] | select(.body | contains($marker))] | length == 0' \
-            "$RUNNER_TEMP/stability-comments.json" >/dev/null; then
-            comment_body=$(printf '%s\nDaily RC monitor **%s** for %s on %s: %s' \
-              "$marker" "$result" "$VERSION" "$observed_date" "$run_url")
-            gh issue comment "$ISSUE_NUMBER" \
-              --body "$comment_body"
-          fi
+          retention-days: 14

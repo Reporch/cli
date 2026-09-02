@@ -155,12 +155,15 @@ assert.match(stablePromotion, /\["dist-tag", "add", `\$\{name\}@\$\{version\}`, 
 assert.match(stablePromotion, /\["release", "edit", tag, "--draft=false", "--latest"\]/);
 const stability = readFileSync(".github/workflows/rc-stability.yml", "utf8");
 assert.match(stability, /schedule:/);
+assert.match(stability, /npm view @reporch\/cli dist-tags\.next/);
 assert.match(stability, /@reporch\/cli@\$VERSION/);
 assert.match(stability, /reporch\.studio-capabilities\.v1/);
 assert.match(stability, /reporch\.authoring-spec\.v2/);
-assert.match(stability, /reporch-cli-stability:/);
-assert.match(stability, /retention-days: 90/);
+assert.match(stability, /retention-days: 14/);
 assert.match(stability, /persist-credentials: false/);
+assert.doesNotMatch(stability, /30-day stability window/);
+assert.doesNotMatch(stability, /issues: write/);
+assert.doesNotMatch(stability, /gh issue comment/);
 assert.doesNotMatch(
   stability,
   /jobs:\n\s+monitor:\n(?:.|\n)*?timeout-minutes: 20\n\s+env:\n\s+GH_TOKEN:/,
