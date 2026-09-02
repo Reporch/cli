@@ -47,3 +47,40 @@ fn auth_login_no_input_fails_before_network_or_device_polling() {
         "auth unexpectedly bootstrapped the VM runtime"
     );
 }
+
+#[test]
+fn auth_status_qualification_measures_protected_reads_without_changing_normal_json() {
+    let isolated = tempfile::tempdir().unwrap();
+    let config = isolated.path().join("config");
+    let normal = reporch()
+        .env("REPORCH_CONFIG_HOME", &config)
+        .args(["--format", "json", "auth", "status"])
+        .output()
+        .unwrap();
+    assert!(normal.status.success(), "{normal:?}");
+    let normal: serde_json::Value = serde_json::from_slice(&normal.stdout).unwrap();
+    assert_eq!(normal["data"]["authenticated"], false);
+    assert!(normal["data"].get("qualification").is_none());
+
+    let measured = reporch()
+        .env("REPORCH_CONFIG_HOME", &config)
+        .args([
+            "--format",
+            "json",
+            "auth",
+            "status",
+            "--qualification-iterations",
+            "20",
+        ])
+        .output()
+        .unwrap();
+    assert!(measured.status.success(), "{measured:?}");
+    let measured: serde_json::Value = serde_json::from_slice(&measured.stdout).unwrap();
+    assert_eq!(measured["data"]["authenticated"], false);
+    assert_eq!(measured["data"]["qualification"]["iterations"], 20);
+    assert_eq!(
+        measured["data"]["qualification"]["schema"],
+        "reporch.auth-status-qualification.v1"
+    );
+    assert!(measured["data"]["qualification"]["p95_ms"].is_number());
+}

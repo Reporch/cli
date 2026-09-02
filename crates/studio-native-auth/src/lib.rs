@@ -1,4 +1,8 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_credential_acl;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -821,14 +825,13 @@ impl TokenStore for NativeFileTokenStore {
     }
 
     async fn load(&self, key: &CredentialKey) -> Result<Option<StoredTokenSet>, NativeAuthError> {
-        let path = self.path.clone();
         let map_key = credential_map_key(key);
-        tokio::task::spawn_blocking(move || {
-            let file = read_credential_file(&path)?;
-            Ok(file.entries.get(&map_key).cloned())
-        })
-        .await
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?
+        // The credential file is bounded to 256 KiB and read exactly once. Keeping this
+        // operation inline avoids creating a fresh blocking-pool thread for every short-lived
+        // `reporch auth status` process while retaining all ownership, mode, link, and size
+        // checks in `read_credential_file`.
+        let file = read_credential_file(&self.path)?;
+        Ok(file.entries.get(&map_key).cloned())
     }
 
     async fn save(
@@ -1546,34 +1549,8 @@ fn atomic_replace_credential_file(
     source: &Path,
     destination: &Path,
 ) -> Result<(), NativeAuthError> {
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-$source = $args[0]
-$destination = $args[1]
-if ([System.IO.File]::Exists($destination)) {
-    [System.IO.File]::Replace($source, $destination, $null, $false)
-} else {
-    [System.IO.File]::Move($source, $destination)
-}
-"#;
-    let status = std::process::Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .arg(source)
-        .arg(destination)
-        .status()
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
-    if !status.success() {
-        return Err(NativeAuthError::CredentialStore(
-            "failed to atomically replace the credential file".into(),
-        ));
-    }
-    Ok(())
+    windows_credential_acl::atomic_replace(source, destination)
+        .map_err(NativeAuthError::CredentialStore)
 }
 
 #[cfg(unix)]
@@ -1621,6 +1598,7 @@ fn acquire_credential_file_lock(path: &Path) -> Result<CredentialOperationGuard,
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
         secure_windows_path(path)?;
@@ -1645,152 +1623,13 @@ fn acquire_credential_file_lock(path: &Path) -> Result<CredentialOperationGuard,
 }
 
 #[cfg(windows)]
-fn current_windows_sid() -> Result<String, NativeAuthError> {
-    let output = std::process::Command::new("whoami.exe")
-        .arg("/user")
-        .arg("/fo")
-        .arg("csv")
-        .arg("/nh")
-        .output()
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
-    if !output.status.success() {
-        return Err(NativeAuthError::CredentialStore(
-            "whoami could not resolve the current SID".into(),
-        ));
-    }
-    let line =
-        String::from_utf8(output.stdout).map_err(|_| NativeAuthError::CredentialStoreCorrupt)?;
-    let sid = line
-        .trim()
-        .trim_matches('"')
-        .rsplit_once("\",\"")
-        .map(|(_, sid)| sid.trim_matches('"').trim())
-        .filter(|sid| sid.starts_with("S-1-") && sid.len() <= 184)
-        .ok_or(NativeAuthError::CredentialStoreCorrupt)?;
-    Ok(sid.to_owned())
-}
-
-#[cfg(windows)]
 fn secure_windows_path(path: &Path) -> Result<(), NativeAuthError> {
-    let sid = current_windows_sid()?;
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-$path = $args[0]
-$sid = [System.Security.Principal.SecurityIdentifier]::new($args[1])
-if ([System.IO.Directory]::Exists($path)) {
-    $acl = [System.Security.AccessControl.DirectorySecurity]::new()
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-        $sid,
-        [System.Security.AccessControl.FileSystemRights]::FullControl,
-        [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
-        [System.Security.AccessControl.PropagationFlags]::None,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-} else {
-    $acl = [System.Security.AccessControl.FileSecurity]::new()
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-        $sid,
-        [System.Security.AccessControl.FileSystemRights]::FullControl,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-}
-$acl.SetOwner($sid)
-$acl.SetAccessRuleProtection($true, $false)
-$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $path -AclObject $acl
-"#;
-    let status = std::process::Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .arg(path)
-        .arg(&sid)
-        .status()
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
-    if !status.success() {
-        return Err(NativeAuthError::CredentialStore(
-            "failed to restrict the credential DACL".into(),
-        ));
-    }
-    verify_windows_path(path)
+    windows_credential_acl::secure_path(path).map_err(NativeAuthError::CredentialStore)
 }
 
 #[cfg(windows)]
 fn verify_windows_path(path: &Path) -> Result<(), NativeAuthError> {
-    let sid = current_windows_sid()?;
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-$acl = Get-Acl -LiteralPath $args[0]
-$rules = @($acl.Access | ForEach-Object {
-    [pscustomobject]@{
-        sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-        inherited = $_.IsInherited
-        type = $_.AccessControlType.ToString()
-        rights = [int64]$_.FileSystemRights
-    }
-})
-[pscustomobject]@{
-    owner = ([System.Security.Principal.NTAccount]$acl.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    protected = $acl.AreAccessRulesProtected
-    linkType = (Get-Item -LiteralPath $args[0] -Force).LinkType
-    rules = $rules
-} | ConvertTo-Json -Compress -Depth 4
-"#;
-    let output = std::process::Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .arg(path)
-        .output()
-        .map_err(|error| NativeAuthError::CredentialStore(error.to_string()))?;
-    if !output.status.success() {
-        return Err(NativeAuthError::CredentialStoreCorrupt);
-    }
-    #[derive(Deserialize)]
-    struct WindowsAclRule {
-        sid: String,
-        inherited: bool,
-        #[serde(rename = "type")]
-        access_type: String,
-        rights: i64,
-    }
-    #[derive(Deserialize)]
-    struct WindowsAcl {
-        owner: String,
-        protected: bool,
-        #[serde(rename = "linkType")]
-        link_type: Option<String>,
-        rules: Vec<WindowsAclRule>,
-    }
-    let acl: WindowsAcl = serde_json::from_slice(&output.stdout)
-        .map_err(|_| NativeAuthError::CredentialStoreCorrupt)?;
-    let expected_sid = sid.to_ascii_uppercase();
-    let full_control = 0x1f01ff_i64;
-    if !acl.protected
-        || acl.owner.to_ascii_uppercase() != expected_sid
-        || acl
-            .link_type
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-        || acl.rules.len() != 1
-        || acl.rules.iter().any(|rule| {
-            rule.sid.to_ascii_uppercase() != expected_sid
-                || rule.inherited
-                || !rule.access_type.eq_ignore_ascii_case("Allow")
-                || rule.rights & full_control != full_control
-        })
-    {
-        return Err(NativeAuthError::CredentialStoreCorrupt);
-    }
-    Ok(())
+    windows_credential_acl::verify_path(path).map_err(|_| NativeAuthError::CredentialStoreCorrupt)
 }
 
 fn normalized_issuer(value: &str, allow_insecure_http: bool) -> Result<Url, NativeAuthError> {
@@ -2725,5 +2564,11 @@ mod tests {
         fs::write(&target, b"{}").unwrap();
         symlink(&target, &store.path).unwrap();
         assert!(store.load(&key).await.is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_credential_file_round_trips_with_a_protected_user_only_dacl() {
+        qualification_native_file_canary().await.unwrap();
     }
 }

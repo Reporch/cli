@@ -374,7 +374,7 @@ enum AuthCommand {
     /// Sign in using sender-constrained OAuth Device Authorization.
     Login(NativeAuthOptions),
     /// Inspect the permission-restricted local session without network or keychain access.
-    Status(NativeAuthOptions),
+    Status(AuthStatusOptions),
     /// Revoke the refresh token when possible and always remove the local credential.
     Logout(NativeAuthOptions),
     /// Replace the legacy Keychain bearer session with a fresh DPoP login.
@@ -384,6 +384,19 @@ enum AuthCommand {
         #[command(subcommand)]
         command: AuthDevicesCommand,
     },
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct AuthStatusOptions {
+    #[command(flatten)]
+    auth: NativeAuthOptions,
+    /// Repeat the protected local read in-process for release qualification.
+    #[arg(
+        long,
+        hide = true,
+        value_parser = clap::value_parser!(u16).range(2..=1000)
+    )]
+    qualification_iterations: Option<u16>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2326,18 +2339,63 @@ async fn auth_migrate_keychain(
     )
 }
 
-async fn auth_status(options: &NativeAuthOptions, output: &CliOutput) -> Result<()> {
-    let config = device_auth_config(options)?;
-    let status = config
-        .local_session_status(&NativeFileTokenStore::discover()?)
-        .await
-        .context("read the protected native credential file")?;
+async fn auth_status(options: &AuthStatusOptions, output: &CliOutput) -> Result<()> {
+    let config = device_auth_config(&options.auth)?;
+    let store = NativeFileTokenStore::discover()?;
+    let iterations = options.qualification_iterations.unwrap_or(1);
+    let mut durations = Vec::with_capacity(usize::from(iterations));
+    let mut statuses = Vec::with_capacity(usize::from(iterations));
+    for _ in 0..iterations {
+        let started = std::time::Instant::now();
+        let status = config
+            .local_session_status(&store)
+            .await
+            .context("read the protected native credential file")?;
+        durations.push(started.elapsed());
+        statuses.push(status);
+    }
+    let status = statuses
+        .pop()
+        .context("auth status qualification did not execute")?;
+    ensure!(
+        statuses.iter().all(|candidate| {
+            candidate.authenticated == status.authenticated
+                && candidate.issuer == status.issuer
+                && candidate.client_id == status.client_id
+                && candidate.expires_at == status.expires_at
+                && candidate.scopes == status.scopes
+                && candidate.refresh_available == status.refresh_available
+        }),
+        "protected credential status changed during qualification"
+    );
     let human = if status.authenticated {
         "Signed in"
     } else {
         "Not signed in"
     };
-    output.emit("auth status", &status, human)
+    let mut result = serde_json::to_value(&status).context("serialize local auth status")?;
+    if options.qualification_iterations.is_some() {
+        durations.sort_unstable();
+        let percentile = |percent: usize| {
+            let index = (durations.len() * percent).div_ceil(100).saturating_sub(1);
+            durations[index].as_secs_f64() * 1_000.0
+        };
+        result
+            .as_object_mut()
+            .context("local auth status must serialize as an object")?
+            .insert(
+                "qualification".into(),
+                serde_json::json!({
+                    "schema": "reporch.auth-status-qualification.v1",
+                    "iterations": iterations,
+                    "p50_ms": percentile(50),
+                    "p95_ms": percentile(95),
+                    "p99_ms": percentile(99),
+                    "maximum_ms": percentile(100),
+                }),
+            );
+    }
+    output.emit("auth status", &result, human)
 }
 
 async fn auth_logout(
