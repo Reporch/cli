@@ -181,6 +181,9 @@ assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates-rebuild" "\$RUN
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
 assert.match(runtimeRelease, /runtime-reproducibility\.json/);
 assert.match(runtimeRelease, /RUNTIME_TAG: reporch-runtime-v1-seq24/);
+assert.match(runtimeRelease, /--title "Reporch Runtime v1 sequence 24"/);
+assert.match(runtimeRelease, /runtime sequence 24\. Assets are target-qualified/);
+assert.doesNotMatch(runtimeRelease, /runtime sequence 23/);
 assert.match(
   runtimeCandidates,
   /"\$target" "\$runtime_sequence" "\$runtime_version" "\$minimum_os"/,
