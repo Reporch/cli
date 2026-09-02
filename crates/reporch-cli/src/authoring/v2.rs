@@ -3,7 +3,6 @@ use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use reporch_format::{VersionedAuthoringSpec, parse_versioned_authoring_spec};
 use studio_core::{
     CheckerSpec, CheckerUnitSpecV2, GeneratedCaseRefV2, GeneratorMatrixStrategyV2,
     GeneratorRecipeSpecV2, GeneratorSpecV2, HarnessKindV2, HarnessProfileSpecV2, HarnessSpecV2,
@@ -16,16 +15,7 @@ use uuid::Uuid;
 use super::*;
 
 pub(super) fn is_active_project() -> Result<bool> {
-    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
-    let path = root.join(reporch_cli::local_project::AUTHORING_FILE_NAME);
-    let bytes = reporch_cli::local_project::read_bounded_regular_file(
-        &path,
-        reporch_format::MAX_AUTHORING_SPEC_BYTES as u64,
-    )?;
-    Ok(matches!(
-        parse_versioned_authoring_spec(&bytes)?,
-        VersionedAuthoringSpec::V2(_)
-    ))
+    reporch_cli::local_project_v2::is_v2_project(Path::new("."))
 }
 
 pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
