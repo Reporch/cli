@@ -176,6 +176,9 @@ const toolchainRelease = readFileSync(".github/workflows/release-toolchains.yml"
 assert.match(runtimeRelease, /RUNTIME_SEQUENCE: "24"/);
 assert.match(runtimeRelease, /RUNTIME_VERSION: 1\.0\.0-rc\.10/);
 assert.match(runtimeRelease, /test "\$RUNTIME_TAG" = "reporch-runtime-v1-seq\$RUNTIME_SEQUENCE"/);
+assert.match(runtimeRelease, /required_kib=\$\(\(20 \* 1024 \* 1024\)\)/);
+assert.match(runtimeRelease, /df -Pk "\$RUNNER_TEMP"/);
+assert.match(runtimeRelease, /Runtime release needs at least 20 GiB free/);
 assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates" "\$RUNTIME_SEQUENCE" "\$RUNTIME_VERSION"/);
 assert.match(runtimeRelease, /"\$RUNNER_TEMP\/runtime-candidates-rebuild" "\$RUNTIME_SEQUENCE" "\$RUNTIME_VERSION"/);
 assert.match(runtimeRelease, /compare-runtime-candidates\.mjs/);
