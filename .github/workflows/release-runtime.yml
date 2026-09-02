@@ -117,8 +117,8 @@ jobs:
             exit 1
           fi
           gh release create "$RUNTIME_TAG" --draft --target "$GITHUB_SHA" \
-            --title "Reporch Runtime v1 sequence 23" \
-            --notes "Signed Docker-free Reporch VM runtime sequence 23. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
+            --title "Reporch Runtime v1 sequence 24" \
+            --notes "Signed Docker-free Reporch VM runtime sequence 24. Assets are target-qualified, digest-bound, and accompanied by SPDX and SLSA provenance evidence."
           gh release upload "$RUNTIME_TAG" "$RUNNER_TEMP/runtime-release"/*
           mkdir "$RUNNER_TEMP/runtime-release-download"
           gh release download "$RUNTIME_TAG" --dir "$RUNNER_TEMP/runtime-release-download"
