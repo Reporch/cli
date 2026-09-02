@@ -517,14 +517,15 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
     steps:
       - name: Publish the already-qualified RC draft
         shell: bash
         run: |
           set -euo pipefail
-          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
-          gh release edit "$RELEASE_TAG" --draft=false --prerelease
+          test "$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq .isDraft)" = true
+          gh release edit "$RELEASE_TAG" --repo "$GH_REPO" --draft=false --prerelease
 
   preserve-stable-candidate:
     if: github.actor == vars.SELF_HOSTED_ACTIONS_ALLOWED_ACTOR && needs.verify-source.outputs.prerelease == 'false'
