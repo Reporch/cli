@@ -48,6 +48,17 @@ jobs:
           node scripts/check-workflows.mjs
           test "$RUNTIME_TAG" = "reporch-runtime-v1-seq$RUNTIME_SEQUENCE"
           test -z "$(git status --porcelain)"
+      - name: Require enough local disk for two reproducible builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_kib=$((20 * 1024 * 1024))
+          available_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 {print $4}')
+          if test -z "$available_kib" || test "$available_kib" -lt "$required_kib"; then
+            echo "::error::Runtime release needs at least 20 GiB free; runner has $((available_kib / 1024 / 1024)) GiB. Remove only regenerable build outputs, then rerun."
+            exit 1
+          fi
+          echo "Runtime release disk preflight passed: $((available_kib / 1024 / 1024)) GiB free."
       - name: Build all five immutable runtime candidates twice locally
         shell: bash
         run: |
