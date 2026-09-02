@@ -273,7 +273,7 @@ fn init_project_template_versioned(
                 ),
                 TemplateFile::text(
                     "interactive/interactor.cpp",
-                    "#include <fstream>\n#include <iostream>\nint main(int argc, char** argv){ if(argc < 2) return 2; std::ifstream input(argv[1]); long long n, answer; input >> n; std::cout << n << std::endl; if(!(std::cin >> answer)) return 1; return answer == 2 * n ? 0 : 1; }\n",
+                    "#include <fstream>\n#include <iostream>\nint main(int argc, char** argv){ if(argc < 2) return 2; std::ifstream input(argv[1]); long long n, answer; input >> n; std::cout << n << std::endl; if(!(std::cin >> answer)) return 43; return answer == 2 * n ? 42 : 43; }\n",
                     "text/x-c++src",
                 ),
             ]);
@@ -1852,6 +1852,31 @@ mod tests {
                 init_project_template(temporary.path(), "Again", Uuid::now_v7(), problem_type)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn interactive_template_uses_icpc_verdicts_and_real_newlines() {
+        let temporary = tempfile::tempdir().unwrap();
+        init_project_template(
+            temporary.path(),
+            "Interactive example",
+            Uuid::now_v7(),
+            ProblemType::Interactive,
+        )
+        .unwrap();
+
+        let interactor =
+            fs::read_to_string(temporary.path().join("interactive/interactor.cpp")).unwrap();
+        assert!(interactor.contains("return answer == 2 * n ? 42 : 43;"));
+        assert!(interactor.contains("if(!(std::cin >> answer)) return 43;"));
+        assert!(!interactor.contains("answer == 2 * n ? 0 : 1"));
+
+        for solution in ["accepted.cpp", "accepted-alt.cpp", "wrong.cpp"] {
+            let source =
+                fs::read_to_string(temporary.path().join("solutions").join(solution)).unwrap();
+            assert!(source.contains("<< '\\n';"));
+            assert!(!source.contains("<< '\\\\n';"));
         }
     }
 
