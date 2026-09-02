@@ -369,7 +369,7 @@ release can be packaged.
 ## Further documentation
 
 - [CLI 1.x automation contract](docs/cli-contract-v1.md)
-- [CLI 1.0 beta and stability gate](docs/1.0-beta.md)
+- [CLI 1.0 qualification gate](docs/1.0-beta.md)
 - [Reporch Runtime v1](docs/runtime-v1.md)
 - [Toolchain index signing and key rotation](docs/toolchain-index.md)
 - [Security policy and private reporting](SECURITY.md)
