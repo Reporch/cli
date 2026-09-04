@@ -302,6 +302,9 @@ impl VerifiedRuntimeBundleV1 {
 pub async fn verified_bundle() -> Result<VerifiedRuntimeBundleV1> {
     let root = runtime_root()?;
     let installation = read_installation(&root)?.ok_or(RuntimeError::BootstrapIncomplete)?;
+    if let Some(cached) = cached_verified_runtime_bundle(&root, &installation)? {
+        return Ok(cached);
+    }
     let verification_root = root.clone();
     let verification = installation.clone();
     let manifest = tokio::task::spawn_blocking(move || {
@@ -310,11 +313,13 @@ pub async fn verified_bundle() -> Result<VerifiedRuntimeBundleV1> {
     .await
     .context("join runtime bundle verification")??;
     let directory = bundle_directory(&root, installation.sequence, &installation.version);
-    Ok(VerifiedRuntimeBundleV1 {
+    let verified = VerifiedRuntimeBundleV1 {
         installation,
         manifest,
         directory,
-    })
+    };
+    cache_verified_runtime_bundle(&root, &verified)?;
+    Ok(verified)
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +339,12 @@ struct RegularFileFingerprint {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
 }
 
 impl RegularFileFingerprint {
@@ -355,8 +366,133 @@ impl RegularFileFingerprint {
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            uid: metadata.uid(),
+            #[cfg(unix)]
+            gid: metadata.gid(),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryFingerprint {
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+impl DirectoryFingerprint {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect cached runtime directory {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "cached runtime path is not a directory: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Self {
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            uid: metadata.uid(),
+            #[cfg(unix)]
+            gid: metadata.gid(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedRuntimeCacheEntry {
+    bundle: VerifiedRuntimeBundleV1,
+    expires_at: chrono::DateTime<Utc>,
+    directory: DirectoryFingerprint,
+    files: Vec<(PathBuf, RegularFileFingerprint)>,
+}
+
+static VERIFIED_RUNTIME_CACHE: OnceLock<Mutex<HashMap<PathBuf, VerifiedRuntimeCacheEntry>>> =
+    OnceLock::new();
+
+fn verified_runtime_cache() -> &'static Mutex<HashMap<PathBuf, VerifiedRuntimeCacheEntry>> {
+    VERIFIED_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_verified_runtime_bundle(
+    root: &Path,
+    installation: &RuntimeInstallationV1,
+) -> Result<Option<VerifiedRuntimeBundleV1>> {
+    let cached = verified_runtime_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified runtime cache lock was poisoned"))?
+        .get(root)
+        .cloned();
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    let unchanged = cached.expires_at > Utc::now()
+        && cached.bundle.installation == *installation
+        && DirectoryFingerprint::read(&cached.bundle.directory)
+            .ok()
+            .as_ref()
+            == Some(&cached.directory)
+        && cached.files.iter().all(|(path, expected)| {
+            RegularFileFingerprint::read(path).ok().as_ref() == Some(expected)
+        });
+    if unchanged {
+        return Ok(Some(cached.bundle));
+    }
+    verified_runtime_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified runtime cache lock was poisoned"))?
+        .remove(root);
+    Ok(None)
+}
+
+fn cache_verified_runtime_bundle(root: &Path, bundle: &VerifiedRuntimeBundleV1) -> Result<()> {
+    let mut paths = vec![
+        root.join("current.json"),
+        bundle.directory.join("manifest.json"),
+        bundle.directory.join("manifest.json.minisig"),
+        bundle.directory.join(".complete"),
+    ];
+    paths.extend(
+        bundle
+            .manifest
+            .artifacts
+            .iter()
+            .map(|artifact| bundle.directory.join(&artifact.file_name)),
+    );
+    let files = paths
+        .into_iter()
+        .map(|path| Ok((path.clone(), RegularFileFingerprint::read(&path)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let entry = VerifiedRuntimeCacheEntry {
+        bundle: bundle.clone(),
+        expires_at: bundle.manifest.expires_at,
+        directory: DirectoryFingerprint::read(&bundle.directory)?,
+        files,
+    };
+    verified_runtime_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified runtime cache lock was poisoned"))?
+        .insert(root.to_path_buf(), entry);
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
