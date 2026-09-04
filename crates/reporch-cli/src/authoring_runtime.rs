@@ -204,7 +204,14 @@ pub async fn run_program(request: &ProgramRequest<'_>) -> Result<LocalSandboxRes
         request.arguments,
         request.options.timeout,
     )?;
-    execute_in_toolchain(root, command, entry.image, request.options).await
+    execute_in_toolchain(
+        root,
+        command,
+        entry.image,
+        request.options,
+        language_requires_compilation(&entry.language),
+    )
+    .await
 }
 
 /// Run one trusted orchestration command inside a language toolchain VM.
@@ -230,7 +237,7 @@ pub async fn run_toolchain_command(
         .context("resolve authoring project directory")?;
     ensure!(root.is_dir(), "authoring project root is not a directory");
     let entry = checked_installed_toolchain(language, options).await?;
-    execute_in_toolchain(root, command, entry.image, options).await
+    execute_in_toolchain(root, command, entry.image, options, false).await
 }
 
 pub async fn run_linked_pair(request: &LinkedPairRequest<'_>) -> Result<LocalSandboxResult> {
@@ -259,7 +266,7 @@ pub async fn run_linked_pair(request: &LinkedPairRequest<'_>) -> Result<LocalSan
         second,
         input,
     ];
-    execute_in_toolchain(root, command, entry.image, request.options).await
+    execute_in_toolchain(root, command, entry.image, request.options, true).await
 }
 
 pub async fn run_interactive_pair(
@@ -300,7 +307,7 @@ pub async fn run_interactive_pair(
         interactor,
         input,
     ];
-    execute_in_toolchain(root, command, entry.image, request.options).await
+    execute_in_toolchain(root, command, entry.image, request.options, true).await
 }
 
 #[cfg(test)]
@@ -396,13 +403,18 @@ async fn execute_in_toolchain(
     command: Vec<String>,
     image: String,
     options: &AuthoringRunOptions,
+    allow_setup_grace: bool,
 ) -> Result<LocalSandboxResult> {
     let sandbox = LocalSandboxOptions {
         runtime: options.runtime,
         image,
         project_directory: root,
         command,
-        timeout: options.timeout.saturating_add(TOOLCHAIN_SETUP_GRACE),
+        timeout: if allow_setup_grace {
+            options.timeout.saturating_add(TOOLCHAIN_SETUP_GRACE)
+        } else {
+            options.timeout
+        },
         memory_mib: options.memory_mib,
         cpus: options.cpus,
         output_kib: options.output_kib,
@@ -586,6 +598,10 @@ fn timeout_command(timeout: Duration) -> String {
         "timeout --signal=KILL --kill-after=1s {:.3}s",
         timeout.as_secs_f64()
     )
+}
+
+fn language_requires_compilation(language: &str) -> bool {
+    matches!(language, "c" | "cpp" | "rust" | "swift" | "java" | "csharp")
 }
 
 pub fn standard_checker_matches(
