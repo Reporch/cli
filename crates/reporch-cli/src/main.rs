@@ -1919,8 +1919,12 @@ fn check_project(output: &CliOutput) -> Result<()> {
     let root = reporch_cli::local_project::discover_project(Path::new("."))?;
     if reporch_cli::local_project_v2::is_v2_project(&root)? {
         let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
-        let manifest =
-            reporch_cli::local_project_v2::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+        let manifest = reporch_cli::local_project_v2::compile_authoring_spec(
+            &root,
+            &spec,
+            Uuid::nil(),
+        )
+        .map_err(check_manifest_compile_error)?;
         let versioned = VersionedReleaseManifest::V2(Box::new(manifest.clone()));
         let issues = validate_versioned_manifest(&versioned);
         let digest = manifest.digest()?;
@@ -1978,7 +1982,8 @@ fn check_project(output: &CliOutput) -> Result<()> {
         );
     }
     let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
-    let manifest = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let manifest = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())
+        .map_err(check_manifest_compile_error)?;
     let versioned = VersionedReleaseManifest::V1(Box::new(manifest.clone()));
     let issues = validate_versioned_manifest(&versioned);
     let digest = manifest.digest()?;
@@ -2047,6 +2052,33 @@ fn check_failure_message(issues: &[ValidationIssue]) -> String {
         "\nInspect the current structure with `reporch test group list`, `reporch test case list`, and `reporch solution matrix`, then run `reporch check` again.",
     );
     message
+}
+
+fn check_manifest_compile_error(error: anyhow::Error) -> anyhow::Error {
+    let message = format!("{error:#}");
+    if !message.contains("inspect project file") && !message.contains("read project file") {
+        return error;
+    }
+    cli_output::domain_error(
+        "check.failed",
+        format!(
+            "static check could not read a declared project file: {message}\nRestore or update the referenced file. If it is only a stale inventory entry, run `reporch project prune --apply`, then run `reporch check` again."
+        ),
+        serde_json::json!({
+            "schema": "reporch.check-result.v1",
+            "valid": false,
+            "issues": [{
+                "code": "files.missing_or_unreadable",
+                "message": message,
+            }],
+            "recovery_commands": [
+                "reporch project prune --apply",
+                "reporch test case list --format json",
+                "reporch check",
+            ],
+            "next_step": "reporch project prune --apply",
+        }),
+    )
 }
 
 fn local_project_status(directory: &Path) -> Result<reporch_cli::local_project::ProjectStatusV1> {
