@@ -228,6 +228,7 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let updated =
                 reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
                     ensure_unique_test_name(spec, &options.name, None)?;
+                    let group_ids = resolve_group_ids(spec, &options.groups)?;
                     if answer.is_some() {
                         ensure_unique_test_input(
                             root,
@@ -239,7 +240,6 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
                                 .map(|test| (test.name.as_str(), test.input_file.as_str())),
                         )?;
                     }
-                    let group_ids = resolve_group_ids(spec, &options.groups)?;
                     let generated = if let Some(generator_name) = &options.generated_by {
                         let seed = options
                             .seed

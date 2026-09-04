@@ -1416,6 +1416,7 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let answer = materialized.answer.clone();
             let updated = reporch_cli::local_project::update_authoring_spec(&root, |root, spec| {
                 ensure_unique_test_name(spec, &options.name, None)?;
+                ensure_groups_exist(spec, &options.groups)?;
                 if answer.is_some() {
                     ensure_unique_test_input(
                         root,
@@ -1427,7 +1428,6 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
                             .map(|test| (test.name.as_str(), test.input_file.as_str())),
                     )?;
                 }
-                ensure_groups_exist(spec, &options.groups)?;
                 if let Some(generator) = &options.generated_by {
                     ensure!(
                         spec.judging
