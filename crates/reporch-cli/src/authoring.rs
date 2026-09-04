@@ -710,7 +710,7 @@ pub async fn verify_local(
         timeout_seconds,
         memory_mib: spec.testing.limits.memory_mib,
         cpus: 1.0,
-        output_kib: 1_024,
+        output_kib: spec.testing.limits.output_kib,
     };
     let mut run_options = runtime.clone().into_run_options(output);
     run_options.timeout = Duration::from_millis(
