@@ -918,11 +918,7 @@ async fn verify_solution_matrix(
                 } else {
                     false
                 };
-                program_execution_verdict(
-                    &result,
-                    checker_accepted,
-                    &solution.program.language,
-                )
+                program_execution_verdict(&result, checker_accepted, &solution.program.language)
             };
             cases.push(LocalSolutionCase {
                 test_id: test.id,
@@ -1116,7 +1112,11 @@ fn group_solution_checks(
                 .iter()
                 .filter(|test| test.group_ids.contains(&group.id))
                 .collect::<Vec<_>>();
-            ensure!(!tests.is_empty(), "score group has no test cases: {}", group.name);
+            ensure!(
+                !tests.is_empty(),
+                "score group has no test cases: {}",
+                group.name
+            );
             let tests_passed = tests
                 .iter()
                 .all(|test| accepted.get(&test.id) == Some(&true));
@@ -1141,9 +1141,10 @@ fn group_solution_checks(
             let group_cases = cases
                 .iter()
                 .filter(|case| {
-                    spec.testing.tests.iter().any(|test| {
-                        test.id == case.test_id && test.group_ids.contains(&group.id)
-                    })
+                    spec.testing
+                        .tests
+                        .iter()
+                        .any(|test| test.id == case.test_id && test.group_ids.contains(&group.id))
                 })
                 .collect::<Vec<_>>();
             ensure!(
@@ -4107,7 +4108,9 @@ fn parse_group_expectation(value: &str) -> Result<GroupExpectationInput, String>
     }
     let (verdict, score) = expectation
         .split_once(':')
-        .map_or((expectation, None), |(verdict, score)| (verdict, Some(score)));
+        .map_or((expectation, None), |(verdict, score)| {
+            (verdict, Some(score))
+        });
     let verdict = match verdict.trim().replace('_', "-").as_str() {
         "accepted" => Verdict::Accepted,
         "wrong-answer" => Verdict::WrongAnswer,

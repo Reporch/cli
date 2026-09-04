@@ -873,11 +873,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                     let sessions =
                         studio_remote::list_device_sessions_operation(&connection).await?;
                     let human = human_item_list("device session", &sessions.items)?;
-                    output.emit(
-                        "auth devices list",
-                        &sessions,
-                        &human,
-                    )
+                    output.emit("auth devices list", &sessions, &human)
                 }
                 AuthDevicesCommand::Revoke {
                     connection,
@@ -1749,7 +1745,10 @@ fn human_item_list<T: serde::Serialize>(singular: &str, items: &[T]) -> Result<S
             })
             .take(6)
             .collect::<Vec<_>>();
-        ensure!(!fields.is_empty(), "human list item has no displayable identity");
+        ensure!(
+            !fields.is_empty(),
+            "human list item has no displayable identity"
+        );
         lines.push(format!("- {}", fields.join(" · ")));
     }
     Ok(lines.join("\n"))
@@ -1919,12 +1918,9 @@ fn check_project(output: &CliOutput) -> Result<()> {
     let root = reporch_cli::local_project::discover_project(Path::new("."))?;
     if reporch_cli::local_project_v2::is_v2_project(&root)? {
         let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
-        let manifest = reporch_cli::local_project_v2::compile_authoring_spec(
-            &root,
-            &spec,
-            Uuid::nil(),
-        )
-        .map_err(check_manifest_compile_error)?;
+        let manifest =
+            reporch_cli::local_project_v2::compile_authoring_spec(&root, &spec, Uuid::nil())
+                .map_err(check_manifest_compile_error)?;
         let versioned = VersionedReleaseManifest::V2(Box::new(manifest.clone()));
         let issues = validate_versioned_manifest(&versioned);
         let digest = manifest.digest()?;

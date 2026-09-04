@@ -3045,11 +3045,8 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
     }
-    let actual_verdict = program_execution_verdict(
-        &result,
-        checker_accepted,
-        &solution.program.language,
-    );
+    let actual_verdict =
+        program_execution_verdict(&result, checker_accepted, &solution.program.language);
     let report = RuntimeProgramReport {
         solution: solution.program.name.clone(),
         test_id: test.id,

@@ -634,13 +634,15 @@ fn csharp_command(source: &str, input: &str, timeout: Duration) -> Vec<String> {
 }
 
 fn guarded_compiler(compiler: &str) -> String {
-    format!(
-        "if ! {compiler}; then printf '%s\\n' '{COMPILATION_FAILURE_MARKER}' >&2; exit 126; fi"
-    )
+    format!("if ! {compiler}; then printf '%s\\n' '{COMPILATION_FAILURE_MARKER}' >&2; exit 126; fi")
 }
 
 pub fn compilation_failed(result: &LocalSandboxResult) -> bool {
-    result.exit_code == 126 && result.stderr.lines().any(|line| line == COMPILATION_FAILURE_MARKER)
+    result.exit_code == 126
+        && result
+            .stderr
+            .lines()
+            .any(|line| line == COMPILATION_FAILURE_MARKER)
 }
 
 pub fn memory_limit_exceeded(
@@ -669,19 +671,14 @@ pub fn memory_limit_exceeded(
             stderr.contains("memory allocation of ") && stderr.contains(" failed")
         }
         "java" => stderr.contains("java.lang.outofmemoryerror"),
-        "csharp" | "c#" | "cs" | "dotnet" => {
-            stderr.contains("system.outofmemoryexception")
-        }
+        "csharp" | "c#" | "cs" | "dotnet" => stderr.contains("system.outofmemoryexception"),
         "python" | "python3" | "py" | "pypy" | "pypy3" => stderr
             .lines()
             .any(|line| line.trim() == "memoryerror" || line.trim().starts_with("memoryerror:")),
-        "javascript" | "js" | "node" | "nodejs" => {
-            stderr.contains("javascript heap out of memory")
-        }
+        "javascript" | "js" | "node" | "nodejs" => stderr.contains("javascript heap out of memory"),
         "php" => stderr.contains("allowed memory size of") && stderr.contains("exhausted"),
         "r" => {
-            stderr.contains("cannot allocate vector of size")
-                || stderr.contains("memory exhausted")
+            stderr.contains("cannot allocate vector of size") || stderr.contains("memory exhausted")
         }
         "swift" => stderr.contains("failed to allocate") && stderr.contains("fatal error"),
         _ => false,
@@ -689,10 +686,7 @@ pub fn memory_limit_exceeded(
 }
 
 fn timeout_command(timeout: Duration) -> String {
-    format!(
-        "timeout --kill-after=1s {:.3}s",
-        timeout.as_secs_f64()
-    )
+    format!("timeout --kill-after=1s {:.3}s", timeout.as_secs_f64())
 }
 
 fn language_requires_compilation(language: &str) -> bool {

@@ -125,7 +125,10 @@ fn scored_solution_group_expectations_round_trip_and_are_verified() {
         .output()
         .unwrap();
     assert_eq!(invalid.status.code(), Some(2), "{invalid:?}");
-    assert_eq!(before, fs::read(project.path().join("reporch.yaml")).unwrap());
+    assert_eq!(
+        before,
+        fs::read(project.path().join("reporch.yaml")).unwrap()
+    );
 
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
     let mut paths = vec![runtime.path().to_owned()];
