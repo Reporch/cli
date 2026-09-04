@@ -1183,7 +1183,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
             let mut cases = Vec::new();
             for unit in units {
                 output.progress("checker run", &format!("Checking unit {}", unit.name));
-                let (actual_accepted, exit_code, duration_ms, stderr) =
+                let (actual, passed, exit_code, duration_ms, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
@@ -1201,9 +1201,31 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                             &run_options,
                         )
                         .await?;
+                        let actual = match result.verdict {
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
+                                "accepted"
+                            }
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
+                                "rejected"
+                            }
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                                "judge_error"
+                            }
+                        };
+                        let passed = match result.verdict {
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
+                                unit.expected_accepted
+                            }
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
+                                !unit.expected_accepted
+                            }
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                                false
+                            }
+                        };
                         (
-                            result.verdict
-                                == reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted,
+                            actual,
+                            passed,
                             result.execution.exit_code,
                             result.execution.duration_ms,
                             result.execution.stderr,
@@ -1211,12 +1233,14 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                     } else {
                         let answer = read_project_bytes(&root, &unit.answer_file)?;
                         let actual = read_project_bytes(&root, &unit.output_file)?;
+                        let accepted = reporch_cli::authoring_runtime::standard_checker_matches(
+                            &spec.testing.checker.checker,
+                            &answer,
+                            &actual,
+                        )?;
                         (
-                            reporch_cli::authoring_runtime::standard_checker_matches(
-                                &spec.testing.checker.checker,
-                                &answer,
-                                &actual,
-                            )?,
+                            if accepted { "accepted" } else { "rejected" },
+                            accepted == unit.expected_accepted,
                             0,
                             0,
                             String::new(),
@@ -1230,12 +1254,8 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                     } else {
                         "rejected"
                     },
-                    actual: if actual_accepted {
-                        "accepted"
-                    } else {
-                        "rejected"
-                    },
-                    passed: actual_accepted == unit.expected_accepted,
+                    actual,
+                    passed,
                     exit_code,
                     duration_ms,
                     stderr,
