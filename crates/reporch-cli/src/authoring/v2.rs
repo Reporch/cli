@@ -95,6 +95,7 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
         StatementCommand::Check => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
             let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            reporch_cli::local_project_v2::validate_statement_documents(&root, &spec)?;
             for (locale, path) in &spec.statements {
                 let file = spec
                     .files
@@ -119,6 +120,7 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
         } => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
             let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            reporch_cli::local_project_v2::validate_statement_documents(&root, &spec)?;
             let locale = locale.unwrap_or(spec.default_locale);
             let source = spec
                 .statements

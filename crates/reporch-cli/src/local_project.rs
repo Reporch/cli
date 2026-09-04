@@ -396,6 +396,7 @@ pub fn compile_authoring_spec(
     spec: &AuthoringSpecV1,
     commit_id: Uuid,
 ) -> Result<ReleaseManifestV1> {
+    validate_statement_documents(directory, spec)?;
     let files = hash_declared_files(directory, spec)?;
     let manifest = spec
         .materialize(commit_id, files)
@@ -408,6 +409,43 @@ pub fn compile_authoring_spec(
         );
     }
     Ok(manifest)
+}
+
+pub fn validate_statement_documents(directory: &Path, spec: &AuthoringSpecV1) -> Result<()> {
+    let root = ensure_real_directory(directory)?;
+    for path in spec.statements.values() {
+        let declared = spec
+            .files
+            .iter()
+            .find(|file| file.path == *path)
+            .with_context(|| format!("Markdown document is not declared: {path}"))?;
+        ensure!(
+            declared.media_type == "text/markdown" && !declared.executable,
+            "Markdown document must be non-executable text/markdown: {path}"
+        );
+        let bytes = read_bounded_regular_file(&root.join(path), MAX_AUTHORING_SPEC_BYTES as u64)?;
+        let markdown = std::str::from_utf8(&bytes)
+            .with_context(|| format!("Markdown document is not UTF-8: {path}"))?;
+        let assets = studio_core::statement_image_paths(markdown).map_err(|issues| {
+            anyhow::anyhow!(
+                "statement Markdown is unsafe in {path}: {}",
+                issues
+                    .iter()
+                    .map(|issue| issue.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })?;
+        for asset in assets {
+            ensure!(
+                spec.files.iter().any(|file| file.path == asset),
+                "statement image asset is not declared: {asset}; add it to the project before checking or rendering"
+            );
+            hash_regular_project_file(&root, &asset)
+                .with_context(|| format!("statement image asset is missing or unsafe: {asset}"))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn migrate_legacy_project(directory: &Path) -> Result<MigrationOutcome> {
