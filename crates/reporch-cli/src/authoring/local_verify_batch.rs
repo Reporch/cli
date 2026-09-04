@@ -561,16 +561,24 @@ fn append_execution(
     output: &str,
     timeout: std::time::Duration,
 ) -> Result<()> {
+    script.push_str("timeout_marker=/run/reporch/batch-timeout.$$\nrm -f \"$timeout_marker\"\n");
+    writeln!(
+        script,
+        "(sleep {:.3}; : > \"$timeout_marker\") & timeout_marker_pid=$!",
+        timeout.as_secs_f64(),
+    )?;
     script.push_str("set +e\n");
     let input = input
         .map(|path| format!(" < {}", shell_quote(path)))
         .unwrap_or_default();
     writeln!(
         script,
-        "timeout --signal=KILL --kill-after=1s {:.3}s {command}{input} > \"{output}\" 2> \"$err\"",
+        "timeout --kill-after=1s {:.3}s {command}{input} > \"{output}\" 2> \"$err\"",
         timeout.as_secs_f64(),
     )?;
-    script.push_str("status=$?\nset -e\n");
+    script.push_str(
+        "status=$?\nsleep 0.02\nif kill -0 \"$timeout_marker_pid\" 2>/dev/null; then kill \"$timeout_marker_pid\" 2>/dev/null || true; fi\nwait \"$timeout_marker_pid\" 2>/dev/null || true\nif [ -f \"$timeout_marker\" ]; then status=124; rm -f \"$timeout_marker\"; fi\nset -e\n",
+    );
     Ok(())
 }
 

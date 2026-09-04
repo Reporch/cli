@@ -261,8 +261,12 @@ pub async fn run_linked_pair(request: &LinkedPairRequest<'_>) -> Result<LocalSan
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; first=$1; second=$2; input=$3; {compiler}; exec {} /run/reporch/program < \"$input\"",
-            timeout_command(request.options.timeout)
+            "set -eu; first=$1; second=$2; input=$3; {compiler}; {}",
+            workload_command(
+                "/run/reporch/program",
+                Some("\"$input\""),
+                request.options.timeout,
+            )
         ),
         "reporch".into(),
         first,
@@ -394,15 +398,13 @@ if [ "$interactor_status" -eq 42 ]; then exit 0; fi
 if [ "$interactor_status" -eq 43 ]; then exit 1; fi
 exit 2
 REPORCH_INTERACTIVE
-set +e
-{timeout_command} bash /run/reporch/interactive-run.sh "$input" "$idle_timeout"
-status=$?
-if [ "$status" -eq 0 ]; then exit 0; fi
-if [ "$status" -eq 1 ]; then exit 1; fi
-if [ "$status" -eq 124 ]; then exit 124; fi
-exit 2
+{interactive_workload}
 "#,
-        timeout_command = timeout_command(timeout),
+        interactive_workload = workload_command(
+            "bash /run/reporch/interactive-run.sh \"$input\" \"$idle_timeout\"",
+            None,
+            timeout,
+        ),
         idle_timeout = idle_timeout.as_secs_f64(),
     )
 }
@@ -562,9 +564,8 @@ fn interpreted_command(
         "sh".into(),
         "-c".into(),
         format!(
-            "input=$1; shift; if [ \"$input\" != - ]; then exec {} \"$@\" < \"$input\"; else exec {} \"$@\"; fi",
-            timeout_command(timeout),
-            timeout_command(timeout)
+            "set -eu; input=$1; shift; {}",
+            workload_command("\"$@\"", Some("\"$input\""), timeout)
         ),
         "reporch".into(),
         input.into(),
@@ -579,8 +580,8 @@ fn compiled_command(compiler: &str, source: &str, input: &str, timeout: Duration
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; src=$1; input=$2; shift 2; {compiler}; if [ \"$input\" != - ]; then exec {timeout_command} /run/reporch/program \"$@\" < \"$input\"; else exec {timeout_command} /run/reporch/program \"$@\"; fi",
-            timeout_command = timeout_command(timeout)
+            "set -eu; src=$1; input=$2; shift 2; {compiler}; {}",
+            workload_command("/run/reporch/program \"$@\"", Some("\"$input\""), timeout,)
         ),
         "reporch".into(),
         source.into(),
@@ -606,8 +607,12 @@ fn java_command(source: &str, input: &str, timeout: Duration) -> Result<Vec<Stri
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; src=$1; input=$2; class=$3; shift 3; mkdir -p /run/reporch/classes; {compiler}; if [ \"$input\" != - ]; then exec {timeout_command} java -cp /run/reporch/classes \"$class\" \"$@\" < \"$input\"; else exec {timeout_command} java -cp /run/reporch/classes \"$class\" \"$@\"; fi",
-            timeout_command = timeout_command(timeout)
+            "set -eu; src=$1; input=$2; class=$3; shift 3; mkdir -p /run/reporch/classes; {compiler}; {}",
+            workload_command(
+                "java -cp /run/reporch/classes \"$class\" \"$@\"",
+                Some("\"$input\""),
+                timeout,
+            )
         ),
         "reporch".into(),
         source.into(),
@@ -624,8 +629,12 @@ fn csharp_command(source: &str, input: &str, timeout: Duration) -> Vec<String> {
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; src=$1; input=$2; shift 2; mkdir -p /run/reporch/app; printf '%s\n' '<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>' > /run/reporch/app/app.csproj; cp \"$src\" /run/reporch/app/Program.cs; {compiler}; if [ \"$input\" != - ]; then exec {timeout_command} dotnet /run/reporch/out/app.dll \"$@\" < \"$input\"; else exec {timeout_command} dotnet /run/reporch/out/app.dll \"$@\"; fi",
-            timeout_command = timeout_command(timeout)
+            "set -eu; src=$1; input=$2; shift 2; mkdir -p /run/reporch/app; printf '%s\n' '<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>' > /run/reporch/app/app.csproj; cp \"$src\" /run/reporch/app/Program.cs; {compiler}; {}",
+            workload_command(
+                "dotnet /run/reporch/out/app.dll \"$@\"",
+                Some("\"$input\""),
+                timeout,
+            )
         ),
         "reporch".into(),
         source.into(),
@@ -687,6 +696,36 @@ pub fn memory_limit_exceeded(
 
 fn timeout_command(timeout: Duration) -> String {
     format!("timeout --kill-after=1s {:.3}s", timeout.as_secs_f64())
+}
+
+/// Run an authored workload behind a marker that is independent of the
+/// toolchain's `timeout` implementation. Some minimal Linux toolchains replace
+/// themselves with the child and surface SIGTERM/SIGKILL instead of exit 124;
+/// the marker keeps that real timeout distinct from a program that crashes on
+/// its own. Compilation happens before this fragment, so build failures can
+/// never consume the runtime budget or satisfy a TLE expectation.
+fn workload_command(command: &str, input: Option<&str>, timeout: Duration) -> String {
+    let invocation = input.map_or_else(
+        || command.to_owned(),
+        |path| {
+            let body = format!(
+                "input=$1; shift; if [ \"$input\" != - ]; then {command} < {path}; else {command}; fi"
+            );
+            format!(
+                "sh -c {} reporch \"$input\" \"$@\"",
+                shell_single_quote(&body)
+            )
+        },
+    );
+    format!(
+        "timeout_marker=/run/reporch/workload-timeout.$$; rm -f \"$timeout_marker\"; (sleep {seconds:.3}; : > \"$timeout_marker\") & timeout_marker_pid=$!; set +e; {timeout_command} {invocation}; status=$?; set -e; sleep 0.02; if kill -0 \"$timeout_marker_pid\" 2>/dev/null; then kill \"$timeout_marker_pid\" 2>/dev/null || true; fi; wait \"$timeout_marker_pid\" 2>/dev/null || true; if [ -f \"$timeout_marker\" ]; then rm -f \"$timeout_marker\"; exit 124; fi; exit \"$status\"",
+        seconds = timeout.as_secs_f64(),
+        timeout_command = timeout_command(timeout),
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn language_requires_compilation(language: &str) -> bool {
@@ -801,7 +840,7 @@ mod checker_protocol_tests {
         let script = interactive_pair_script("compile solver", "compile interactor");
         assert!(script.contains("interactor_status\" -eq 42 ]; then exit 0"));
         assert!(script.contains("interactor_status\" -eq 43 ]; then exit 1"));
-        assert!(script.ends_with("exit 2\n"));
+        assert!(script.contains("exit 2\nREPORCH_INTERACTIVE"));
         assert!(!script.contains("interactor_status\" -ne 0"));
     }
 
@@ -827,6 +866,9 @@ mod checker_protocol_tests {
         let command = timeout_command(Duration::from_secs(1));
         assert_eq!(command, "timeout --kill-after=1s 1.000s");
         assert!(!command.contains("--signal=KILL"));
+        let command = workload_command("/run/reporch/program", None, Duration::from_secs(1));
+        assert!(command.contains("workload-timeout.$$"));
+        assert!(command.contains("exit 124"));
     }
 
     #[test]
