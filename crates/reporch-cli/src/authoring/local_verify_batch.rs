@@ -88,7 +88,7 @@ pub(super) async fn try_verify(
     let programs = generator_targets
         .iter()
         .map(|target| &target.generator.program)
-        .chain(validators.iter().map(|program| *program))
+        .chain(validators.iter().copied())
         .chain(
             spec.testing
                 .solutions
@@ -286,12 +286,12 @@ pub(super) async fn try_verify(
         }
     }
     let mut command = vec!["bash".to_owned(), format!("/workspace/{script_relative}")];
-    command.extend(inputs.into_iter());
+    command.extend(inputs);
     let mut batch_options = options.clone();
     batch_options.timeout = std::time::Duration::from_millis(total_timeout_ms as u64);
     output.progress(
         "verify",
-        &format!("Running {jobs} validator/solution case(s) in one VM"),
+        &format!("Running {jobs} generator/validator/solution check(s) in one VM"),
     );
     let execution = reporch_cli::authoring_runtime::run_toolchain_command(
         root,

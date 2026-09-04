@@ -1699,6 +1699,9 @@ struct StressCandidateResult {
     passed: bool,
 }
 
+type StressMismatch = (u64, Vec<u8>, Vec<u8>, Vec<u8>);
+type StressMismatchMap = std::collections::BTreeMap<Uuid, StressMismatch>;
+
 pub(super) async fn stress(options: StressOptions, output: &CliOutput) -> Result<()> {
     match options.command {
         StressCommand::List => {
@@ -1877,8 +1880,7 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
     {
         return emit_stress_results(&root, &suite, &candidates, first_mismatch, output);
     }
-    let mut first_mismatch =
-        std::collections::BTreeMap::<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>::new();
+    let mut first_mismatch = StressMismatchMap::new();
     let mut last_progress = std::time::Instant::now();
     for ordinal in 0..suite.cases {
         let seed = suite
@@ -1975,7 +1977,7 @@ fn emit_stress_results(
     root: &Path,
     suite: &StressSuiteSpecV2,
     candidates: &[&SolutionSpecV2],
-    mut first_mismatch: std::collections::BTreeMap<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    mut first_mismatch: StressMismatchMap,
     output: &CliOutput,
 ) -> Result<()> {
     let mut results = Vec::new();
@@ -1987,10 +1989,10 @@ fn emit_stress_results(
         let (counterexample_seed, input_path, counterexample_sha256) =
             if let Some((seed, input, oracle, actual)) = mismatch {
                 let base = format!("stress-failures/{}-{seed}", suite.name);
-                write_project_bytes_once_or_same(&root, &format!("{base}.in"), &input)?;
-                write_project_bytes_once_or_same(&root, &format!("{base}.oracle"), &oracle)?;
+                write_project_bytes_once_or_same(root, &format!("{base}.in"), &input)?;
+                write_project_bytes_once_or_same(root, &format!("{base}.oracle"), &oracle)?;
                 write_project_bytes_once_or_same(
-                    &root,
+                    root,
                     &format!("{base}.{}.out", candidate.program.name),
                     &actual,
                 )?;
@@ -2039,7 +2041,7 @@ async fn try_run_stress_batch(
     checker: &CheckerSpec,
     options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
     output: &CliOutput,
-) -> Result<Option<std::collections::BTreeMap<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>>> {
+) -> Result<Option<StressMismatchMap>> {
     if options.runtime != reporch_cli::local_sandbox::OciRuntime::Auto
         && std::env::var_os("REPORCH_DEBUG_ENABLE_STRESS_BATCH").is_none()
     {
