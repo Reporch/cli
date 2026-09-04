@@ -106,7 +106,10 @@ export function resolveBinary({
   const binaryDirectory = join(dirname(packageJson), "bin");
   const binary = join(binaryDirectory, binaryName);
   if (!existsSync(binary)) {
-    throw new Error(`The platform package ${packageName} does not contain ${binaryName}.`);
+    throw new PlatformPackageMissingError(
+      packageName,
+      new Error(`the installed platform package does not contain ${binaryName}`)
+    );
   }
   const expectedSha256 = checksums[packageName];
   verifyBinary(binary, expectedSha256);
