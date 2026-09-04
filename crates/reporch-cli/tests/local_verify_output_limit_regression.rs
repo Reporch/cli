@@ -67,19 +67,17 @@ fn local_verify_honors_the_authored_output_limit() {
         .output()
         .unwrap();
     assert!(initialized.status.success(), "{initialized:?}");
-    for name in ["accepted-alt"] {
-        let removed = reporch()
-            .args([
-                "--cwd",
-                project.path().to_str().unwrap(),
-                "solution",
-                "remove",
-                name,
-            ])
-            .output()
-            .unwrap();
-        assert!(removed.status.success(), "{removed:?}");
-    }
+    let removed = reporch()
+        .args([
+            "--cwd",
+            project.path().to_str().unwrap(),
+            "solution",
+            "remove",
+            "accepted-alt",
+        ])
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{removed:?}");
 
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
     let mut paths = vec![runtime.path().to_owned()];
