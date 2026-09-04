@@ -1,6 +1,6 @@
 [package]
 name = "reporch-runtime-host"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
