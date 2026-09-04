@@ -2966,7 +2966,7 @@ fn materialize_statement_file(
                 .filter(|value| !value.is_empty())
                 .unwrap_or("Problem statement");
             let starter = format!(
-                "# {heading}\n\n<!-- Locale: {locale} -->\n\n## Description\n\nWrite the problem description here.\n\n## Input\n\nDescribe the input format.\n\n## Output\n\nDescribe the output format.\n"
+                "# {heading}\n\n*Locale: {locale}*\n\n## Description\n\nWrite the problem description here.\n\n## Input\n\nDescribe the input format.\n\n## Output\n\nDescribe the output format.\n"
             );
             write_project_bytes_atomic(root, relative, starter.as_bytes())?;
             Ok(Some(destination))
