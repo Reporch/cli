@@ -714,46 +714,22 @@ pub async fn verify_local(
     };
     let run_options = runtime.clone().into_run_options(output);
 
-    let generator_checks = verify_generators(&root, &spec, &run_options).await?;
     let batch = local_verify_batch::try_verify(&root, &spec, &run_options, output).await?;
-    let (validator_units, checker_units, solutions, output_submissions) = if let Some(batch) = batch
-    {
-        (
-            batch.validator_units,
-            batch.checker_units,
-            batch.solutions,
-            0,
-        )
-    } else {
-        if !spec.testing.validators.unit_tests.is_empty() {
-            v2::validator(
-                ValidatorOptions {
-                    command: ValidatorCommand::Run {
-                        name: None,
-                        runtime: runtime.clone(),
-                    },
-                },
-                &silent,
+    let (generator_checks, validator_units, checker_units, solutions, output_submissions) =
+        if let Some(batch) = batch {
+            (
+                batch.generator_checks,
+                batch.validator_units,
+                batch.checker_units,
+                batch.solutions,
+                0,
             )
-            .await?;
-        }
-        if !spec.testing.checker.unit_tests.is_empty() {
-            v2::checker(
-                CheckerOptions {
-                    command: CheckerCommand::Run {
-                        name: None,
-                        runtime: runtime.clone(),
-                    },
-                },
-                &silent,
-            )
-            .await?;
-        }
-        let (solutions, output_submissions) =
-            if spec.problem_type == studio_core::ProblemType::OutputOnly {
-                v2::output_submission(
-                    OutputOptions {
-                        command: OutputCommand::Test {
+        } else {
+            let generator_checks = verify_generators(&root, &spec, &run_options).await?;
+            if !spec.testing.validators.unit_tests.is_empty() {
+                v2::validator(
+                    ValidatorOptions {
+                        command: ValidatorCommand::Run {
                             name: None,
                             runtime: runtime.clone(),
                         },
@@ -761,17 +737,43 @@ pub async fn verify_local(
                     &silent,
                 )
                 .await?;
-                (Vec::new(), spec.output_submissions.len())
-            } else {
-                (verify_solution_matrix(&root, &spec, &run_options).await?, 0)
-            };
-        (
-            spec.testing.validators.unit_tests.len(),
-            spec.testing.checker.unit_tests.len(),
-            solutions,
-            output_submissions,
-        )
-    };
+            }
+            if !spec.testing.checker.unit_tests.is_empty() {
+                v2::checker(
+                    CheckerOptions {
+                        command: CheckerCommand::Run {
+                            name: None,
+                            runtime: runtime.clone(),
+                        },
+                    },
+                    &silent,
+                )
+                .await?;
+            }
+            let (solutions, output_submissions) =
+                if spec.problem_type == studio_core::ProblemType::OutputOnly {
+                    v2::output_submission(
+                        OutputOptions {
+                            command: OutputCommand::Test {
+                                name: None,
+                                runtime: runtime.clone(),
+                            },
+                        },
+                        &silent,
+                    )
+                    .await?;
+                    (Vec::new(), spec.output_submissions.len())
+                } else {
+                    (verify_solution_matrix(&root, &spec, &run_options).await?, 0)
+                };
+            (
+                generator_checks,
+                spec.testing.validators.unit_tests.len(),
+                spec.testing.checker.unit_tests.len(),
+                solutions,
+                output_submissions,
+            )
+        };
     let report = LocalVerifyReport {
         schema: "reporch.local-verification.v1",
         evidence: "local_preflight_only",

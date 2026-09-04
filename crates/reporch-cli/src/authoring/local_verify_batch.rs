@@ -8,9 +8,17 @@ use base64::Engine as _;
 use super::*;
 
 pub(super) struct BatchVerifyResult {
+    pub(super) generator_checks: Vec<LocalGeneratorCheck>,
     pub(super) validator_units: usize,
     pub(super) checker_units: usize,
     pub(super) solutions: Vec<LocalSolutionCheck>,
+}
+
+struct GeneratorTarget<'a> {
+    generator: &'a studio_core::GeneratorSpecV2,
+    recipe: &'a studio_core::GeneratorRecipeSpecV2,
+    seed: u64,
+    expected_path: Option<&'a str>,
 }
 
 pub(super) async fn try_verify(
@@ -33,6 +41,43 @@ pub(super) async fn try_verify(
     ) {
         return Ok(None);
     }
+    let mut generator_targets = Vec::new();
+    let mut covered_recipes = std::collections::BTreeSet::new();
+    for test in &spec.testing.tests {
+        let Some(generated) = &test.generated else {
+            continue;
+        };
+        let generator = spec
+            .testing
+            .generators
+            .iter()
+            .find(|generator| generator.program.id == generated.generator_id)
+            .context("generated test references a missing generator")?;
+        let recipe = generator
+            .recipes
+            .iter()
+            .find(|recipe| recipe.id == generated.recipe_id)
+            .context("generated test references a missing recipe")?;
+        generator_targets.push(GeneratorTarget {
+            generator,
+            recipe,
+            seed: generated.seed,
+            expected_path: Some(&test.input_file),
+        });
+        covered_recipes.insert((generator.program.id, recipe.id));
+    }
+    for generator in &spec.testing.generators {
+        for recipe in &generator.recipes {
+            if !covered_recipes.contains(&(generator.program.id, recipe.id)) {
+                generator_targets.push(GeneratorTarget {
+                    generator,
+                    recipe,
+                    seed: recipe.seed_start,
+                    expected_path: None,
+                });
+            }
+        }
+    }
     let validators = spec
         .testing
         .validators
@@ -40,9 +85,10 @@ pub(super) async fn try_verify(
         .iter()
         .chain(spec.testing.validators.extra.iter())
         .collect::<Vec<_>>();
-    let programs = validators
+    let programs = generator_targets
         .iter()
-        .map(|program| *program)
+        .map(|target| &target.generator.program)
+        .chain(validators.iter().map(|program| *program))
         .chain(
             spec.testing
                 .solutions
@@ -71,15 +117,17 @@ pub(super) async fn try_verify(
             return Ok(None);
         }
     }
-    let jobs = validators
-        .len()
-        .saturating_mul(spec.testing.validators.unit_tests.len())
-        .saturating_add(
-            spec.testing
-                .solutions
-                .len()
-                .saturating_mul(spec.testing.tests.len()),
-        );
+    let jobs = generator_targets.len().saturating_mul(2).saturating_add(
+        validators
+            .len()
+            .saturating_mul(spec.testing.validators.unit_tests.len())
+            .saturating_add(
+                spec.testing
+                    .solutions
+                    .len()
+                    .saturating_mul(spec.testing.tests.len()),
+            ),
+    );
     let total_timeout_ms = options
         .timeout
         .as_millis()
@@ -98,6 +146,16 @@ pub(super) async fn try_verify(
         .suffix(".sh")
         .tempfile_in(&scratch_parent)?;
     let mut script = String::from("#!/bin/sh\nset -eu\nb64() { base64 < \"$1\" | tr -d '\\n'; }\n");
+    let mut generator_commands = std::collections::BTreeMap::new();
+    for target in &generator_targets {
+        if generator_commands.contains_key(&target.generator.program.id) {
+            continue;
+        }
+        let label = format!("generator-{}", generator_commands.len());
+        let (setup, command) = program_shell(&language, &label, &target.generator.program)?;
+        script.push_str(&setup);
+        generator_commands.insert(target.generator.program.id, command);
+    }
     let mut validator_commands = Vec::new();
     for (index, validator) in validators.iter().enumerate() {
         let (setup, command) = program_shell(&language, &format!("validator-{index}"), validator)?;
@@ -111,6 +169,52 @@ pub(super) async fn try_verify(
         script.push_str(&setup);
         solution_commands.push(command);
     }
+    for (target_index, target) in generator_targets.iter().enumerate() {
+        let base_command = generator_commands
+            .get(&target.generator.program.id)
+            .context("generator batch command is missing")?;
+        let recipe_arguments = target
+            .recipe
+            .argument_template
+            .iter()
+            .map(|argument| shell_quote(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = format!(
+            "{base_command}{} {}",
+            if recipe_arguments.is_empty() {
+                String::new()
+            } else {
+                format!(" {recipe_arguments}")
+            },
+            target.seed
+        );
+        writeln!(
+            &mut script,
+            "out=/run/reporch/generator-{target_index}.out; repeat=/run/reporch/generator-{target_index}.repeat; err=/run/reporch/generator-{target_index}.err"
+        )?;
+        append_execution(&mut script, &command, None, "$out", options.timeout)?;
+        script.push_str("first_status=$status\n");
+        append_execution(&mut script, &command, None, "$repeat", options.timeout)?;
+        script.push_str("second_status=$status\nactual=matched; termination=exited\n");
+        script.push_str("if [ \"$first_status\" -eq 124 ] || [ \"$second_status\" -eq 124 ]; then actual=timed_out; termination=timed_out\n");
+        script.push_str("elif [ \"$first_status\" -ne 0 ] || [ \"$second_status\" -ne 0 ]; then actual=runtime_error\n");
+        script.push_str("elif ! cmp -s \"$out\" \"$repeat\"; then actual=nondeterministic\n");
+        if let Some(expected) = target.expected_path {
+            let expected = guest_path(root, expected)?;
+            writeln!(
+                &mut script,
+                "elif ! cmp -s {} \"$out\"; then actual=mismatch",
+                shell_quote(&expected)
+            )?;
+        }
+        script.push_str("fi\n");
+        writeln!(
+            &mut script,
+            "printf 'G\\t{target_index}\\t0\\t%s\\t%s\\t%s\\t' \"$actual\" \"$first_status\" \"$termination\""
+        )?;
+        script.push_str("b64 \"$out\"; printf '\\t'; b64 \"$err\"; printf '\\n'\n");
+    }
     for (validator_index, command) in validator_commands.iter().enumerate() {
         for (unit_index, unit) in spec.testing.validators.unit_tests.iter().enumerate() {
             let input = guest_path(root, &unit.input_file)?;
@@ -118,7 +222,7 @@ pub(super) async fn try_verify(
                 &mut script,
                 "out=/run/reporch/validator-{validator_index}-{unit_index}.out; err=/run/reporch/validator-{validator_index}-{unit_index}.err"
             )?;
-            append_execution(&mut script, command, &input, options.timeout)?;
+            append_execution(&mut script, command, Some(&input), "$out", options.timeout)?;
             script.push_str("actual=invalid; termination=exited\n");
             script.push_str("if [ \"$status\" -eq 0 ]; then actual=valid; fi\n");
             script.push_str(
@@ -143,7 +247,7 @@ pub(super) async fn try_verify(
                 &mut script,
                 "out=/run/reporch/solution-{solution_index}-{test_index}.out; err=/run/reporch/solution-{solution_index}-{test_index}.err"
             )?;
-            append_execution(&mut script, command, &input, options.timeout)?;
+            append_execution(&mut script, command, Some(&input), "$out", options.timeout)?;
             script.push_str("actual=runtime_error; termination=exited\n");
             script.push_str(
                 "if [ \"$status\" -eq 124 ]; then actual=time_limit; termination=timed_out\n",
@@ -210,6 +314,7 @@ pub(super) async fn try_verify(
         ));
     }
 
+    let mut generator_checks = Vec::new();
     let mut validator_results = Vec::new();
     let mut solution_cases = (0..spec.testing.solutions.len())
         .map(|_| Vec::new())
@@ -226,9 +331,29 @@ pub(super) async fn try_verify(
         let case_index = fields[2].parse::<usize>().context("parse result case")?;
         let exit_code = fields[4].parse::<i32>().context("parse result exit code")?;
         let termination = parse_termination(fields[5])?;
-        let stdout = decode_text(fields[6])?;
+        let stdout_bytes = decode_bytes(fields[6])?;
+        let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let stderr = decode_text(fields[7])?;
         match fields[0] {
+            "G" => {
+                let target = generator_targets
+                    .get(owner)
+                    .context("generator result index is out of range")?;
+                let expected_sha256 = target
+                    .expected_path
+                    .map(|path| read_project_bytes(root, path))
+                    .transpose()?
+                    .map(|bytes| hex::encode(Sha256::digest(bytes)));
+                generator_checks.push(LocalGeneratorCheck {
+                    generator: target.generator.program.name.clone(),
+                    recipe: target.recipe.name.clone(),
+                    seed: target.seed,
+                    expected_sha256,
+                    actual_sha256: hex::encode(Sha256::digest(&stdout_bytes)),
+                    passed: fields[3] == "matched"
+                        && termination == reporch_runtime_core::GuestTerminationV2::Exited,
+                });
+            }
             "V" => {
                 let validator = validators
                     .get(owner)
@@ -284,6 +409,10 @@ pub(super) async fn try_verify(
         }
     }
     ensure!(completed, "local verification result is incomplete");
+    ensure!(
+        generator_checks.len() == generator_targets.len(),
+        "local verification omitted a generator check"
+    );
     if !validator_results.is_empty() {
         let silent = CliOutput::new(
             crate::cli_output::OutputFormat::Human,
@@ -315,6 +444,7 @@ pub(super) async fn try_verify(
         });
     }
     Ok(Some(BatchVerifyResult {
+        generator_checks,
         validator_units: spec.testing.validators.unit_tests.len(),
         checker_units: spec.testing.checker.unit_tests.len(),
         solutions,
@@ -409,15 +539,18 @@ fn program_shell(
 fn append_execution(
     script: &mut String,
     command: &str,
-    input: &str,
+    input: Option<&str>,
+    output: &str,
     timeout: std::time::Duration,
 ) -> Result<()> {
     script.push_str("set +e\n");
+    let input = input
+        .map(|path| format!(" < {}", shell_quote(path)))
+        .unwrap_or_default();
     writeln!(
         script,
-        "timeout --signal=KILL --kill-after=1s {:.3}s {command} < {} > \"$out\" 2> \"$err\"",
+        "timeout --signal=KILL --kill-after=1s {:.3}s {command}{input} > \"{output}\" 2> \"$err\"",
         timeout.as_secs_f64(),
-        shell_quote(input)
     )?;
     script.push_str("status=$?\nset -e\n");
     Ok(())
@@ -448,10 +581,13 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn decode_text(value: &str) -> Result<String> {
-    let bytes = base64::engine::general_purpose::STANDARD
+    Ok(String::from_utf8_lossy(&decode_bytes(value)?).into_owned())
+}
+
+fn decode_bytes(value: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
         .decode(value)
-        .context("decode local verification output")?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+        .context("decode local verification output")
 }
 
 fn parse_termination(value: &str) -> Result<reporch_runtime_core::GuestTerminationV2> {
