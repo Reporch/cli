@@ -276,6 +276,7 @@ pub fn validate_statement_documents(directory: &Path, spec: &AuthoringSpecV2) ->
             declared.media_type == "text/markdown" && !declared.executable,
             "Markdown document must be non-executable text/markdown: {path}"
         );
+        hash_regular_project_file(&root, path)?;
         let bytes = read_bounded_regular_file(&root.join(path), MAX_AUTHORING_SPEC_BYTES as u64)?;
         let markdown = std::str::from_utf8(&bytes)
             .with_context(|| format!("Markdown document is not UTF-8: {path}"))?;

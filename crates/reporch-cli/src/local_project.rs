@@ -423,6 +423,7 @@ pub fn validate_statement_documents(directory: &Path, spec: &AuthoringSpecV1) ->
             declared.media_type == "text/markdown" && !declared.executable,
             "Markdown document must be non-executable text/markdown: {path}"
         );
+        hash_regular_project_file(&root, path)?;
         let bytes = read_bounded_regular_file(&root.join(path), MAX_AUTHORING_SPEC_BYTES as u64)?;
         let markdown = std::str::from_utf8(&bytes)
             .with_context(|| format!("Markdown document is not UTF-8: {path}"))?;
@@ -552,7 +553,7 @@ pub(crate) fn hash_regular_project_file(root: &Path, relative_path: &str) -> Res
         .with_context(|| format!("inspect project file {relative_path}"))?;
     ensure!(
         metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-        "project file is not a regular file: {relative_path}"
+        "project file is not a regular file (a non-symlink is required): {relative_path}"
     );
     let canonical = fs::canonicalize(&source)
         .with_context(|| format!("resolve project file {relative_path}"))?;
