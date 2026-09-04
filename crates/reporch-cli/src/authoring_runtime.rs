@@ -111,7 +111,11 @@ pub async fn run_custom_checker(
         options,
     })
     .await?;
-    let verdict = custom_checker_verdict(protocol, execution.exit_code);
+    let verdict = if execution.termination == reporch_runtime_core::GuestTerminationV2::Exited {
+        custom_checker_verdict(protocol, execution.exit_code)
+    } else {
+        CustomCheckerVerdict::JudgeError
+    };
     Ok(CustomCheckerResult { verdict, execution })
 }
 

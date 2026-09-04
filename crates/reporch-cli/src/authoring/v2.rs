@@ -1011,7 +1011,9 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                         },
                     )
                     .await?;
-                    let actual_valid = result.exit_code == 0;
+                    let exited =
+                        result.termination == reporch_runtime_core::GuestTerminationV2::Exited;
+                    let actual_valid = exited && result.exit_code == 0;
                     cases.push(ProgramUnitResult {
                         program: validator.name.clone(),
                         name: unit.name.clone(),
@@ -1020,9 +1022,14 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                         } else {
                             "invalid"
                         },
-                        actual: if actual_valid { "valid" } else { "invalid" },
-                        passed: actual_valid == unit.expected_valid,
+                        actual: if exited {
+                            if actual_valid { "valid" } else { "invalid" }
+                        } else {
+                            termination_name(result.termination)
+                        },
+                        passed: exited && actual_valid == unit.expected_valid,
                         exit_code: result.exit_code,
+                        termination: result.termination,
                         duration_ms: result.duration_ms,
                         stderr: result.stderr,
                     });
@@ -1183,7 +1190,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
             let mut cases = Vec::new();
             for unit in units {
                 output.progress("checker run", &format!("Checking unit {}", unit.name));
-                let (actual, passed, exit_code, duration_ms, stderr) =
+                let (actual, passed, exit_code, termination, duration_ms, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
@@ -1201,18 +1208,24 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                             &run_options,
                         )
                         .await?;
-                        let actual = match result.verdict {
-                            reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
-                                "accepted"
+                        let exited = result.execution.termination
+                            == reporch_runtime_core::GuestTerminationV2::Exited;
+                        let actual = if exited {
+                            match result.verdict {
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
+                                    "accepted"
+                                }
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
+                                    "rejected"
+                                }
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                                    "judge_error"
+                                }
                             }
-                            reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
-                                "rejected"
-                            }
-                            reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
-                                "judge_error"
-                            }
+                        } else {
+                            termination_name(result.execution.termination)
                         };
-                        let passed = match result.verdict {
+                        let passed = exited && match result.verdict {
                             reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
                                 unit.expected_accepted
                             }
@@ -1227,6 +1240,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                             actual,
                             passed,
                             result.execution.exit_code,
+                            result.execution.termination,
                             result.execution.duration_ms,
                             result.execution.stderr,
                         )
@@ -1242,6 +1256,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                             if accepted { "accepted" } else { "rejected" },
                             accepted == unit.expected_accepted,
                             0,
+                            reporch_runtime_core::GuestTerminationV2::Exited,
                             0,
                             String::new(),
                         )
@@ -1257,6 +1272,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                     actual,
                     passed,
                     exit_code,
+                    termination,
                     duration_ms,
                     stderr,
                 });

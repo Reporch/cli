@@ -1622,7 +1622,9 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                         },
                     )
                     .await?;
-                    let actual_valid = result.exit_code == 0;
+                    let exited =
+                        result.termination == reporch_runtime_core::GuestTerminationV2::Exited;
+                    let actual_valid = exited && result.exit_code == 0;
                     cases.push(ProgramUnitResult {
                         program: validator.id.clone(),
                         name: unit.name.clone(),
@@ -1631,9 +1633,14 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                         } else {
                             "invalid"
                         },
-                        actual: if actual_valid { "valid" } else { "invalid" },
-                        passed: actual_valid == unit.expected_valid,
+                        actual: if exited {
+                            if actual_valid { "valid" } else { "invalid" }
+                        } else {
+                            termination_name(result.termination)
+                        },
+                        passed: exited && actual_valid == unit.expected_valid,
                         exit_code: result.exit_code,
+                        termination: result.termination,
                         duration_ms: result.duration_ms,
                         stderr: result.stderr,
                     });
@@ -1782,7 +1789,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
             let mut cases = Vec::new();
             for unit in units {
                 output.progress("checker run", &format!("Checking unit {}", unit.name));
-                let (actual, passed, exit_code, duration_ms, stderr) =
+                let (actual, passed, exit_code, termination, duration_ms, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
@@ -1800,18 +1807,24 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                             &run_options,
                         )
                         .await?;
-                        let actual = match result.verdict {
-                            reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
-                                "accepted"
+                        let exited = result.execution.termination
+                            == reporch_runtime_core::GuestTerminationV2::Exited;
+                        let actual = if exited {
+                            match result.verdict {
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
+                                    "accepted"
+                                }
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
+                                    "rejected"
+                                }
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                                    "judge_error"
+                                }
                             }
-                            reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
-                                "rejected"
-                            }
-                            reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
-                                "judge_error"
-                            }
+                        } else {
+                            termination_name(result.execution.termination)
                         };
-                        let passed = match result.verdict {
+                        let passed = exited && match result.verdict {
                             reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
                                 unit.expected_accepted
                             }
@@ -1826,6 +1839,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                             actual,
                             passed,
                             result.execution.exit_code,
+                            result.execution.termination,
                             result.execution.duration_ms,
                             result.execution.stderr,
                         )
@@ -1841,6 +1855,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                             if accepted { "accepted" } else { "rejected" },
                             accepted == unit.expected_accepted,
                             0,
+                            reporch_runtime_core::GuestTerminationV2::Exited,
                             0,
                             String::new(),
                         )
@@ -1856,6 +1871,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                     actual,
                     passed,
                     exit_code,
+                    termination,
                     duration_ms,
                     stderr,
                 });
@@ -2678,6 +2694,7 @@ struct ProgramUnitResult {
     actual: &'static str,
     passed: bool,
     exit_code: i32,
+    termination: reporch_runtime_core::GuestTerminationV2,
     duration_ms: u128,
     stderr: String,
 }
@@ -2691,6 +2708,28 @@ fn emit_unit_report(
         passed: cases.iter().all(|case| case.passed),
         cases,
     };
+    if report
+        .cases
+        .iter()
+        .any(|case| case.termination == reporch_runtime_core::GuestTerminationV2::TimedOut)
+    {
+        return Err(crate::cli_output::domain_error(
+            "runtime.execution_timed_out",
+            "a local validation workload exceeded its configured timeout",
+            &report,
+        ));
+    }
+    if report
+        .cases
+        .iter()
+        .any(|case| case.termination != reporch_runtime_core::GuestTerminationV2::Exited)
+    {
+        return Err(crate::cli_output::domain_error(
+            "runtime.execution_failed",
+            "a local validation workload did not exit normally",
+            &report,
+        ));
+    }
     if !report.passed {
         let failed = report
             .cases
@@ -2702,6 +2741,16 @@ fn emit_unit_report(
         bail!("validation did not pass for {failed}");
     }
     output.emit(command, &report, "All configured unit cases passed")
+}
+
+fn termination_name(termination: reporch_runtime_core::GuestTerminationV2) -> &'static str {
+    match termination {
+        reporch_runtime_core::GuestTerminationV2::Exited => "exited",
+        reporch_runtime_core::GuestTerminationV2::TimedOut => "timed_out",
+        reporch_runtime_core::GuestTerminationV2::Signalled => "signalled",
+        reporch_runtime_core::GuestTerminationV2::OutputLimit => "output_limit",
+        reporch_runtime_core::GuestTerminationV2::InternalError => "internal_error",
+    }
 }
 
 fn find_legacy_solution<'a>(
