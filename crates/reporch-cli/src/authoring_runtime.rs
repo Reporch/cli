@@ -10,6 +10,7 @@ use studio_core::{CheckerProtocolV1, CheckerSpec};
 use crate::local_sandbox::{LocalSandboxOptions, LocalSandboxResult, OciRuntime};
 
 const TOOLCHAIN_SETUP_GRACE: Duration = Duration::from_secs(30);
+const COMPILATION_FAILURE_MARKER: &str = "reporch:compilation-failed:v1";
 
 #[derive(Clone)]
 pub struct AuthoringProgress(Arc<dyn Fn(&str) + Send + Sync>);
@@ -254,6 +255,7 @@ pub async fn run_linked_pair(request: &LinkedPairRequest<'_>) -> Result<LocalSan
         "cpp" => "c++ -std=c++20 -O2 -pipe \"$first\" \"$second\" -o /run/reporch/program",
         _ => bail!("linked grader execution currently requires the signed C or C++ toolchain"),
     };
+    let compiler = guarded_compiler(compiler);
     let command = vec![
         "sh".into(),
         "-c".into(),
@@ -324,6 +326,8 @@ fn interactive_pair_script_with_timeout(
     interactor_compile: &str,
     timeout: Duration,
 ) -> String {
+    let solver_compile = guarded_compiler(solver_compile);
+    let interactor_compile = guarded_compiler(interactor_compile);
     format!(
         r#"set -eu
 solver=$1
@@ -539,6 +543,7 @@ fn interpreted_command(
 }
 
 fn compiled_command(compiler: &str, source: &str, input: &str, timeout: Duration) -> Vec<String> {
+    let compiler = guarded_compiler(compiler);
     vec![
         "sh".into(),
         "-c".into(),
@@ -565,11 +570,12 @@ fn java_command(source: &str, input: &str, timeout: Duration) -> Result<Vec<Stri
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')),
         "Java source file stem is not a valid main class name"
     );
+    let compiler = guarded_compiler("javac -d /run/reporch/classes \"$src\"");
     Ok(vec![
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; src=$1; input=$2; class=$3; shift 3; mkdir -p /run/reporch/classes; javac -d /run/reporch/classes \"$src\"; if [ \"$input\" != - ]; then exec {timeout_command} java -cp /run/reporch/classes \"$class\" \"$@\" < \"$input\"; else exec {timeout_command} java -cp /run/reporch/classes \"$class\" \"$@\"; fi",
+            "set -eu; src=$1; input=$2; class=$3; shift 3; mkdir -p /run/reporch/classes; {compiler}; if [ \"$input\" != - ]; then exec {timeout_command} java -cp /run/reporch/classes \"$class\" \"$@\" < \"$input\"; else exec {timeout_command} java -cp /run/reporch/classes \"$class\" \"$@\"; fi",
             timeout_command = timeout_command(timeout)
         ),
         "reporch".into(),
@@ -580,17 +586,30 @@ fn java_command(source: &str, input: &str, timeout: Duration) -> Result<Vec<Stri
 }
 
 fn csharp_command(source: &str, input: &str, timeout: Duration) -> Vec<String> {
+    let compiler = guarded_compiler(
+        "dotnet build /run/reporch/app/app.csproj --nologo --verbosity quiet -o /run/reporch/out >/dev/null",
+    );
     vec![
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; src=$1; input=$2; shift 2; mkdir -p /run/reporch/app; printf '%s\n' '<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>' > /run/reporch/app/app.csproj; cp \"$src\" /run/reporch/app/Program.cs; dotnet build /run/reporch/app/app.csproj --nologo --verbosity quiet -o /run/reporch/out >/dev/null; if [ \"$input\" != - ]; then exec {timeout_command} dotnet /run/reporch/out/app.dll \"$@\" < \"$input\"; else exec {timeout_command} dotnet /run/reporch/out/app.dll \"$@\"; fi",
+            "set -eu; src=$1; input=$2; shift 2; mkdir -p /run/reporch/app; printf '%s\n' '<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>' > /run/reporch/app/app.csproj; cp \"$src\" /run/reporch/app/Program.cs; {compiler}; if [ \"$input\" != - ]; then exec {timeout_command} dotnet /run/reporch/out/app.dll \"$@\" < \"$input\"; else exec {timeout_command} dotnet /run/reporch/out/app.dll \"$@\"; fi",
             timeout_command = timeout_command(timeout)
         ),
         "reporch".into(),
         source.into(),
         input.into(),
     ]
+}
+
+fn guarded_compiler(compiler: &str) -> String {
+    format!(
+        "if ! {compiler}; then printf '%s\\n' '{COMPILATION_FAILURE_MARKER}' >&2; exit 126; fi"
+    )
+}
+
+pub fn compilation_failed(result: &LocalSandboxResult) -> bool {
+    result.exit_code == 126 && result.stderr.lines().any(|line| line == COMPILATION_FAILURE_MARKER)
 }
 
 fn timeout_command(timeout: Duration) -> String {
@@ -721,5 +740,13 @@ mod checker_protocol_tests {
         let command = timeout_command(Duration::from_secs(1));
         assert_eq!(command, "timeout --kill-after=1s 1.000s");
         assert!(!command.contains("--signal=KILL"));
+    }
+
+    #[test]
+    fn compiled_commands_mark_build_failures_separately_from_runtime_errors() {
+        let command = compiled_command("c++ source.cpp", "source.cpp", "-", Duration::from_secs(1));
+        let script = &command[2];
+        assert!(script.contains(COMPILATION_FAILURE_MARKER), "{script}");
+        assert!(script.contains("exit 126"), "{script}");
     }
 }

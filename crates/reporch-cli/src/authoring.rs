@@ -2769,6 +2769,9 @@ fn program_execution_verdict(
     result: &reporch_cli::local_sandbox::LocalSandboxResult,
     checker_accepted: bool,
 ) -> Option<ExpectedVerdict> {
+    if reporch_cli::authoring_runtime::compilation_failed(result) {
+        return None;
+    }
     match result.termination {
         reporch_runtime_core::GuestTerminationV2::Exited if result.exit_code == 0 => {
             Some(if checker_accepted {
@@ -2790,6 +2793,9 @@ fn program_execution_verdict(
 fn interactive_execution_verdict(
     result: &reporch_cli::local_sandbox::LocalSandboxResult,
 ) -> Option<ExpectedVerdict> {
+    if reporch_cli::authoring_runtime::compilation_failed(result) {
+        return None;
+    }
     match result.termination {
         reporch_runtime_core::GuestTerminationV2::Exited if result.exit_code == 0 => {
             Some(ExpectedVerdict::Accepted)
