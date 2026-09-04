@@ -3169,12 +3169,50 @@ pub async fn approve_review_operation(options: &ApproveReviewOptions) -> Result<
 }
 
 pub async fn list_waivers_operation(options: &WaiverScopeOptions) -> Result<WaiverPage> {
-    let (project_id, validation_id) =
-        resolve_local_validation(options.project_id, options.validation_run_id)?;
-    StudioApiClient::connect(&options.connection)
-        .await?
-        .list_waivers(project_id, validation_id)
-        .await
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let validation_id = match options.validation_run_id {
+        Some(validation_id) => validation_id,
+        None if options.project_id.is_none() => resolve_local_validation(None, None)?.1,
+        None => latest_remote_validation_id(&client, project_id).await?,
+    };
+    client.list_waivers(project_id, validation_id).await
+}
+
+async fn latest_remote_validation_id(client: &StudioApiClient, project_id: Uuid) -> Result<Uuid> {
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut latest = None;
+    for _ in 0..100 {
+        let page = client.list_validations(project_id, cursor).await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|validation| validation.project_id == project_id),
+            "Studio returned a validation from another project"
+        );
+        for validation in page.items {
+            if latest.as_ref().is_none_or(
+                |current: &studio_contracts::ValidationRunSummaryResponse| {
+                    validation.created_at > current.created_at
+                        || validation.created_at == current.created_at && validation.id > current.id
+                },
+            ) {
+                latest = Some(validation);
+            }
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            return latest.map(|validation| validation.id).context(
+                "the project has no validation runs; pass --validation-run-id after running verify",
+            );
+        };
+        ensure!(
+            seen.insert(next_cursor),
+            "Studio returned a repeated validation cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio validation listing exceeded the 10,000-item native client bound")
 }
 
 pub async fn create_waiver_operation(options: &CreateWaiverOptions) -> Result<WaiverResponse> {
@@ -3973,6 +4011,71 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn waiver_list_with_explicit_project_recovers_the_latest_remote_validation() {
+        use axum::{Json, Router, routing::get};
+
+        let project_id = Uuid::now_v7();
+        let older_id = Uuid::now_v7();
+        let latest_id = Uuid::now_v7();
+        let application = Router::new()
+            .route(
+                "/api/v1/projects/{project_id}/validations",
+                get(move || async move {
+                    Json(serde_json::json!({
+                        "items": [
+                            {
+                                "id": older_id,
+                                "project_id": project_id,
+                                "commit_id": Uuid::now_v7(),
+                                "status": "passed",
+                                "created_at": "2026-09-03T00:00:00Z",
+                                "updated_at": "2026-09-03T00:01:00Z"
+                            },
+                            {
+                                "id": latest_id,
+                                "project_id": project_id,
+                                "commit_id": Uuid::now_v7(),
+                                "status": "passed",
+                                "created_at": "2026-09-04T00:00:00Z",
+                                "updated_at": "2026-09-04T00:01:00Z"
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/validations/{validation_id}/waivers",
+                get(move |path: axum::extract::Path<(Uuid, Uuid)>| async move {
+                    assert_eq!(path.0.0, project_id);
+                    assert_eq!(path.0.1, latest_id);
+                    Json(serde_json::json!({ "items": [] }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, application).await.unwrap();
+        });
+        let options = WaiverScopeOptions {
+            connection: RemoteConnectionOptions {
+                api_url: format!("http://{address}"),
+                auth: NativeAuthOptions {
+                    issuer: "http://127.0.0.1/oauth".into(),
+                    client_id: "test".into(),
+                    allow_insecure_http: true,
+                },
+                dev_subject: Some("qa-author".into()),
+            },
+            project_id: Some(project_id),
+            validation_run_id: None,
+        };
+
+        let page = list_waivers_operation(&options).await.unwrap();
+        assert!(page.items.is_empty());
+        server.abort();
+    }
 
     #[test]
     fn studio_api_url_is_https_or_explicit_loopback_only() {
