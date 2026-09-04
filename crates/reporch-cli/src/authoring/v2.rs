@@ -183,23 +183,19 @@ fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
     );
     let root = reporch_cli::local_project::discover_project(Path::new("."))?;
     let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
-    let defaults = next_test_case_defaults(spec.testing.tests.iter().map(|test| {
-        (
-            test.name.as_str(),
-            test.input_file.as_str(),
-            test.answer_file.as_deref(),
-        )
-    }));
-    let name = prompt("Test name", &defaults.0)?;
-    let input = prompt("Input file", &defaults.1)?;
-    let answer = prompt("Answer file (blank for none)", &defaults.2)?;
+    let name = prompt(
+        "Test name",
+        &next_test_case_name(spec.testing.tests.iter().map(|test| test.name.as_str())),
+    )?;
+    let input = prompt("Input data (single line)", "")?;
+    let answer = prompt("Expected output (single line; blank for none)", "")?;
     test_case(
         TestCaseCommand::Add(TestCaseAddOptions {
             name,
-            input: Some(PathBuf::from(input)),
-            input_text: None,
-            answer: (!answer.is_empty()).then(|| PathBuf::from(answer)),
-            answer_text: None,
+            input: None,
+            input_text: Some(guided_test_text(&input)),
+            answer: None,
+            answer_text: (!answer.is_empty()).then(|| guided_test_text(&answer)),
             groups: vec![],
             generated_by: None,
             seed: None,

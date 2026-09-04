@@ -1398,23 +1398,19 @@ fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
     );
     let root = reporch_cli::local_project::discover_project(Path::new("."))?;
     let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
-    let defaults = next_test_case_defaults(spec.judging.tests.iter().map(|test| {
-        (
-            test.name.as_str(),
-            test.input_file.as_str(),
-            test.answer_file.as_deref(),
-        )
-    }));
-    let name = prompt("Test name", &defaults.0)?;
-    let input = prompt("Input file", &defaults.1)?;
-    let answer = prompt("Answer file (blank for none)", &defaults.2)?;
+    let name = prompt(
+        "Test name",
+        &next_test_case_name(spec.judging.tests.iter().map(|test| test.name.as_str())),
+    )?;
+    let input = prompt("Input data (single line)", "")?;
+    let answer = prompt("Expected output (single line; blank for none)", "")?;
     test_case(
         TestCaseCommand::Add(TestCaseAddOptions {
             name,
-            input: Some(PathBuf::from(input)),
-            input_text: None,
-            answer: (!answer.is_empty()).then(|| PathBuf::from(answer)),
-            answer_text: None,
+            input: None,
+            input_text: Some(guided_test_text(&input)),
+            answer: None,
+            answer_text: (!answer.is_empty()).then(|| guided_test_text(&answer)),
             groups: vec![],
             generated_by: None,
             seed: None,
@@ -3595,30 +3591,26 @@ fn ensure_unique_test_input<'a>(
     Ok(())
 }
 
-fn next_test_case_defaults<'a>(
-    tests: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
-) -> (String, String, String) {
+fn next_test_case_name<'a>(tests: impl Iterator<Item = &'a str>) -> String {
     let mut names = std::collections::BTreeSet::new();
-    let mut paths = std::collections::BTreeSet::new();
-    for (name, input, answer) in tests {
+    for name in tests {
         names.insert(name);
-        paths.insert(input);
-        if let Some(answer) = answer {
-            paths.insert(answer);
-        }
     }
     for index in 1_u64.. {
         let name = format!("sample-{index}");
-        let input = format!("tests/{index}.in");
-        let answer = format!("tests/{index}.ans");
-        if !names.contains(name.as_str())
-            && !paths.contains(input.as_str())
-            && !paths.contains(answer.as_str())
-        {
-            return (name, input, answer);
+        if !names.contains(name.as_str()) {
+            return name;
         }
     }
     unreachable!("the test index space is finite only after exhausting u64")
+}
+
+fn guided_test_text(value: &str) -> String {
+    if value.is_empty() || value.ends_with('\n') {
+        value.to_owned()
+    } else {
+        format!("{value}\n")
+    }
 }
 
 fn write_project_bytes_atomic(root: &Path, path: &str, bytes: &[u8]) -> Result<()> {
