@@ -598,6 +598,10 @@ struct ToolchainIndexStateV2 {
 
 pub async fn install_toolchain(id: &str) -> Result<VerifiedToolchainBundleV2> {
     validate_toolchain_id(id)?;
+    if let Ok(installed) = verified_toolchain(id).await {
+        repair_toolchain_read_access(&installed)?;
+        return verified_toolchain(id).await;
+    }
     #[cfg(any(target_os = "linux", windows))]
     if probe_runtime_service().await {
         request_service_toolchain_install(id).await?;
@@ -615,6 +619,9 @@ pub async fn install_toolchain_direct(id: &str) -> Result<VerifiedToolchainBundl
     let root = runtime_root.join("toolchains");
     ensure_runtime_root_is_narrow(&root)?;
     create_private_directory(&root)?;
+    if let Some(installed) = reuse_installed_toolchain(&root, id, target)? {
+        return Ok(installed);
+    }
     let base = toolchain_channel_url()?;
     let client = runtime_download_client()?;
     let index_url = base
@@ -830,6 +837,19 @@ pub async fn verified_toolchain(id: &str) -> Result<VerifiedToolchainBundleV2> {
     let target = HostTarget::current()
         .ok_or_else(|| RuntimeError::VirtualizationUnavailable("unsupported host target".into()))?;
     verified_toolchain_at(&runtime_root()?.join("toolchains"), id, target)
+}
+
+fn reuse_installed_toolchain(
+    root: &Path,
+    id: &str,
+    target: HostTarget,
+) -> Result<Option<VerifiedToolchainBundleV2>> {
+    let installed = match verified_toolchain_at(root, id, target) {
+        Ok(installed) => installed,
+        Err(_) => return Ok(None),
+    };
+    repair_toolchain_read_access(&installed)?;
+    verified_toolchain_at(root, id, target).map(Some)
 }
 
 fn verified_toolchain_at(
