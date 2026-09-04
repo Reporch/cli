@@ -228,15 +228,17 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let updated =
                 reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
                     ensure_unique_test_name(spec, &options.name, None)?;
-                    ensure_unique_test_input(
-                        root,
-                        &input,
-                        &options.name,
-                        spec.testing
-                            .tests
-                            .iter()
-                            .map(|test| (test.name.as_str(), test.input_file.as_str())),
-                    )?;
+                    if answer.is_some() {
+                        ensure_unique_test_input(
+                            root,
+                            &input,
+                            &options.name,
+                            spec.testing
+                                .tests
+                                .iter()
+                                .map(|test| (test.name.as_str(), test.input_file.as_str())),
+                        )?;
+                    }
                     let group_ids = resolve_group_ids(spec, &options.groups)?;
                     let generated = if let Some(generator_name) = &options.generated_by {
                         let seed = options
@@ -428,15 +430,17 @@ fn import_test_cases(options: TestCaseImportOptions, output: &CliOutput) -> Resu
                 .context("test input has a non-Unicode file name")?;
             let name = normalize_name(stem)?;
             ensure_unique_test_name(spec, &name, None)?;
-            ensure_unique_test_input(
-                root,
-                &input,
-                &name,
-                spec.testing
-                    .tests
-                    .iter()
-                    .map(|test| (test.name.as_str(), test.input_file.as_str())),
-            )?;
+            if answer.is_some() {
+                ensure_unique_test_input(
+                    root,
+                    &input,
+                    &name,
+                    spec.testing
+                        .tests
+                        .iter()
+                        .map(|test| (test.name.as_str(), test.input_file.as_str())),
+                )?;
+            }
             reporch_cli::local_project_v2::declare_project_file(
                 root,
                 spec,
