@@ -760,13 +760,20 @@ pub fn migrate_project(directory: &Path) -> Result<MigrationOutcomeV2> {
         if schema == studio_core::RELEASE_MANIFEST_SCHEMA_V2 {
             let manifest: ReleaseManifestV2 = serde_json::from_slice(&legacy_bytes)?;
             manifest.validate_references()?;
+            let recovered = AuthoringSpecV2::from_manifest(&manifest);
+            let rebuilt = compile_authoring_spec(&root, &recovered, manifest.commit_id)?;
+            ensure!(
+                rebuilt == manifest,
+                "generated v2 manifest cannot be recovered losslessly into {AUTHORING_FILE_NAME}"
+            );
+            write_authoring_spec_create_new(&root, &recovered)?;
             return Ok(MigrationOutcomeV2 {
                 schema: "reporch.migration-result.v2",
                 directory: root,
                 authoring_file: authoring_path,
                 backup_files,
                 project_id: manifest.project_id,
-                migrated: false,
+                migrated: true,
             });
         } else {
             let outcome = crate::local_project::migrate_legacy_project(&root)?;
@@ -883,6 +890,26 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         write_minimal_v1(temporary.path());
         assert!(migrate_project(temporary.path()).unwrap().migrated);
+        assert!(!migrate_project(temporary.path()).unwrap().migrated);
+    }
+
+    #[test]
+    fn project_migration_recovers_missing_yaml_from_a_v2_generated_manifest() {
+        let temporary = tempfile::tempdir().unwrap();
+        write_minimal_v1(temporary.path());
+        let spec = migrate_v1_authoring_file(temporary.path()).unwrap();
+        let manifest = compile_authoring_spec(temporary.path(), &spec, Uuid::now_v7()).unwrap();
+        fs::write(
+            temporary.path().join(LEGACY_MANIFEST_FILE_NAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(temporary.path().join(AUTHORING_FILE_NAME)).unwrap();
+
+        let outcome = migrate_project(temporary.path()).unwrap();
+        assert!(outcome.migrated);
+        assert!(outcome.authoring_file.is_file());
+        assert_eq!(read_authoring_spec(temporary.path()).unwrap(), spec);
         assert!(!migrate_project(temporary.path()).unwrap().migrated);
     }
 
