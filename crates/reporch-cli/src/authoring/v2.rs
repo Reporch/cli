@@ -1031,6 +1031,7 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                         exit_code: result.exit_code,
                         termination: result.termination,
                         duration_ms: result.duration_ms,
+                        stdout: result.stdout,
                         stderr: result.stderr,
                     });
                 }
@@ -1190,7 +1191,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
             let mut cases = Vec::new();
             for unit in units {
                 output.progress("checker run", &format!("Checking unit {}", unit.name));
-                let (actual, passed, exit_code, termination, duration_ms, stderr) =
+                let (actual, passed, exit_code, termination, duration_ms, stdout, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
@@ -1242,6 +1243,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                             result.execution.exit_code,
                             result.execution.termination,
                             result.execution.duration_ms,
+                            result.execution.stdout,
                             result.execution.stderr,
                         )
                     } else {
@@ -1259,6 +1261,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                             reporch_runtime_core::GuestTerminationV2::Exited,
                             0,
                             String::new(),
+                            String::new(),
                         )
                     };
                 cases.push(ProgramUnitResult {
@@ -1274,6 +1277,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                     exit_code,
                     termination,
                     duration_ms,
+                    stdout,
                     stderr,
                 });
             }

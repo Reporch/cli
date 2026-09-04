@@ -1642,6 +1642,7 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                         exit_code: result.exit_code,
                         termination: result.termination,
                         duration_ms: result.duration_ms,
+                        stdout: result.stdout,
                         stderr: result.stderr,
                     });
                 }
@@ -1789,7 +1790,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
             let mut cases = Vec::new();
             for unit in units {
                 output.progress("checker run", &format!("Checking unit {}", unit.name));
-                let (actual, passed, exit_code, termination, duration_ms, stderr) =
+                let (actual, passed, exit_code, termination, duration_ms, stdout, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
@@ -1841,6 +1842,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                             result.execution.exit_code,
                             result.execution.termination,
                             result.execution.duration_ms,
+                            result.execution.stdout,
                             result.execution.stderr,
                         )
                     } else {
@@ -1858,6 +1860,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                             reporch_runtime_core::GuestTerminationV2::Exited,
                             0,
                             String::new(),
+                            String::new(),
                         )
                     };
                 cases.push(ProgramUnitResult {
@@ -1873,6 +1876,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                     exit_code,
                     termination,
                     duration_ms,
+                    stdout,
                     stderr,
                 });
             }
@@ -2696,6 +2700,7 @@ struct ProgramUnitResult {
     exit_code: i32,
     termination: reporch_runtime_core::GuestTerminationV2,
     duration_ms: u128,
+    stdout: String,
     stderr: String,
 }
 
@@ -2738,7 +2743,11 @@ fn emit_unit_report(
             .map(|case| format!("{}:{}", case.program, case.name))
             .collect::<Vec<_>>()
             .join(", ");
-        bail!("validation did not pass for {failed}");
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            format!("validation did not pass for {failed}"),
+            &report,
+        ));
     }
     output.emit(command, &report, "All configured unit cases passed")
 }
