@@ -4,6 +4,8 @@
 mod apple_backend;
 mod host_version;
 #[cfg(test)]
+mod runtime_bundle_cache_tests;
+#[cfg(test)]
 mod toolchain_cache_tests;
 #[cfg(windows)]
 mod windows_identity;
