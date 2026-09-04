@@ -9,6 +9,8 @@ use studio_core::{CheckerProtocolV1, CheckerSpec};
 
 use crate::local_sandbox::{LocalSandboxOptions, LocalSandboxResult, OciRuntime};
 
+const TOOLCHAIN_SETUP_GRACE: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct AuthoringProgress(Arc<dyn Fn(&str) + Send + Sync>);
 
@@ -200,27 +202,9 @@ pub async fn run_program(request: &ProgramRequest<'_>) -> Result<LocalSandboxRes
         &source,
         stdin.as_deref(),
         request.arguments,
+        request.options.timeout,
     )?;
-    let sandbox = LocalSandboxOptions {
-        runtime: request.options.runtime,
-        image: entry.image,
-        project_directory: root,
-        command,
-        timeout: request.options.timeout,
-        memory_mib: request.options.memory_mib,
-        cpus: request.options.cpus,
-        output_kib: request.options.output_kib,
-    };
-    request
-        .options
-        .progress
-        .report("Preparing the isolated Reporch VM");
-    let plan = crate::local_sandbox::plan(&sandbox).await?;
-    request
-        .options
-        .progress
-        .report("Running the isolated Reporch VM job");
-    crate::local_sandbox::execute(&plan).await
+    execute_in_toolchain(root, command, entry.image, request.options).await
 }
 
 /// Run one trusted orchestration command inside a language toolchain VM.
@@ -267,7 +251,8 @@ pub async fn run_linked_pair(request: &LinkedPairRequest<'_>) -> Result<LocalSan
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; first=$1; second=$2; input=$3; {compiler}; exec /run/reporch/program < \"$input\""
+            "set -eu; first=$1; second=$2; input=$3; {compiler}; exec {} /run/reporch/program < \"$input\"",
+            timeout_command(request.options.timeout)
         ),
         "reporch".into(),
         first,
@@ -301,7 +286,11 @@ pub async fn run_interactive_pair(
             "local interactive pairing currently requires matching signed C or C++ toolchains; use Studio verification for cross-language pairing"
         ),
     };
-    let script = interactive_pair_script(solver_compile, interactor_compile);
+    let script = interactive_pair_script_with_timeout(
+        solver_compile,
+        interactor_compile,
+        request.options.timeout,
+    );
     let command = vec![
         "bash".into(),
         "-c".into(),
@@ -314,7 +303,20 @@ pub async fn run_interactive_pair(
     execute_in_toolchain(root, command, entry.image, request.options).await
 }
 
+#[cfg(test)]
 fn interactive_pair_script(solver_compile: &str, interactor_compile: &str) -> String {
+    interactive_pair_script_with_timeout(
+        solver_compile,
+        interactor_compile,
+        Duration::from_secs(30),
+    )
+}
+
+fn interactive_pair_script_with_timeout(
+    solver_compile: &str,
+    interactor_compile: &str,
+    timeout: Duration,
+) -> String {
     format!(
         r#"set -eu
 solver=$1
@@ -322,6 +324,9 @@ interactor=$2
 input=$3
 {solver_compile}
 {interactor_compile}
+cat > /run/reporch/interactive-run.sh <<'REPORCH_INTERACTIVE'
+set -u
+input=$1
 mkfifo /run/reporch/solver-to-interactor /run/reporch/interactor-to-solver
 exec 3<>/run/reporch/solver-to-interactor
 exec 4<>/run/reporch/interactor-to-solver
@@ -347,7 +352,16 @@ if [ "$solver_status" -ne 0 ]; then exit 1; fi
 if [ "$interactor_status" -eq 42 ]; then exit 0; fi
 if [ "$interactor_status" -eq 43 ]; then exit 1; fi
 exit 2
-"#
+REPORCH_INTERACTIVE
+set +e
+{timeout_command} bash /run/reporch/interactive-run.sh "$input"
+status=$?
+if [ "$status" -eq 0 ]; then exit 0; fi
+if [ "$status" -eq 1 ]; then exit 1; fi
+if [ "$status" -eq 124 ]; then exit 124; fi
+exit 2
+"#,
+        timeout_command = timeout_command(timeout),
     )
 }
 
@@ -388,7 +402,7 @@ async fn execute_in_toolchain(
         image,
         project_directory: root,
         command,
-        timeout: options.timeout,
+        timeout: options.timeout.saturating_add(TOOLCHAIN_SETUP_GRACE),
         memory_mib: options.memory_mib,
         cpus: options.cpus,
         output_kib: options.output_kib,
@@ -398,7 +412,13 @@ async fn execute_in_toolchain(
     options
         .progress
         .report("Running the isolated Reporch VM job");
-    crate::local_sandbox::execute(&plan).await
+    let mut result = crate::local_sandbox::execute(&plan).await?;
+    if result.termination == reporch_runtime_core::GuestTerminationV2::Exited
+        && result.exit_code == 124
+    {
+        result.termination = reporch_runtime_core::GuestTerminationV2::TimedOut;
+    }
+    Ok(result)
 }
 
 fn checked_workspace_file(root: &Path, path: &str) -> Result<String> {
@@ -443,44 +463,62 @@ fn program_command(
     source: &str,
     stdin: Option<&str>,
     arguments: &[String],
+    timeout: Duration,
 ) -> Result<Vec<String>> {
     let input = stdin.unwrap_or("-");
     let mut command = match language {
-        "python" => interpreted_command("python3", source, input),
-        "pypy" => interpreted_command("pypy3", source, input),
-        "javascript" => interpreted_command("node", source, input),
-        "php" => interpreted_command("php", source, input),
-        "r" => interpreted_command("Rscript", source, input),
-        "bash" => interpreted_command("bash", source, input),
+        "python" => interpreted_command("python3", source, input, timeout),
+        "pypy" => interpreted_command("pypy3", source, input, timeout),
+        "javascript" => interpreted_command("node", source, input, timeout),
+        "php" => interpreted_command("php", source, input, timeout),
+        "r" => interpreted_command("Rscript", source, input, timeout),
+        "bash" => interpreted_command("bash", source, input, timeout),
         "c" => compiled_command(
             "cc -std=c17 -O2 -pipe \"$src\" -o /run/reporch/program",
             source,
             input,
+            timeout,
         ),
         "cpp" => compiled_command(
             "c++ -std=c++20 -O2 -pipe \"$src\" -o /run/reporch/program",
             source,
             input,
+            timeout,
         ),
         "rust" => compiled_command(
             "rustc --edition=2024 -O \"$src\" -o /run/reporch/program",
             source,
             input,
+            timeout,
         ),
-        "swift" => compiled_command("swiftc -O \"$src\" -o /run/reporch/program", source, input),
-        "java" => java_command(source, input)?,
-        "csharp" => csharp_command(source, input),
+        "swift" => compiled_command(
+            "swiftc -O \"$src\" -o /run/reporch/program",
+            source,
+            input,
+            timeout,
+        ),
+        "java" => java_command(source, input, timeout)?,
+        "csharp" => csharp_command(source, input, timeout),
         _ => bail!("unsupported signed toolchain language: {language}"),
     };
     command.extend(arguments.iter().cloned());
     Ok(command)
 }
 
-fn interpreted_command(interpreter: &str, source: &str, input: &str) -> Vec<String> {
+fn interpreted_command(
+    interpreter: &str,
+    source: &str,
+    input: &str,
+    timeout: Duration,
+) -> Vec<String> {
     vec![
         "sh".into(),
         "-c".into(),
-        "input=$1; shift; if [ \"$input\" != - ]; then exec \"$@\" < \"$input\"; else exec \"$@\"; fi".into(),
+        format!(
+            "input=$1; shift; if [ \"$input\" != - ]; then exec {} \"$@\" < \"$input\"; else exec {} \"$@\"; fi",
+            timeout_command(timeout),
+            timeout_command(timeout)
+        ),
         "reporch".into(),
         input.into(),
         interpreter.into(),
@@ -488,12 +526,13 @@ fn interpreted_command(interpreter: &str, source: &str, input: &str) -> Vec<Stri
     ]
 }
 
-fn compiled_command(compiler: &str, source: &str, input: &str) -> Vec<String> {
+fn compiled_command(compiler: &str, source: &str, input: &str, timeout: Duration) -> Vec<String> {
     vec![
         "sh".into(),
         "-c".into(),
         format!(
-            "set -eu; src=$1; input=$2; shift 2; {compiler}; if [ \"$input\" != - ]; then exec /run/reporch/program \"$@\" < \"$input\"; else exec /run/reporch/program \"$@\"; fi"
+            "set -eu; src=$1; input=$2; shift 2; {compiler}; if [ \"$input\" != - ]; then exec {timeout_command} /run/reporch/program \"$@\" < \"$input\"; else exec {timeout_command} /run/reporch/program \"$@\"; fi",
+            timeout_command = timeout_command(timeout)
         ),
         "reporch".into(),
         source.into(),
@@ -501,7 +540,7 @@ fn compiled_command(compiler: &str, source: &str, input: &str) -> Vec<String> {
     ]
 }
 
-fn java_command(source: &str, input: &str) -> Result<Vec<String>> {
+fn java_command(source: &str, input: &str, timeout: Duration) -> Result<Vec<String>> {
     let class = PathBuf::from(source)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -517,7 +556,10 @@ fn java_command(source: &str, input: &str) -> Result<Vec<String>> {
     Ok(vec![
         "sh".into(),
         "-c".into(),
-        "set -eu; src=$1; input=$2; class=$3; shift 3; mkdir -p /run/reporch/classes; javac -d /run/reporch/classes \"$src\"; if [ \"$input\" != - ]; then exec java -cp /run/reporch/classes \"$class\" \"$@\" < \"$input\"; else exec java -cp /run/reporch/classes \"$class\" \"$@\"; fi".into(),
+        format!(
+            "set -eu; src=$1; input=$2; class=$3; shift 3; mkdir -p /run/reporch/classes; javac -d /run/reporch/classes \"$src\"; if [ \"$input\" != - ]; then exec {timeout_command} java -cp /run/reporch/classes \"$class\" \"$@\" < \"$input\"; else exec {timeout_command} java -cp /run/reporch/classes \"$class\" \"$@\"; fi",
+            timeout_command = timeout_command(timeout)
+        ),
         "reporch".into(),
         source.into(),
         input.into(),
@@ -525,15 +567,25 @@ fn java_command(source: &str, input: &str) -> Result<Vec<String>> {
     ])
 }
 
-fn csharp_command(source: &str, input: &str) -> Vec<String> {
+fn csharp_command(source: &str, input: &str, timeout: Duration) -> Vec<String> {
     vec![
         "sh".into(),
         "-c".into(),
-        "set -eu; src=$1; input=$2; shift 2; mkdir -p /run/reporch/app; printf '%s\n' '<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>' > /run/reporch/app/app.csproj; cp \"$src\" /run/reporch/app/Program.cs; dotnet build /run/reporch/app/app.csproj --nologo --verbosity quiet -o /run/reporch/out >/dev/null; if [ \"$input\" != - ]; then exec dotnet /run/reporch/out/app.dll \"$@\" < \"$input\"; else exec dotnet /run/reporch/out/app.dll \"$@\"; fi".into(),
+        format!(
+            "set -eu; src=$1; input=$2; shift 2; mkdir -p /run/reporch/app; printf '%s\n' '<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>' > /run/reporch/app/app.csproj; cp \"$src\" /run/reporch/app/Program.cs; dotnet build /run/reporch/app/app.csproj --nologo --verbosity quiet -o /run/reporch/out >/dev/null; if [ \"$input\" != - ]; then exec {timeout_command} dotnet /run/reporch/out/app.dll \"$@\" < \"$input\"; else exec {timeout_command} dotnet /run/reporch/out/app.dll \"$@\"; fi",
+            timeout_command = timeout_command(timeout)
+        ),
         "reporch".into(),
         source.into(),
         input.into(),
     ]
+}
+
+fn timeout_command(timeout: Duration) -> String {
+    format!(
+        "timeout --signal=KILL --kill-after=1s {:.3}s",
+        timeout.as_secs_f64()
+    )
 }
 
 pub fn standard_checker_matches(
