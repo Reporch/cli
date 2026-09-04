@@ -132,6 +132,9 @@ fn generator_and_solution_preflights_share_the_same_vm_job() {
     assert!(verified.status.success(), "{verified:?}");
     assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 1);
     let result: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
-    assert_eq!(result["data"]["generator_checks"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["data"]["generator_checks"].as_array().unwrap().len(),
+        1
+    );
     assert_eq!(result["data"]["generator_checks"][0]["passed"], true);
 }

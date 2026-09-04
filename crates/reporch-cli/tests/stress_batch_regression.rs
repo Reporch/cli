@@ -163,13 +163,7 @@ fn supported_stress_suite_uses_one_runtime_job_for_all_seeds() {
         runtime.path(),
         project.path(),
         &log,
-        &[
-            "stress",
-            "run",
-            "known-wrong-check",
-            "--runtime",
-            "podman",
-        ],
+        &["stress", "run", "known-wrong-check", "--runtime", "podman"],
         true,
     );
     assert!(stressed.status.success(), "{stressed:?}");
