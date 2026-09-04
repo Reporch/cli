@@ -6,15 +6,15 @@ mod host_version;
 #[cfg(windows)]
 mod windows_identity;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -323,6 +323,131 @@ pub struct VerifiedToolchainBundleV2 {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegularFileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    read_only: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl RegularFileFingerprint {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect cached toolchain file {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "cached toolchain path is not a regular file: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            read_only: metadata.permissions().readonly(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedToolchainCacheEntry {
+    bundle: VerifiedToolchainBundleV2,
+    expires_at: chrono::DateTime<Utc>,
+    state: RegularFileFingerprint,
+    index: RegularFileFingerprint,
+    signature: RegularFileFingerprint,
+    image: RegularFileFingerprint,
+}
+
+type VerifiedToolchainCacheKey = (PathBuf, String, HostTarget);
+
+static VERIFIED_TOOLCHAIN_CACHE: OnceLock<
+    Mutex<HashMap<VerifiedToolchainCacheKey, VerifiedToolchainCacheEntry>>,
+> = OnceLock::new();
+
+fn verified_toolchain_cache()
+-> &'static Mutex<HashMap<VerifiedToolchainCacheKey, VerifiedToolchainCacheEntry>> {
+    VERIFIED_TOOLCHAIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_verified_toolchain(
+    root: &Path,
+    id: &str,
+    target: HostTarget,
+) -> Result<Option<VerifiedToolchainBundleV2>> {
+    let key = (root.to_path_buf(), id.to_owned(), target);
+    let cached = verified_toolchain_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified toolchain cache lock was poisoned"))?
+        .get(&key)
+        .cloned();
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    let state_path = toolchain_state_path(root, id);
+    let directory = cached
+        .bundle
+        .path
+        .parent()
+        .context("cached toolchain image has no parent")?;
+    let unchanged = cached.expires_at > Utc::now()
+        && RegularFileFingerprint::read(&state_path).ok().as_ref() == Some(&cached.state)
+        && RegularFileFingerprint::read(&directory.join("index.json"))
+            .ok()
+            .as_ref()
+            == Some(&cached.index)
+        && RegularFileFingerprint::read(&directory.join("index.json.minisig"))
+            .ok()
+            .as_ref()
+            == Some(&cached.signature)
+        && RegularFileFingerprint::read(&cached.bundle.path)
+            .ok()
+            .as_ref()
+            == Some(&cached.image);
+    if unchanged {
+        return Ok(Some(cached.bundle));
+    }
+    verified_toolchain_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified toolchain cache lock was poisoned"))?
+        .remove(&key);
+    Ok(None)
+}
+
+fn cache_verified_toolchain(
+    root: &Path,
+    id: &str,
+    target: HostTarget,
+    bundle: &VerifiedToolchainBundleV2,
+    expires_at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let directory = bundle
+        .path
+        .parent()
+        .context("verified toolchain image has no parent")?;
+    let entry = VerifiedToolchainCacheEntry {
+        bundle: bundle.clone(),
+        expires_at,
+        state: RegularFileFingerprint::read(&toolchain_state_path(root, id))?,
+        index: RegularFileFingerprint::read(&directory.join("index.json"))?,
+        signature: RegularFileFingerprint::read(&directory.join("index.json.minisig"))?,
+        image: RegularFileFingerprint::read(&bundle.path)?,
+    };
+    verified_toolchain_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified toolchain cache lock was poisoned"))?
+        .insert((root.to_path_buf(), id.to_owned(), target), entry);
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolchainIndexStateV2 {
@@ -572,6 +697,9 @@ fn verified_toolchain_at(
     id: &str,
     target: HostTarget,
 ) -> Result<VerifiedToolchainBundleV2> {
+    if let Some(cached) = cached_verified_toolchain(root, id, target)? {
+        return Ok(cached);
+    }
     let state_path = toolchain_state_path(root, id);
     let installation_bytes =
         read_bounded_regular(&state_path, 64 * 1024, "toolchain installation state")?;
@@ -634,12 +762,14 @@ fn verified_toolchain_at(
         hash_regular_file(&path, bundle.size)? == bundle.sha256,
         "installed toolchain image digest changed"
     );
-    Ok(VerifiedToolchainBundleV2 {
+    let verified = VerifiedToolchainBundleV2 {
         installation,
         entry: entry.clone(),
         bundle: bundle.clone(),
         path,
-    })
+    };
+    cache_verified_toolchain(root, id, target, &verified, index.expires_at)?;
+    Ok(verified)
 }
 
 fn enforce_toolchain_index_monotonicity(root: &Path, sequence: u64, digest: &str) -> Result<()> {
