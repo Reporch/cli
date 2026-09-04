@@ -600,7 +600,7 @@ struct RuntimeOptions {
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
-enum RuntimeKind {
+pub(crate) enum RuntimeKind {
     #[default]
     Auto,
     /// Deprecated explicit compatibility backend.
@@ -634,6 +634,475 @@ impl RuntimeOptions {
             progress,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct LocalVerifyReport {
+    schema: &'static str,
+    evidence: &'static str,
+    passed: bool,
+    generator_checks: Vec<LocalGeneratorCheck>,
+    validator_units: usize,
+    checker_units: usize,
+    solutions: Vec<LocalSolutionCheck>,
+    output_submissions: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalGeneratorCheck {
+    generator: String,
+    recipe: String,
+    seed: u64,
+    expected_sha256: Option<String>,
+    actual_sha256: String,
+    passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalSolutionCheck {
+    solution: String,
+    expected: &'static str,
+    actual: &'static str,
+    score: f64,
+    passed: bool,
+    cases: Vec<LocalSolutionCase>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalSolutionCase {
+    test_id: Uuid,
+    test: String,
+    actual: &'static str,
+    accepted: bool,
+    exit_code: i32,
+    termination: reporch_runtime_core::GuestTerminationV2,
+    duration_ms: u128,
+    stdout: String,
+    stderr: String,
+}
+
+pub async fn verify_local(
+    timeout_seconds: u64,
+    runtime_kind: RuntimeKind,
+    output: &CliOutput,
+) -> Result<()> {
+    ensure!(
+        (1..=600).contains(&timeout_seconds),
+        "local verification timeout must be between 1 and 600 seconds"
+    );
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = if reporch_cli::local_project_v2::is_v2_project(&root)? {
+        reporch_cli::local_project_v2::read_authoring_spec(&root)?
+    } else {
+        let legacy = reporch_cli::local_project::read_authoring_spec(&root)?;
+        reporch_format::AuthoringSpecV2::migrate_v1(&legacy)
+            .context("migrate the legacy authoring model for local verification")?
+    };
+    let silent = CliOutput::new(
+        crate::cli_output::OutputFormat::Human,
+        true,
+        crate::cli_output::ColorMode::Never,
+    );
+    let runtime = RuntimeOptions {
+        toolchain: None,
+        runtime: runtime_kind,
+        timeout_seconds,
+        memory_mib: spec.testing.limits.memory_mib,
+        cpus: 1.0,
+        output_kib: 1_024,
+    };
+    let run_options = runtime.clone().into_run_options(output);
+
+    let generator_checks = verify_generators(&root, &spec, &run_options).await?;
+    if !spec.testing.validators.unit_tests.is_empty() {
+        v2::validator(
+            ValidatorOptions {
+                command: ValidatorCommand::Run {
+                    name: None,
+                    runtime: runtime.clone(),
+                },
+            },
+            &silent,
+        )
+        .await?;
+    }
+    if !spec.testing.checker.unit_tests.is_empty() {
+        v2::checker(
+            CheckerOptions {
+                command: CheckerCommand::Run {
+                    name: None,
+                    runtime: runtime.clone(),
+                },
+            },
+            &silent,
+        )
+        .await?;
+    }
+
+    let (solutions, output_submissions) =
+        if spec.problem_type == studio_core::ProblemType::OutputOnly {
+            v2::output_submission(
+                OutputOptions {
+                    command: OutputCommand::Test {
+                        name: None,
+                        runtime: runtime.clone(),
+                    },
+                },
+                &silent,
+            )
+            .await?;
+            (Vec::new(), spec.output_submissions.len())
+        } else {
+            (verify_solution_matrix(&root, &spec, &run_options).await?, 0)
+        };
+    let report = LocalVerifyReport {
+        schema: "reporch.local-verification.v1",
+        evidence: "local_preflight_only",
+        passed: generator_checks.iter().all(|check| check.passed)
+            && solutions.iter().all(|solution| solution.passed),
+        generator_checks,
+        validator_units: spec.testing.validators.unit_tests.len(),
+        checker_units: spec.testing.checker.unit_tests.len(),
+        solutions,
+        output_submissions,
+    };
+    if !report.passed {
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            "local verification did not match the declared expectations",
+            &report,
+        ));
+    }
+    output.emit(
+        "verify",
+        &report,
+        "Local verification passed. This is a preflight only; run `reporch verify` for official Studio evidence.",
+    )
+}
+
+async fn verify_generators(
+    root: &Path,
+    spec: &reporch_format::AuthoringSpecV2,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<Vec<LocalGeneratorCheck>> {
+    let mut checks = Vec::new();
+    let mut covered = std::collections::BTreeSet::new();
+    for test in &spec.testing.tests {
+        let Some(generated) = &test.generated else {
+            continue;
+        };
+        let generator = spec
+            .testing
+            .generators
+            .iter()
+            .find(|generator| generator.program.id == generated.generator_id)
+            .context("generated test references a missing generator")?;
+        let recipe = generator
+            .recipes
+            .iter()
+            .find(|recipe| recipe.id == generated.recipe_id)
+            .context("generated test references a missing recipe")?;
+        let bytes = materialize_generator(
+            root,
+            &legacy_program_v2(&generator.program),
+            &recipe.argument_template,
+            Some(generated.seed),
+            options,
+        )
+        .await?;
+        let expected = read_project_bytes(root, &test.input_file)?;
+        let expected_sha256 = hex::encode(Sha256::digest(&expected));
+        let actual_sha256 = hex::encode(Sha256::digest(&bytes));
+        checks.push(LocalGeneratorCheck {
+            generator: generator.program.name.clone(),
+            recipe: recipe.name.clone(),
+            seed: generated.seed,
+            expected_sha256: Some(expected_sha256.clone()),
+            actual_sha256: actual_sha256.clone(),
+            passed: expected_sha256 == actual_sha256,
+        });
+        covered.insert((generator.program.id, recipe.id));
+    }
+    for generator in &spec.testing.generators {
+        for recipe in &generator.recipes {
+            if covered.contains(&(generator.program.id, recipe.id)) {
+                continue;
+            }
+            let bytes = materialize_generator(
+                root,
+                &legacy_program_v2(&generator.program),
+                &recipe.argument_template,
+                Some(recipe.seed_start),
+                options,
+            )
+            .await?;
+            checks.push(LocalGeneratorCheck {
+                generator: generator.program.name.clone(),
+                recipe: recipe.name.clone(),
+                seed: recipe.seed_start,
+                expected_sha256: None,
+                actual_sha256: hex::encode(Sha256::digest(&bytes)),
+                passed: true,
+            });
+        }
+    }
+    Ok(checks)
+}
+
+async fn verify_solution_matrix(
+    root: &Path,
+    spec: &reporch_format::AuthoringSpecV2,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<Vec<LocalSolutionCheck>> {
+    let mut reports = Vec::new();
+    for solution in &spec.testing.solutions {
+        let mut cases = Vec::new();
+        for test in &spec.testing.tests {
+            let result = execute_solution_case(root, spec, solution, test, options).await?;
+            let actual_verdict = if spec.problem_type == studio_core::ProblemType::Interactive {
+                interactive_execution_verdict(&result)
+            } else {
+                let checker_accepted = if result.termination
+                    == reporch_runtime_core::GuestTerminationV2::Exited
+                    && result.exit_code == 0
+                {
+                    let answer = test.answer_file.as_deref().with_context(|| {
+                        format!("test {} has no answer for solution verification", test.name)
+                    })?;
+                    checker_accepts_bytes(
+                        root,
+                        &spec.testing.checker.checker,
+                        &test.input_file,
+                        answer,
+                        &result.stdout_bytes,
+                        options,
+                    )
+                    .await?
+                } else {
+                    false
+                };
+                program_execution_verdict(&result, checker_accepted)
+            };
+            cases.push(LocalSolutionCase {
+                test_id: test.id,
+                test: test.name.clone(),
+                actual: observed_verdict_name(actual_verdict),
+                accepted: actual_verdict == Some(ExpectedVerdict::Accepted),
+                exit_code: result.exit_code,
+                termination: result.termination,
+                duration_ms: result.duration_ms,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            });
+        }
+        let score = score_v2(&spec.testing.groups, &spec.testing.tests, &cases)?;
+        let actual =
+            aggregate_solution_verdict(&cases, score, total_score_v2(&spec.testing.groups));
+        let score_matches = solution
+            .expected_score
+            .as_ref()
+            .is_none_or(|range| score >= range.minimum && score <= range.maximum);
+        reports.push(LocalSolutionCheck {
+            solution: solution.program.name.clone(),
+            expected: verdict_name(solution.expected_verdict),
+            actual: observed_verdict_name(actual),
+            score,
+            passed: actual == Some(solution.expected_verdict) && score_matches,
+            cases,
+        });
+    }
+    Ok(reports)
+}
+
+fn legacy_program_v2(program: &studio_core::ProgramSpecV2) -> ProgramSpec {
+    ProgramSpec {
+        id: program.name.clone(),
+        source_path: program.source_path.clone(),
+        language: program.language.clone(),
+        arguments: program.arguments.clone(),
+    }
+}
+
+async fn execute_solution_case(
+    root: &Path,
+    spec: &reporch_format::AuthoringSpecV2,
+    solution: &studio_core::SolutionSpecV2,
+    test: &studio_core::TestCaseSpecV2,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<reporch_cli::local_sandbox::LocalSandboxResult> {
+    match spec.problem_type {
+        studio_core::ProblemType::Interactive => {
+            let interactive = spec
+                .execution
+                .interactive
+                .as_ref()
+                .context("interactive problem has no interactor")?;
+            let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
+                options.toolchain_id.as_deref(),
+                &interactive.interactor.language,
+            )?;
+            let solution_toolchain = reporch_cli::toolchain::resolve_for_language(
+                options.toolchain_id.as_deref(),
+                &solution.program.language,
+            )?;
+            ensure!(
+                interactor_toolchain.language == solution_toolchain.language,
+                "local interactive pairing requires matching toolchain languages"
+            );
+            reporch_cli::authoring_runtime::run_interactive_pair(
+                &reporch_cli::authoring_runtime::InteractivePairRequest {
+                    project_directory: root,
+                    solver_source_path: &solution.program.source_path,
+                    interactor_source_path: &interactive.interactor.source_path,
+                    language: &interactive.interactor.language,
+                    input_path: &test.input_file,
+                    options,
+                },
+            )
+            .await
+        }
+        studio_core::ProblemType::Library | studio_core::ProblemType::Grader => {
+            let harness = spec
+                .execution
+                .harness
+                .as_ref()
+                .context("library/grader problem has no harness")?;
+            let profile = harness
+                .profiles
+                .get(&solution.program.language)
+                .or_else(|| harness.profiles.values().next())
+                .context("library/grader harness has no language profile")?;
+            ensure!(
+                reporch_cli::toolchain::resolve_for_language(None, &profile.language)?.language
+                    == reporch_cli::toolchain::resolve_for_language(
+                        None,
+                        &solution.program.language,
+                    )?
+                    .language,
+                "local grader linking requires matching C or C++ toolchains"
+            );
+            reporch_cli::authoring_runtime::run_linked_pair(
+                &reporch_cli::authoring_runtime::LinkedPairRequest {
+                    project_directory: root,
+                    first_source_path: &solution.program.source_path,
+                    second_source_path: &profile.source_path,
+                    language: &profile.language,
+                    stdin_path: &test.input_file,
+                    options,
+                },
+            )
+            .await
+        }
+        _ => {
+            reporch_cli::authoring_runtime::run_program(
+                &reporch_cli::authoring_runtime::ProgramRequest {
+                    project_directory: root,
+                    source_path: &solution.program.source_path,
+                    language: &solution.program.language,
+                    arguments: &solution.program.arguments,
+                    stdin_path: Some(&test.input_file),
+                    options,
+                },
+            )
+            .await
+        }
+    }
+}
+
+fn aggregate_solution_verdict(
+    cases: &[LocalSolutionCase],
+    score: f64,
+    total_score: f64,
+) -> Option<ExpectedVerdict> {
+    if cases.iter().any(|case| case.actual == "judge_error") {
+        return None;
+    }
+    if cases.iter().all(|case| case.accepted) {
+        return Some(ExpectedVerdict::Accepted);
+    }
+    for verdict in [
+        ExpectedVerdict::RuntimeError,
+        ExpectedVerdict::MemoryLimit,
+        ExpectedVerdict::TimeLimit,
+    ] {
+        if cases
+            .iter()
+            .any(|case| case.actual == verdict_name(verdict))
+        {
+            return Some(verdict);
+        }
+    }
+    if score > 0.0 && score < total_score {
+        Some(ExpectedVerdict::Partial)
+    } else {
+        Some(ExpectedVerdict::WrongAnswer)
+    }
+}
+
+fn total_score_v2(groups: &[studio_core::TestGroupSpecV2]) -> f64 {
+    if groups.is_empty() {
+        100.0
+    } else {
+        groups.iter().map(|group| group.points).sum()
+    }
+}
+
+fn score_v2(
+    groups: &[studio_core::TestGroupSpecV2],
+    tests: &[studio_core::TestCaseSpecV2],
+    cases: &[LocalSolutionCase],
+) -> Result<f64> {
+    if groups.is_empty() {
+        return Ok(if cases.iter().all(|case| case.accepted) {
+            100.0
+        } else {
+            0.0
+        });
+    }
+    let accepted = cases
+        .iter()
+        .map(|case| (case.test_id, case.accepted))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut resolved = std::collections::BTreeMap::<Uuid, bool>::new();
+    while resolved.len() < groups.len() {
+        let before = resolved.len();
+        for group in groups {
+            if resolved.contains_key(&group.id)
+                || group
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !resolved.contains_key(dependency))
+            {
+                continue;
+            }
+            let dependencies_passed = group
+                .depends_on
+                .iter()
+                .all(|dependency| resolved.get(dependency) == Some(&true));
+            let group_tests = tests
+                .iter()
+                .filter(|test| test.group_ids.contains(&group.id))
+                .collect::<Vec<_>>();
+            ensure!(
+                !group_tests.is_empty(),
+                "score group has no test cases: {}",
+                group.name
+            );
+            let tests_passed = group_tests
+                .iter()
+                .all(|test| accepted.get(&test.id) == Some(&true));
+            resolved.insert(group.id, dependencies_passed && tests_passed);
+        }
+        ensure!(
+            resolved.len() > before,
+            "score group dependencies contain a cycle or unknown group"
+        );
+    }
+    Ok(groups
+        .iter()
+        .filter(|group| resolved.get(&group.id) == Some(&true))
+        .map(|group| group.points)
+        .sum())
 }
 
 #[derive(Debug, Subcommand)]

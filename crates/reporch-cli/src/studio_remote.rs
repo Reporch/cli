@@ -239,6 +239,20 @@ pub struct ValidateOptions {
     pub project_id: Option<Uuid>,
     #[arg(long)]
     pub commit_id: Option<Uuid>,
+    /// Run the complete local preflight matrix in the isolated Reporch VM.
+    /// Local results never become publication evidence.
+    #[arg(long)]
+    pub local: bool,
+    /// Local execution backend. Docker and Podman remain deprecated compatibility modes.
+    #[arg(long, value_enum, default_value_t = LocalVerifyRuntime::Auto)]
+    pub runtime: LocalVerifyRuntime,
+    /// Per-program timeout for --local verification.
+    #[arg(
+        long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..=600)
+    )]
+    pub local_timeout_seconds: u64,
     /// Reuse this value after an ambiguous network failure.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -246,6 +260,14 @@ pub struct ValidateOptions {
     pub wait: bool,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
     pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum LocalVerifyRuntime {
+    #[default]
+    Auto,
+    Podman,
+    Docker,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -2718,6 +2740,10 @@ pub async fn push(options: &PushOptions) -> Result<()> {
 }
 
 pub async fn validate_operation(options: &ValidateOptions) -> Result<ValidationOperationResult> {
+    ensure!(
+        !options.local,
+        "--local verification must be dispatched through the CLI local verifier"
+    );
     validate_wait_timeout(options.timeout_seconds)?;
     let (project_id, commit_id, local_root) =
         resolve_local_candidate(options.project_id, options.commit_id)?;

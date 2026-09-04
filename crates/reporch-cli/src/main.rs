@@ -824,6 +824,20 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Grader(options) => authoring::grader(options, output).await,
         Command::Output(options) => authoring::output_submission(options, output).await,
         Command::Verify(options) => {
+            if options.local {
+                let silent = CliOutput::new(OutputFormat::Human, true, ColorMode::Never);
+                check_project(&silent)?;
+                return authoring::verify_local(
+                    options.local_timeout_seconds,
+                    match options.runtime {
+                        studio_remote::LocalVerifyRuntime::Auto => authoring::RuntimeKind::Auto,
+                        studio_remote::LocalVerifyRuntime::Podman => authoring::RuntimeKind::Podman,
+                        studio_remote::LocalVerifyRuntime::Docker => authoring::RuntimeKind::Docker,
+                    },
+                    output,
+                )
+                .await;
+            }
             let validation = studio_remote::validate_operation(&options).await?;
             if validation.detail.as_ref().is_some_and(|detail| {
                 detail.status != studio_contracts::ValidationRunStatus::Passed
@@ -2200,6 +2214,9 @@ async fn submit_project(options: SubmitOptions, output: &CliOutput) -> Result<()
         connection: options.connection.clone(),
         project_id: Some(push.commit.project_id),
         commit_id: Some(push.commit.id),
+        local: false,
+        runtime: studio_remote::LocalVerifyRuntime::Auto,
+        local_timeout_seconds: 30,
         idempotency_key: Some(format!("validation-{}", push.commit.id)),
         wait: true,
         timeout_seconds: options.timeout_seconds,
