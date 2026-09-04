@@ -275,7 +275,21 @@ pub async fn run_interactive_pair(
             "local interactive pairing currently requires matching signed C or C++ toolchains; use Studio verification for cross-language pairing"
         ),
     };
-    let script = format!(
+    let script = interactive_pair_script(solver_compile, interactor_compile);
+    let command = vec![
+        "bash".into(),
+        "-c".into(),
+        script,
+        "reporch".into(),
+        solver,
+        interactor,
+        input,
+    ];
+    execute_in_toolchain(root, command, entry.image, request.options).await
+}
+
+fn interactive_pair_script(solver_compile: &str, interactor_compile: &str) -> String {
+    format!(
         r#"set -eu
 solver=$1
 interactor=$2
@@ -303,19 +317,12 @@ printf '%s\n' '--- solver stderr ---'
 cat /run/reporch/solver.err
 printf '%s\n' '--- interactor stderr ---'
 cat /run/reporch/interactor.err
-if [ "$solver_status" -ne 0 ] || [ "$interactor_status" -ne 0 ]; then exit 1; fi
+if [ "$solver_status" -ne 0 ]; then exit 1; fi
+if [ "$interactor_status" -eq 42 ]; then exit 0; fi
+if [ "$interactor_status" -eq 43 ]; then exit 1; fi
+exit 2
 "#
-    );
-    let command = vec![
-        "bash".into(),
-        "-c".into(),
-        script,
-        "reporch".into(),
-        solver,
-        interactor,
-        input,
-    ];
-    execute_in_toolchain(root, command, entry.image, request.options).await
+    )
 }
 
 async fn checked_installed_toolchain(
@@ -604,5 +611,14 @@ mod checker_protocol_tests {
             custom_checker_verdict(CheckerProtocolV1::ReporchLegacyV0, 1),
             CustomCheckerVerdict::WrongAnswer
         );
+    }
+
+    #[test]
+    fn interactive_pair_maps_icpc_interactor_verdicts_before_returning() {
+        let script = interactive_pair_script("compile solver", "compile interactor");
+        assert!(script.contains("interactor_status\" -eq 42 ]; then exit 0"));
+        assert!(script.contains("interactor_status\" -eq 43 ]; then exit 1"));
+        assert!(script.ends_with("exit 2\n"));
+        assert!(!script.contains("interactor_status\" -ne 0"));
     }
 }

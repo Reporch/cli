@@ -2050,6 +2050,12 @@ async fn run_interactor(
         },
     )
     .await?;
+    ensure!(
+        matches!(result.exit_code, 0 | 1),
+        "interactive judge failed with exit code {}: {}",
+        result.exit_code,
+        result.stderr
+    );
     if let Some(path) = options.output.as_deref() {
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
