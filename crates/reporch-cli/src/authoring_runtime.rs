@@ -348,25 +348,31 @@ cat > /run/reporch/interactive-run.sh <<'REPORCH_INTERACTIVE'
 set -u
 input=$1
 idle_timeout=$2
-mkfifo /run/reporch/solver-to-interactor /run/reporch/interactor-to-solver /run/reporch/activity
-exec 3<>/run/reporch/solver-to-interactor
-exec 4<>/run/reporch/interactor-to-solver
+mkfifo /run/reporch/solver-to-interactor /run/reporch/interactor-to-solver /run/reporch/solver-raw /run/reporch/interactor-raw /run/reporch/activity
 exec 5<>/run/reporch/activity
 relay() {{
-  while IFS= read -r line || [ -n "$line" ]; do
-    printf '%s\n' "$line"
+  destination=$1
+  source=$2
+  transcript=$3
+  exec 6>"$destination"
+  exec 7<"$source"
+  while IFS= read -r line <&7 || [ -n "$line" ]; do
+    printf '%s\n' "$line" | tee -a "$transcript" >&6
     printf '.\n' >&5
   done
 }}
 set +e
-set -o pipefail
-/run/reporch/solver < /run/reporch/interactor-to-solver 2>/run/reporch/solver.err | relay | tee /run/reporch/solver.out > /run/reporch/solver-to-interactor &
+relay /run/reporch/solver-to-interactor /run/reporch/solver-raw /run/reporch/solver.out &
+solver_relay_pid=$!
+relay /run/reporch/interactor-to-solver /run/reporch/interactor-raw /run/reporch/interactor.out &
+interactor_relay_pid=$!
+/run/reporch/solver < /run/reporch/interactor-to-solver > /run/reporch/solver-raw 2>/run/reporch/solver.err &
 solver_pid=$!
-/run/reporch/interactor "$input" < /run/reporch/solver-to-interactor 2>/run/reporch/interactor.err | relay | tee /run/reporch/interactor.out > /run/reporch/interactor-to-solver &
+/run/reporch/interactor "$input" < /run/reporch/solver-to-interactor > /run/reporch/interactor-raw 2>/run/reporch/interactor.err &
 interactor_pid=$!
 runner_pid=$BASHPID
 idle_timed_out=0
-trap 'idle_timed_out=1; kill "$solver_pid" "$interactor_pid" 2>/dev/null || true' USR1
+trap 'idle_timed_out=1; kill "$solver_pid" "$interactor_pid" "$solver_relay_pid" "$interactor_relay_pid" 2>/dev/null || true' USR1
 (
   while kill -0 "$solver_pid" 2>/dev/null || kill -0 "$interactor_pid" 2>/dev/null; do
     if ! IFS= read -r -t "$idle_timeout" -u 5; then
@@ -381,6 +387,9 @@ wait "$solver_pid"
 solver_status=$?
 wait "$interactor_pid"
 interactor_status=$?
+wait "$solver_relay_pid" 2>/dev/null || true
+wait "$interactor_relay_pid" 2>/dev/null || true
+kill "$watchdog_pid" 2>/dev/null || true
 wait "$watchdog_pid"
 watchdog_status=$?
 trap - USR1
