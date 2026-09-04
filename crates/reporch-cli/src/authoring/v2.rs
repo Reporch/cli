@@ -318,19 +318,20 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
+                    let test_id = find_test(spec, &options.selector)?.id;
                     let group_ids = if options.groups.is_empty() {
                         None
                     } else {
                         Some(resolve_group_ids(spec, &options.groups)?)
                     };
                     if let Some(name) = &options.name {
-                        ensure_unique_test_name(spec, name, Some(options.id))?;
+                        ensure_unique_test_name(spec, name, Some(test_id))?;
                     }
                     let test = spec
                         .testing
                         .tests
                         .iter_mut()
-                        .find(|test| test.id == options.id)
+                        .find(|test| test.id == test_id)
                         .context("test case was not found")?;
                     if let Some(name) = &options.name {
                         test.name = normalize_name(name)?;
@@ -344,15 +345,16 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test case update",
                 &spec.testing.tests,
-                &format!("Updated test case {}", options.id),
+                &format!("Updated test case {}", options.selector),
             )
         }
-        TestCaseCommand::Remove { id } => {
+        TestCaseCommand::Remove { selector } => {
             let mut inventory_removed = Vec::new();
             let mut files_preserved = Vec::new();
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |root, spec| {
+                    let id = find_test(spec, &selector)?.id;
                     let test = spec
                         .testing
                         .tests
@@ -388,7 +390,7 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
                     inventory_removed,
                     files_preserved,
                 },
-                &format!("Removed test case {id}"),
+                &format!("Removed test case {selector}"),
             )
         }
     }

@@ -85,7 +85,11 @@ enum TestCaseCommand {
     Add(TestCaseAddOptions),
     Import(TestCaseImportOptions),
     Update(TestCaseUpdateOptions),
-    Remove { id: Uuid },
+    Remove {
+        /// Test name, UUID, or declared input path.
+        #[arg(value_name = "NAME|UUID|PATH")]
+        selector: String,
+    },
 }
 
 #[derive(Debug, ClapArgs)]
@@ -126,7 +130,9 @@ struct TestCaseImportOptions {
 
 #[derive(Debug, ClapArgs)]
 struct TestCaseUpdateOptions {
-    id: Uuid,
+    /// Test name, UUID, or declared input path.
+    #[arg(value_name = "NAME|UUID|PATH")]
+    selector: String,
     #[arg(long)]
     name: Option<String>,
     #[arg(long = "group")]
@@ -1006,15 +1012,16 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
+                    let test_id = find_legacy_test(spec, &options.selector)?.id;
                     ensure_groups_exist(spec, &options.groups)?;
                     if let Some(name) = &options.name {
-                        ensure_unique_test_name(spec, name, Some(options.id))?;
+                        ensure_unique_test_name(spec, name, Some(test_id))?;
                     }
                     let test = spec
                         .judging
                         .tests
                         .iter_mut()
-                        .find(|test| test.id == options.id)
+                        .find(|test| test.id == test_id)
                         .context("test case was not found")?;
                     if let Some(name) = &options.name {
                         test.name = normalize_name(name)?;
@@ -1028,13 +1035,14 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test case update",
                 &spec.judging.tests,
-                &format!("Updated test case {}", options.id),
+                &format!("Updated test case {}", options.selector),
             )
         }
-        TestCaseCommand::Remove { id } => {
+        TestCaseCommand::Remove { selector } => {
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
+                    let id = find_legacy_test(spec, &selector)?.id;
                     let before = spec.judging.tests.len();
                     spec.judging.tests.retain(|test| test.id != id);
                     ensure!(
@@ -1050,7 +1058,7 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test case remove",
                 &spec.judging.tests,
-                &format!("Removed test case {id}"),
+                &format!("Removed test case {selector}"),
             )
         }
     }
