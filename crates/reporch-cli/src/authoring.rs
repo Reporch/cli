@@ -712,7 +712,14 @@ pub async fn verify_local(
         cpus: 1.0,
         output_kib: 1_024,
     };
-    let run_options = runtime.clone().into_run_options(output);
+    let mut run_options = runtime.clone().into_run_options(output);
+    run_options.timeout = Duration::from_millis(
+        spec.testing
+            .limits
+            .time_ms
+            .max(1_000)
+            .min(timeout_seconds.saturating_mul(1_000)),
+    );
 
     let batch = local_verify_batch::try_verify(&root, &spec, &run_options, output).await?;
     let (generator_checks, validator_units, checker_units, solutions, output_submissions) =
