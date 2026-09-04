@@ -389,7 +389,21 @@ pub(super) async fn try_verify(
                     .tests
                     .get(case_index)
                     .context("solution test result index is out of range")?;
-                let actual = parse_verdict(fields[3])?;
+                let solution = spec
+                    .testing
+                    .solutions
+                    .get(owner)
+                    .context("solution result index is out of range")?;
+                let actual = if reporch_cli::authoring_runtime::memory_limit_exceeded(
+                    &solution.program.language,
+                    exit_code,
+                    termination,
+                    &stderr,
+                ) {
+                    Some(ExpectedVerdict::MemoryLimit)
+                } else {
+                    parse_verdict(fields[3])?
+                };
                 solution_cases
                     .get_mut(owner)
                     .context("solution result index is out of range")?

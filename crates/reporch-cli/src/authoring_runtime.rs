@@ -643,6 +643,51 @@ pub fn compilation_failed(result: &LocalSandboxResult) -> bool {
     result.exit_code == 126 && result.stderr.lines().any(|line| line == COMPILATION_FAILURE_MARKER)
 }
 
+pub fn memory_limit_exceeded(
+    language: &str,
+    exit_code: i32,
+    termination: reporch_runtime_core::GuestTerminationV2,
+    stderr: &str,
+) -> bool {
+    if exit_code == 0
+        || matches!(
+            termination,
+            reporch_runtime_core::GuestTerminationV2::TimedOut
+                | reporch_runtime_core::GuestTerminationV2::OutputLimit
+                | reporch_runtime_core::GuestTerminationV2::InternalError
+        )
+    {
+        return false;
+    }
+    let language = language.trim().to_ascii_lowercase();
+    let stderr = stderr.to_ascii_lowercase();
+    match language.as_str() {
+        "cpp" | "c++" | "cpp17" | "cpp20" | "gnu++17" | "gnu++20" => {
+            stderr.contains("std::bad_alloc")
+        }
+        "rust" | "rust2021" | "rust2024" => {
+            stderr.contains("memory allocation of ") && stderr.contains(" failed")
+        }
+        "java" => stderr.contains("java.lang.outofmemoryerror"),
+        "csharp" | "c#" | "cs" | "dotnet" => {
+            stderr.contains("system.outofmemoryexception")
+        }
+        "python" | "python3" | "py" | "pypy" | "pypy3" => stderr
+            .lines()
+            .any(|line| line.trim() == "memoryerror" || line.trim().starts_with("memoryerror:")),
+        "javascript" | "js" | "node" | "nodejs" => {
+            stderr.contains("javascript heap out of memory")
+        }
+        "php" => stderr.contains("allowed memory size of") && stderr.contains("exhausted"),
+        "r" => {
+            stderr.contains("cannot allocate vector of size")
+                || stderr.contains("memory exhausted")
+        }
+        "swift" => stderr.contains("failed to allocate") && stderr.contains("fatal error"),
+        _ => false,
+    }
+}
+
 fn timeout_command(timeout: Duration) -> String {
     format!(
         "timeout --kill-after=1s {:.3}s",
@@ -796,5 +841,27 @@ mod checker_protocol_tests {
         let script = &command[2];
         assert!(script.contains(COMPILATION_FAILURE_MARKER), "{script}");
         assert!(script.contains("exit 126"), "{script}");
+    }
+
+    #[test]
+    fn language_runtime_memory_failures_are_classified_without_matching_generic_crashes() {
+        assert!(memory_limit_exceeded(
+            "cpp",
+            128,
+            reporch_runtime_core::GuestTerminationV2::Signalled,
+            "terminate called after throwing an instance of 'std::bad_alloc'",
+        ));
+        assert!(memory_limit_exceeded(
+            "python3",
+            1,
+            reporch_runtime_core::GuestTerminationV2::Exited,
+            "Traceback (most recent call last):\nMemoryError",
+        ));
+        assert!(!memory_limit_exceeded(
+            "cpp",
+            128,
+            reporch_runtime_core::GuestTerminationV2::Signalled,
+            "Aborted",
+        ));
     }
 }

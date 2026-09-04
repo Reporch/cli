@@ -918,7 +918,11 @@ async fn verify_solution_matrix(
                 } else {
                     false
                 };
-                program_execution_verdict(&result, checker_accepted)
+                program_execution_verdict(
+                    &result,
+                    checker_accepted,
+                    &solution.program.language,
+                )
             };
             cases.push(LocalSolutionCase {
                 test_id: test.id,
@@ -2878,7 +2882,7 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
     }
-    let actual_verdict = program_execution_verdict(&result, checker_accepted);
+    let actual_verdict = program_execution_verdict(&result, checker_accepted, &solution.language);
     let report = RuntimeProgramReport {
         solution: solution.name.clone(),
         test_id: test.id,
@@ -2927,9 +2931,18 @@ struct RuntimeProgramReport {
 fn program_execution_verdict(
     result: &reporch_cli::local_sandbox::LocalSandboxResult,
     checker_accepted: bool,
+    language: &str,
 ) -> Option<ExpectedVerdict> {
     if reporch_cli::authoring_runtime::compilation_failed(result) {
         return None;
+    }
+    if reporch_cli::authoring_runtime::memory_limit_exceeded(
+        language,
+        result.exit_code,
+        result.termination,
+        &result.stderr,
+    ) {
+        return Some(ExpectedVerdict::MemoryLimit);
     }
     match result.termination {
         reporch_runtime_core::GuestTerminationV2::Exited if result.exit_code == 0 => {
