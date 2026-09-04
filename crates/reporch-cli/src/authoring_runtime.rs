@@ -349,6 +349,8 @@ set -u
 input=$1
 idle_timeout=$2
 mkfifo /run/reporch/solver-to-interactor /run/reporch/interactor-to-solver /run/reporch/solver-raw /run/reporch/interactor-raw /run/reporch/activity
+: > /run/reporch/solver.out
+: > /run/reporch/interactor.out
 exec 5<>/run/reporch/activity
 relay() {{
   destination=$1
