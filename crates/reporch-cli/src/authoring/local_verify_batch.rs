@@ -434,12 +434,16 @@ pub(super) async fn try_verify(
             .expected_score
             .as_ref()
             .is_none_or(|range| score >= range.minimum && score <= range.maximum);
+        let group_expectations = group_solution_checks(spec, solution, &cases)?;
         solutions.push(LocalSolutionCheck {
             solution: solution.program.name.clone(),
             expected: verdict_name(solution.expected_verdict),
             actual: observed_verdict_name(actual),
             score,
-            passed: actual == Some(solution.expected_verdict) && score_matches,
+            passed: actual == Some(solution.expected_verdict)
+                && score_matches
+                && group_expectations.iter().all(|group| group.passed),
+            group_expectations,
             cases,
         });
     }

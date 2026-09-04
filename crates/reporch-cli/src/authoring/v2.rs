@@ -1367,6 +1367,8 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                             });
                     validate_solution_role(expected_verdict, role)?;
                     ensure_reference_is_available(spec, role, None)?;
+                    let group_expectations =
+                        resolve_group_expectations(spec, &options.group_expectations)?;
                     spec.testing.solutions.push(SolutionSpecV2 {
                         program: ProgramSpecV2 {
                             id: Uuid::now_v7(),
@@ -1378,7 +1380,7 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                         role,
                         expected_verdict,
                         expected_score: expected_score.clone(),
-                        group_expectations: Vec::new(),
+                        group_expectations,
                         tags: Vec::new(),
                         notes: String::new(),
                     });
@@ -1420,11 +1422,24 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                     };
                     validate_solution_role(expected_verdict, role)?;
                     ensure_reference_is_available(spec, role, Some(solution_index))?;
+                    let group_expectations = if options.clear_group_expectations {
+                        Some(Vec::new())
+                    } else if options.group_expectations.is_empty() {
+                        None
+                    } else {
+                        Some(resolve_group_expectations(
+                            spec,
+                            &options.group_expectations,
+                        )?)
+                    };
 
                     let solution = &mut spec.testing.solutions[solution_index];
                     solution.expected_verdict = expected_verdict;
                     solution.role = role;
                     solution.expected_score = expected_score;
+                    if let Some(group_expectations) = group_expectations {
+                        solution.group_expectations = group_expectations;
+                    }
                     Ok(())
                 },
             )?;
@@ -1487,6 +1502,46 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
             )
         }
     }
+}
+
+fn resolve_group_expectations(
+    spec: &reporch_format::AuthoringSpecV2,
+    requested: &[GroupExpectationInput],
+) -> Result<Vec<studio_core::GroupSolutionExpectationV2>> {
+    let mut resolved = Vec::with_capacity(requested.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for expectation in requested {
+        let parsed = Uuid::parse_str(&expectation.group).ok();
+        let group = spec
+            .testing
+            .groups
+            .iter()
+            .find(|group| group.name == expectation.group || parsed == Some(group.id))
+            .with_context(|| {
+                format!(
+                    "group was not found: {}; list groups with `reporch test group list --format json`",
+                    expectation.group
+                )
+            })?;
+        ensure!(
+            seen.insert(group.id),
+            "duplicate group expectation: {}",
+            expectation.group
+        );
+        let verdict = expectation.verdict.into();
+        let score = score_range_for_verdict(
+            expectation.minimum_score,
+            expectation.maximum_score,
+            verdict,
+        )?;
+        resolved.push(studio_core::GroupSolutionExpectationV2 {
+            group_id: group.id,
+            verdict,
+            score,
+        });
+    }
+    resolved.sort_by_key(|expectation| expectation.group_id);
+    Ok(resolved)
 }
 
 fn emit_solutions(command: &'static str, output: &CliOutput) -> Result<()> {

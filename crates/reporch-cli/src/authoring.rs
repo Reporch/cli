@@ -666,7 +666,18 @@ struct LocalSolutionCheck {
     actual: &'static str,
     score: f64,
     passed: bool,
+    group_expectations: Vec<LocalGroupSolutionCheck>,
     cases: Vec<LocalSolutionCase>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalGroupSolutionCheck {
+    group_id: Uuid,
+    group: String,
+    expected: &'static str,
+    actual: &'static str,
+    score: f64,
+    passed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -928,12 +939,16 @@ async fn verify_solution_matrix(
             .expected_score
             .as_ref()
             .is_none_or(|range| score >= range.minimum && score <= range.maximum);
+        let group_expectations = group_solution_checks(spec, solution, &cases)?;
         reports.push(LocalSolutionCheck {
             solution: solution.program.name.clone(),
             expected: verdict_name(solution.expected_verdict),
             actual: observed_verdict_name(actual),
             score,
-            passed: actual == Some(solution.expected_verdict) && score_matches,
+            passed: actual == Some(solution.expected_verdict)
+                && score_matches
+                && group_expectations.iter().all(|group| group.passed),
+            group_expectations,
             cases,
         });
     }
@@ -1066,6 +1081,122 @@ fn aggregate_solution_verdict(
     }
 }
 
+fn group_solution_checks(
+    spec: &reporch_format::AuthoringSpecV2,
+    solution: &studio_core::SolutionSpecV2,
+    cases: &[LocalSolutionCase],
+) -> Result<Vec<LocalGroupSolutionCheck>> {
+    let accepted = cases
+        .iter()
+        .map(|case| (case.test_id, case.accepted))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut group_passes = std::collections::BTreeMap::<Uuid, bool>::new();
+    while group_passes.len() < spec.testing.groups.len() {
+        let before = group_passes.len();
+        for group in &spec.testing.groups {
+            if group_passes.contains_key(&group.id)
+                || group
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !group_passes.contains_key(dependency))
+            {
+                continue;
+            }
+            let dependencies_passed = group
+                .depends_on
+                .iter()
+                .all(|dependency| group_passes.get(dependency) == Some(&true));
+            let tests = spec
+                .testing
+                .tests
+                .iter()
+                .filter(|test| test.group_ids.contains(&group.id))
+                .collect::<Vec<_>>();
+            ensure!(!tests.is_empty(), "score group has no test cases: {}", group.name);
+            let tests_passed = tests
+                .iter()
+                .all(|test| accepted.get(&test.id) == Some(&true));
+            group_passes.insert(group.id, dependencies_passed && tests_passed);
+        }
+        ensure!(
+            group_passes.len() > before,
+            "score group dependencies contain a cycle or unknown group"
+        );
+    }
+
+    solution
+        .group_expectations
+        .iter()
+        .map(|expectation| {
+            let group = spec
+                .testing
+                .groups
+                .iter()
+                .find(|group| group.id == expectation.group_id)
+                .context("solution expectation references a missing group")?;
+            let group_cases = cases
+                .iter()
+                .filter(|case| {
+                    spec.testing.tests.iter().any(|test| {
+                        test.id == case.test_id && test.group_ids.contains(&group.id)
+                    })
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                !group_cases.is_empty(),
+                "solution expectation group has no test cases: {}",
+                group.name
+            );
+            let effective_pass = group_passes.get(&group.id) == Some(&true);
+            let score = if effective_pass { group.points } else { 0.0 };
+            let actual = aggregate_group_verdict(&group_cases, effective_pass, score, group.points);
+            let score_matches = expectation
+                .score
+                .as_ref()
+                .is_none_or(|range| score >= range.minimum && score <= range.maximum);
+            Ok(LocalGroupSolutionCheck {
+                group_id: group.id,
+                group: group.name.clone(),
+                expected: verdict_name(expectation.verdict),
+                actual: observed_verdict_name(actual),
+                score,
+                passed: actual == Some(expectation.verdict) && score_matches,
+            })
+        })
+        .collect()
+}
+
+fn aggregate_group_verdict(
+    cases: &[&LocalSolutionCase],
+    effective_pass: bool,
+    score: f64,
+    total_score: f64,
+) -> Option<ExpectedVerdict> {
+    if cases.iter().any(|case| case.actual == "judge_error") {
+        return None;
+    }
+    if effective_pass && cases.iter().all(|case| case.accepted) {
+        return Some(ExpectedVerdict::Accepted);
+    }
+    for verdict in [
+        ExpectedVerdict::RuntimeError,
+        ExpectedVerdict::MemoryLimit,
+        ExpectedVerdict::TimeLimit,
+    ] {
+        if cases
+            .iter()
+            .any(|case| case.actual == verdict_name(verdict))
+        {
+            return Some(verdict);
+        }
+    }
+    if score > 0.0 && score < total_score {
+        Some(ExpectedVerdict::Partial)
+    } else {
+        Some(ExpectedVerdict::WrongAnswer)
+    }
+}
+
 fn total_score_v2(groups: &[studio_core::TestGroupSpecV2]) -> f64 {
     if groups.is_empty() {
         100.0
@@ -1158,6 +1289,13 @@ struct SolutionAddOptions {
     minimum_score: Option<f64>,
     #[arg(long)]
     maximum_score: Option<f64>,
+    /// Expected verdict for one group, for example `small=accepted` or `full=partial:20..40`.
+    #[arg(
+        long = "group-expectation",
+        value_name = "GROUP=VERDICT[:MIN..MAX]",
+        value_parser = parse_group_expectation
+    )]
+    group_expectations: Vec<GroupExpectationInput>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -1171,6 +1309,25 @@ struct SolutionUpdateOptions {
     #[arg(long)]
     minimum_score: Option<f64>,
     #[arg(long)]
+    maximum_score: Option<f64>,
+    /// Replace group expectations; repeat for multiple groups.
+    #[arg(
+        long = "group-expectation",
+        value_name = "GROUP=VERDICT[:MIN..MAX]",
+        value_parser = parse_group_expectation,
+        conflicts_with = "clear_group_expectations"
+    )]
+    group_expectations: Vec<GroupExpectationInput>,
+    /// Remove every per-group expectation from this solution.
+    #[arg(long)]
+    clear_group_expectations: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GroupExpectationInput {
+    group: String,
+    verdict: Verdict,
+    minimum_score: Option<f64>,
     maximum_score: Option<f64>,
 }
 
@@ -3925,6 +4082,60 @@ fn parse_output_mapping(value: &str) -> Result<(Uuid, String), String> {
         })?;
     let path = relative_string(Path::new(path)).map_err(|error| error.to_string())?;
     Ok((test_id, path))
+}
+
+fn parse_group_expectation(value: &str) -> Result<GroupExpectationInput, String> {
+    let (group, expectation) = value
+        .split_once('=')
+        .ok_or_else(|| "group expectation must use GROUP=VERDICT[:MIN..MAX]".to_owned())?;
+    let group = group.trim();
+    if group.is_empty() {
+        return Err("group expectation selector cannot be empty".into());
+    }
+    let (verdict, score) = expectation
+        .split_once(':')
+        .map_or((expectation, None), |(verdict, score)| (verdict, Some(score)));
+    let verdict = match verdict.trim().replace('_', "-").as_str() {
+        "accepted" => Verdict::Accepted,
+        "wrong-answer" => Verdict::WrongAnswer,
+        "time-limit" => Verdict::TimeLimit,
+        "memory-limit" => Verdict::MemoryLimit,
+        "runtime-error" => Verdict::RuntimeError,
+        "partial" => Verdict::Partial,
+        _ => {
+            return Err(
+                "group verdict must be accepted, wrong-answer, time-limit, memory-limit, runtime-error, or partial"
+                    .into(),
+            );
+        }
+    };
+    let (minimum_score, maximum_score) = match score {
+        Some(score) => {
+            let (minimum, maximum) = score
+                .split_once("..")
+                .ok_or_else(|| "group score range must use MIN..MAX".to_owned())?;
+            let minimum = minimum
+                .parse::<f64>()
+                .map_err(|_| "group minimum score is invalid".to_owned())?;
+            let maximum = maximum
+                .parse::<f64>()
+                .map_err(|_| "group maximum score is invalid".to_owned())?;
+            (Some(minimum), Some(maximum))
+        }
+        None => (None, None),
+    };
+    if matches!(verdict, Verdict::Partial) != minimum_score.is_some() {
+        return Err(
+            "partial group expectations require :MIN..MAX; other verdicts cannot have a score range"
+                .into(),
+        );
+    }
+    Ok(GroupExpectationInput {
+        group: group.to_owned(),
+        verdict,
+        minimum_score,
+        maximum_score,
+    })
 }
 
 fn parse_runtime_output_path(value: &str) -> Result<PathBuf, String> {
