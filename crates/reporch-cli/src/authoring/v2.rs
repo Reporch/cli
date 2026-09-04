@@ -426,6 +426,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestGroupCommand::Add(options) => {
+            super::validate_group_points(options.points)?;
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -452,6 +453,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
                             ScoreAggregationV2::AllOrNothing
                         },
                     });
+                    ensure_v2_group_dependencies_acyclic(&spec.testing.groups)?;
                     Ok(())
                 },
             )?;
@@ -467,6 +469,9 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestGroupCommand::Update(options) => {
+            if let Some(points) = options.points {
+                super::validate_group_points(points)?;
+            }
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -493,6 +498,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
                     if let Some(depends_on) = depends_on {
                         group.depends_on = depends_on;
                     }
+                    ensure_v2_group_dependencies_acyclic(&spec.testing.groups)?;
                     Ok(())
                 },
             )?;
@@ -1036,10 +1042,15 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                 CheckerKind::Exact => CheckerSpec::Exact,
                 CheckerKind::Token => CheckerSpec::Token,
                 CheckerKind::CaseInsensitive => CheckerSpec::CaseInsensitive,
-                CheckerKind::Floating => CheckerSpec::Floating {
-                    absolute_error: absolute_error.context("--absolute-error is required")?,
-                    relative_error: relative_error.context("--relative-error is required")?,
-                },
+                CheckerKind::Floating => {
+                    let absolute_error = absolute_error.context("--absolute-error is required")?;
+                    let relative_error = relative_error.context("--relative-error is required")?;
+                    super::validate_floating_tolerances(&absolute_error, &relative_error)?;
+                    CheckerSpec::Floating {
+                        absolute_error,
+                        relative_error,
+                    }
+                }
                 CheckerKind::Custom => CheckerSpec::Custom {
                     source_path: source.clone().context("--source is required")?,
                     language: language.clone().context("--language is required")?,
@@ -2790,6 +2801,28 @@ fn resolve_group_ids(
         .iter()
         .map(|name| Ok(find_group(spec, name)?.id))
         .collect()
+}
+
+fn ensure_v2_group_dependencies_acyclic(groups: &[TestGroupSpecV2]) -> Result<()> {
+    let mut resolved = std::collections::BTreeSet::new();
+    while resolved.len() < groups.len() {
+        let before = resolved.len();
+        for group in groups {
+            if !resolved.contains(&group.id)
+                && group
+                    .depends_on
+                    .iter()
+                    .all(|dependency| resolved.contains(dependency))
+            {
+                resolved.insert(group.id);
+            }
+        }
+        ensure!(
+            resolved.len() > before,
+            "test group dependency graph cannot contain a cycle"
+        );
+    }
+    Ok(())
 }
 
 fn find_group<'a>(

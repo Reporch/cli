@@ -1116,6 +1116,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestGroupCommand::Add(options) => {
+            validate_group_points(options.points)?;
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -1136,6 +1137,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
                         depends_on: options.depends_on.clone(),
                         feedback_policy: studio_core::GroupFeedbackPolicyV1::Complete,
                     });
+                    ensure_v1_group_dependencies_acyclic(&spec.judging.groups)?;
                     Ok(())
                 },
             )?;
@@ -1151,6 +1153,9 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestGroupCommand::Update(options) => {
+            if let Some(points) = options.points {
+                validate_group_points(points)?;
+            }
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -1171,6 +1176,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
                     if !options.depends_on.is_empty() {
                         group.depends_on.clone_from(&options.depends_on);
                     }
+                    ensure_v1_group_dependencies_acyclic(&spec.judging.groups)?;
                     Ok(())
                 },
             )?;
@@ -1693,10 +1699,15 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                 CheckerKind::Exact => CheckerSpec::Exact,
                 CheckerKind::Token => CheckerSpec::Token,
                 CheckerKind::CaseInsensitive => CheckerSpec::CaseInsensitive,
-                CheckerKind::Floating => CheckerSpec::Floating {
-                    absolute_error: absolute_error.context("--absolute-error is required")?,
-                    relative_error: relative_error.context("--relative-error is required")?,
-                },
+                CheckerKind::Floating => {
+                    let absolute_error = absolute_error.context("--absolute-error is required")?;
+                    let relative_error = relative_error.context("--relative-error is required")?;
+                    validate_floating_tolerances(&absolute_error, &relative_error)?;
+                    CheckerSpec::Floating {
+                        absolute_error,
+                        relative_error,
+                    }
+                }
                 CheckerKind::Custom => CheckerSpec::Custom {
                     source_path: source.clone().context("--source is required")?,
                     language: language.clone().context("--language is required")?,
@@ -3044,6 +3055,48 @@ fn validate_group_id(id: &str) -> Result<()> {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
         "group ID must contain 1-64 letters, numbers, '-' or '_'"
+    );
+    Ok(())
+}
+
+fn validate_group_points(points: f64) -> Result<()> {
+    ensure!(
+        points.is_finite() && (0.0..=100.0).contains(&points),
+        "group points must be a finite value from 0 to 100"
+    );
+    Ok(())
+}
+
+fn ensure_v1_group_dependencies_acyclic(groups: &[TestGroupSpec]) -> Result<()> {
+    let mut resolved = std::collections::BTreeSet::new();
+    while resolved.len() < groups.len() {
+        let before = resolved.len();
+        for group in groups {
+            if !resolved.contains(&group.id)
+                && group
+                    .depends_on
+                    .iter()
+                    .all(|dependency| resolved.contains(dependency))
+            {
+                resolved.insert(group.id.clone());
+            }
+        }
+        ensure!(
+            resolved.len() > before,
+            "test group dependency graph cannot contain a cycle"
+        );
+    }
+    Ok(())
+}
+
+fn validate_floating_tolerances(absolute_error: &str, relative_error: &str) -> Result<()> {
+    let absolute = absolute_error.parse::<f64>().ok();
+    let relative = relative_error.parse::<f64>().ok();
+    ensure!(
+        absolute.is_some_and(|value| value.is_finite() && value >= 0.0)
+            && relative.is_some_and(|value| value.is_finite() && value >= 0.0)
+            && (absolute != Some(0.0) || relative != Some(0.0)),
+        "floating checker tolerances must be finite and non-negative, with at least one greater than zero"
     );
     Ok(())
 }
