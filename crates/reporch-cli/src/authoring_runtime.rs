@@ -698,11 +698,11 @@ fn timeout_command(timeout: Duration) -> String {
     format!("timeout --kill-after=1s {:.3}s", timeout.as_secs_f64())
 }
 
-/// Run an authored workload behind a marker that is independent of the
+/// Run an authored workload behind a watchdog that is independent of the
 /// toolchain's `timeout` implementation. Some minimal Linux toolchains replace
 /// themselves with the child and surface SIGTERM/SIGKILL instead of exit 124;
-/// the marker keeps that real timeout distinct from a program that crashes on
-/// its own. Compilation happens before this fragment, so build failures can
+/// the watchdog keeps that real timeout distinct from a program that crashes
+/// on its own. Compilation happens before this fragment, so build failures can
 /// never consume the runtime budget or satisfy a TLE expectation.
 fn workload_command(command: &str, input: Option<&str>, timeout: Duration) -> String {
     let invocation = input.map_or_else(
@@ -718,7 +718,7 @@ fn workload_command(command: &str, input: Option<&str>, timeout: Duration) -> St
         },
     );
     format!(
-        "timeout_marker=/run/reporch/workload-timeout.$$; rm -f \"$timeout_marker\"; (sleep {seconds:.3}; : > \"$timeout_marker\") & timeout_marker_pid=$!; set +e; {timeout_command} {invocation}; status=$?; set -e; sleep 0.02; if kill -0 \"$timeout_marker_pid\" 2>/dev/null; then kill \"$timeout_marker_pid\" 2>/dev/null || true; fi; wait \"$timeout_marker_pid\" 2>/dev/null || true; if [ -f \"$timeout_marker\" ]; then rm -f \"$timeout_marker\"; exit 124; fi; exit \"$status\"",
+        "sleep {seconds:.3} </dev/null >/dev/null 2>&1 & timeout_watchdog_pid=$!; set +e; {timeout_command} {invocation}; status=$?; set -e; sleep 0.02; if kill -0 \"$timeout_watchdog_pid\" 2>/dev/null; then kill \"$timeout_watchdog_pid\" 2>/dev/null || true; wait \"$timeout_watchdog_pid\" 2>/dev/null || true; else wait \"$timeout_watchdog_pid\" 2>/dev/null || true; status=124; fi; exit \"$status\"",
         seconds = timeout.as_secs_f64(),
         timeout_command = timeout_command(timeout),
     )
@@ -867,8 +867,8 @@ mod checker_protocol_tests {
         assert_eq!(command, "timeout --kill-after=1s 1.000s");
         assert!(!command.contains("--signal=KILL"));
         let command = workload_command("/run/reporch/program", None, Duration::from_secs(1));
-        assert!(command.contains("workload-timeout.$$"));
-        assert!(command.contains("exit 124"));
+        assert!(command.contains("timeout_watchdog_pid=$!"));
+        assert!(command.contains("status=124"));
     }
 
     #[test]

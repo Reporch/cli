@@ -561,10 +561,9 @@ fn append_execution(
     output: &str,
     timeout: std::time::Duration,
 ) -> Result<()> {
-    script.push_str("timeout_marker=/run/reporch/batch-timeout.$$\nrm -f \"$timeout_marker\"\n");
     writeln!(
         script,
-        "(sleep {:.3}; : > \"$timeout_marker\") & timeout_marker_pid=$!",
+        "sleep {:.3} </dev/null >/dev/null 2>&1 & timeout_watchdog_pid=$!",
         timeout.as_secs_f64(),
     )?;
     script.push_str("set +e\n");
@@ -577,7 +576,7 @@ fn append_execution(
         timeout.as_secs_f64(),
     )?;
     script.push_str(
-        "status=$?\nsleep 0.02\nif kill -0 \"$timeout_marker_pid\" 2>/dev/null; then kill \"$timeout_marker_pid\" 2>/dev/null || true; fi\nwait \"$timeout_marker_pid\" 2>/dev/null || true\nif [ -f \"$timeout_marker\" ]; then status=124; rm -f \"$timeout_marker\"; fi\nset -e\n",
+        "status=$?\nsleep 0.02\nif kill -0 \"$timeout_watchdog_pid\" 2>/dev/null; then\nkill \"$timeout_watchdog_pid\" 2>/dev/null || true\nwait \"$timeout_watchdog_pid\" 2>/dev/null || true\nelse\nwait \"$timeout_watchdog_pid\" 2>/dev/null || true\nstatus=124\nfi\nset -e\n",
     );
     Ok(())
 }
