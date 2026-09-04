@@ -2613,7 +2613,10 @@ async fn run_interactor(
         .context("no interactor is configured")?;
     let solution = find_runtime_solution(&spec, &options.solution)?;
     let test = find_test(&spec, &options.test)?;
-    let run_options = options.runtime.into_run_options(output);
+    let mut run_options = options.runtime.into_run_options(output);
+    run_options.timeout = run_options
+        .timeout
+        .min(Duration::from_millis(spec.testing.limits.time_ms.max(1)));
     let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
         run_options.toolchain_id.as_deref(),
         &interactive.interactor.language,
@@ -2633,6 +2636,7 @@ async fn run_interactor(
             interactor_source_path: &interactive.interactor.source_path,
             language: &interactive.interactor.language,
             input_path: &test.input_file,
+            idle_timeout: Duration::from_millis(interactive.idle_timeout_ms),
             options: &run_options,
         },
     )

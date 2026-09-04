@@ -717,7 +717,7 @@ pub async fn verify_local(
         spec.testing
             .limits
             .time_ms
-            .max(1_000)
+            .max(1)
             .min(timeout_seconds.saturating_mul(1_000)),
     );
 
@@ -982,6 +982,7 @@ async fn execute_solution_case(
                     interactor_source_path: &interactive.interactor.source_path,
                     language: &interactive.interactor.language,
                     input_path: &test.input_file,
+                    idle_timeout: Duration::from_millis(interactive.idle_timeout_ms),
                     options,
                 },
             )
@@ -2616,6 +2617,7 @@ async fn run_interactor(
             interactor_source_path: interactor_path,
             language: interactor_language,
             input_path: &test.input_file,
+            idle_timeout: run_options.timeout,
             options: &run_options,
         },
     )

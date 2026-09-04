@@ -151,6 +151,7 @@ pub struct InteractivePairRequest<'a> {
     pub interactor_source_path: &'a str,
     pub language: &'a str,
     pub input_path: &'a str,
+    pub idle_timeout: Duration,
     pub options: &'a AuthoringRunOptions,
 }
 
@@ -299,6 +300,7 @@ pub async fn run_interactive_pair(
         solver_compile,
         interactor_compile,
         request.options.timeout,
+        request.idle_timeout,
     );
     let command = vec![
         "bash".into(),
@@ -318,6 +320,7 @@ fn interactive_pair_script(solver_compile: &str, interactor_compile: &str) -> St
         solver_compile,
         interactor_compile,
         Duration::from_secs(30),
+        Duration::from_secs(2),
     )
 }
 
@@ -325,6 +328,7 @@ fn interactive_pair_script_with_timeout(
     solver_compile: &str,
     interactor_compile: &str,
     timeout: Duration,
+    idle_timeout: Duration,
 ) -> String {
     let solver_compile = guarded_compiler(solver_compile);
     let interactor_compile = guarded_compiler(interactor_compile);
@@ -333,24 +337,49 @@ fn interactive_pair_script_with_timeout(
 solver=$1
 interactor=$2
 input=$3
+idle_timeout={idle_timeout:.3}
 {solver_compile}
 {interactor_compile}
 cat > /run/reporch/interactive-run.sh <<'REPORCH_INTERACTIVE'
 set -u
 input=$1
-mkfifo /run/reporch/solver-to-interactor /run/reporch/interactor-to-solver
+idle_timeout=$2
+mkfifo /run/reporch/solver-to-interactor /run/reporch/interactor-to-solver /run/reporch/activity
 exec 3<>/run/reporch/solver-to-interactor
 exec 4<>/run/reporch/interactor-to-solver
+exec 5<>/run/reporch/activity
+relay() {{
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$line"
+    printf '.\n' >&5
+  done
+}}
 set +e
 set -o pipefail
-/run/reporch/solver < /run/reporch/interactor-to-solver 2>/run/reporch/solver.err | tee /run/reporch/solver.out > /run/reporch/solver-to-interactor &
+/run/reporch/solver < /run/reporch/interactor-to-solver 2>/run/reporch/solver.err | relay | tee /run/reporch/solver.out > /run/reporch/solver-to-interactor &
 solver_pid=$!
-/run/reporch/interactor "$input" < /run/reporch/solver-to-interactor 2>/run/reporch/interactor.err | tee /run/reporch/interactor.out > /run/reporch/interactor-to-solver &
+/run/reporch/interactor "$input" < /run/reporch/solver-to-interactor 2>/run/reporch/interactor.err | relay | tee /run/reporch/interactor.out > /run/reporch/interactor-to-solver &
 interactor_pid=$!
+runner_pid=$BASHPID
+idle_timed_out=0
+trap 'idle_timed_out=1; kill "$solver_pid" "$interactor_pid" 2>/dev/null || true' USR1
+(
+  while kill -0 "$solver_pid" 2>/dev/null || kill -0 "$interactor_pid" 2>/dev/null; do
+    if ! IFS= read -r -t "$idle_timeout" -u 5; then
+      kill -USR1 "$runner_pid"
+      exit 124
+    fi
+  done
+  exit 0
+) &
+watchdog_pid=$!
 wait "$solver_pid"
 solver_status=$?
 wait "$interactor_pid"
 interactor_status=$?
+wait "$watchdog_pid"
+watchdog_status=$?
+trap - USR1
 printf '%s\n' '--- solver -> interactor ---'
 cat /run/reporch/solver.out
 printf '%s\n' '--- interactor -> solver ---'
@@ -359,13 +388,14 @@ printf '%s\n' '--- solver stderr ---'
 cat /run/reporch/solver.err
 printf '%s\n' '--- interactor stderr ---'
 cat /run/reporch/interactor.err
+if [ "$idle_timed_out" -eq 1 ] || [ "$watchdog_status" -eq 124 ]; then exit 124; fi
 if [ "$solver_status" -ne 0 ]; then exit 1; fi
 if [ "$interactor_status" -eq 42 ]; then exit 0; fi
 if [ "$interactor_status" -eq 43 ]; then exit 1; fi
 exit 2
 REPORCH_INTERACTIVE
 set +e
-{timeout_command} bash /run/reporch/interactive-run.sh "$input"
+{timeout_command} bash /run/reporch/interactive-run.sh "$input" "$idle_timeout"
 status=$?
 if [ "$status" -eq 0 ]; then exit 0; fi
 if [ "$status" -eq 1 ]; then exit 1; fi
@@ -373,6 +403,7 @@ if [ "$status" -eq 124 ]; then exit 124; fi
 exit 2
 "#,
         timeout_command = timeout_command(timeout),
+        idle_timeout = idle_timeout.as_secs_f64(),
     )
 }
 
@@ -733,6 +764,23 @@ mod checker_protocol_tests {
         assert!(script.contains("interactor_status\" -eq 43 ]; then exit 1"));
         assert!(script.ends_with("exit 2\n"));
         assert!(!script.contains("interactor_status\" -ne 0"));
+    }
+
+    #[test]
+    fn interactive_pair_has_an_activity_resetting_idle_watchdog() {
+        let script = interactive_pair_script_with_timeout(
+            "compile solver",
+            "compile interactor",
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        assert!(script.contains("idle_timeout=0.200"), "{script}");
+        assert!(
+            script.contains("read -r -t \"$idle_timeout\" -u 5"),
+            "{script}"
+        );
+        assert!(script.contains("kill -USR1 \"$runner_pid\""), "{script}");
+        assert!(script.contains("exit 124"), "{script}");
     }
 
     #[test]
