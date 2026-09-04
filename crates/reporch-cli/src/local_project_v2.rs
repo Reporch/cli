@@ -454,19 +454,30 @@ pub fn prune_project(
         .join("prune-trash")
         .join(operation_id.to_string());
     let mut moved = Vec::<(PathBuf, PathBuf)>::new();
+    let mut trashable = Vec::new();
+    let mut preserved = Vec::new();
     if delete_files {
-        let trash_parent = trash_root
-            .parent()
-            .context("prune trash directory has no parent")?;
-        ensure_private_lock_directory(trash_parent)?;
-        fs::create_dir(&trash_root)
-            .with_context(|| format!("create recoverable prune trash {}", trash_root.display()))?;
         for path in &candidates {
             // Hashing performs the canonical containment, regular-file and
-            // symlink-ancestor checks before any rename occurs.
-            let _ = hash_regular_project_file(&root, path)?;
+            // symlink-ancestor checks before any rename occurs. Unsafe,
+            // missing, or non-regular paths leave the physical entry alone;
+            // only their stale inventory declaration is removed.
+            if hash_regular_project_file(&root, path).is_ok() {
+                trashable.push(path.clone());
+            } else {
+                preserved.push(path.clone());
+            }
         }
-        for path in &candidates {
+        if !trashable.is_empty() {
+            let trash_parent = trash_root
+                .parent()
+                .context("prune trash directory has no parent")?;
+            ensure_private_lock_directory(trash_parent)?;
+            fs::create_dir(&trash_root).with_context(|| {
+                format!("create recoverable prune trash {}", trash_root.display())
+            })?;
+        }
+        for path in &trashable {
             let source = root.join(path);
             let destination = trash_root.join(path);
             if let Some(parent) = destination.parent() {
@@ -503,12 +514,12 @@ pub fn prune_project(
         applied: true,
         inventory_removed: candidates.clone(),
         files_preserved: if delete_files {
-            Vec::new()
+            preserved
         } else {
             candidates.clone()
         },
-        files_trashed: if delete_files { candidates } else { Vec::new() },
-        trash_directory: delete_files.then_some(trash_root),
+        files_trashed: if delete_files { trashable } else { Vec::new() },
+        trash_directory: (!moved.is_empty()).then_some(trash_root),
     })
 }
 
@@ -943,6 +954,46 @@ mod tests {
         assert_eq!(
             fs::read(trash.join("unused.txt")).unwrap(),
             b"preserve me\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_prune_removes_stale_symlink_inventory_without_touching_the_link() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        write_minimal_v1(temporary.path());
+        migrate_v1_authoring_file(temporary.path()).unwrap();
+        symlink(outside.path(), temporary.path().join("unused-link")).unwrap();
+        update_authoring_spec(temporary.path(), |_root, spec| {
+            spec.files.push(AuthoringFileV2 {
+                path: "unused-link".into(),
+                media_type: "application/octet-stream".into(),
+                executable: false,
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let removed = prune_project(temporary.path(), true, true).unwrap();
+        assert_eq!(removed.inventory_removed, vec!["unused-link"]);
+        assert_eq!(removed.files_preserved, vec!["unused-link"]);
+        assert!(removed.files_trashed.is_empty());
+        assert!(removed.trash_directory.is_none());
+        assert!(
+            fs::symlink_metadata(temporary.path().join("unused-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !read_authoring_spec(temporary.path())
+                .unwrap()
+                .files
+                .iter()
+                .any(|file| file.path == "unused-link")
         );
     }
 }
