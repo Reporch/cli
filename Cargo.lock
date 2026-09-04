@@ -2439,7 +2439,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reporch-cli"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-format"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "serde",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-guestd"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-bundle-builder"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2529,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-core"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "reporch-runtime-protocol",
@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-evidence-builder"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-hcs"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-host"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-image-builder"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-install-tree-builder"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-protocol"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "base64",
  "rmp-serde",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-service"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "cap-std",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-runtime-source-fetcher"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "cab",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-toolchain-bundle-builder"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arcbox-ext4",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "reporch-toolchain-release-builder"
-version = "1.0.0-rc.12"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
