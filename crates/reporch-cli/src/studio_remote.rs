@@ -1616,6 +1616,69 @@ pub async fn list_projects_operation(connection: &RemoteConnectionOptions) -> Re
     bail!("Studio project listing exceeded the 10,000-item native client bound")
 }
 
+pub async fn show_local_project_operation(
+    connection: &RemoteConnectionOptions,
+) -> Result<ProjectResponse> {
+    let root = crate::local_project::discover_project(Path::new("."))?;
+    let spec = read_versioned_authoring_spec(&root)?;
+    let client = StudioApiClient::connect(connection).await?;
+    let project = find_accessible_project(&client, spec.project_id()).await?;
+    ensure_or_recover_remote_link(&root, connection, spec.project_id())?;
+    Ok(project)
+}
+
+async fn find_accessible_project(
+    client: &StudioApiClient,
+    project_id: Uuid,
+) -> Result<ProjectResponse> {
+    let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_projects(cursor.as_deref()).await?;
+        if let Some(project) = page
+            .items
+            .into_iter()
+            .find(|project| project.id == project_id)
+        {
+            return Ok(project);
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            bail!("Studio project {project_id} is no longer accessible")
+        };
+        ensure!(
+            seen_cursors.insert(next_cursor.clone()),
+            "Studio returned a repeated project cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio project listing exceeded the 10,000-item native client bound")
+}
+
+fn ensure_or_recover_remote_link(
+    root: &Path,
+    connection: &RemoteConnectionOptions,
+    project_id: Uuid,
+) -> Result<()> {
+    let api_url = connection.api_url.trim_end_matches('/');
+    let mut state = crate::local_project::read_local_state(root)?;
+    if let Some(remote) = &state.remote {
+        ensure!(
+            remote.project_id == project_id,
+            "local link and reporch.yaml project IDs differ"
+        );
+        ensure!(
+            remote.api_url.trim_end_matches('/') == api_url,
+            "linked Studio API URL differs from the selected connection"
+        );
+        return Ok(());
+    }
+    state.remote = Some(crate::local_project::RemoteLinkV1 {
+        api_url: api_url.to_owned(),
+        project_id,
+    });
+    crate::local_project::write_local_state(root, &state).map(|_| ())
+}
+
 pub async fn capabilities_operation(
     connection: &RemoteConnectionOptions,
 ) -> Result<StudioCapabilitiesV1> {
@@ -2375,20 +2438,6 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
     }
     let spec = read_versioned_authoring_spec(&root)?;
     let project_id = spec.project_id();
-    let mut state = crate::local_project::read_local_state(&root)?;
-    let remote = state
-        .remote
-        .as_ref()
-        .context("project is not linked; run reporch project link")?;
-    ensure!(
-        remote.project_id == project_id,
-        "local link and reporch.yaml project IDs differ"
-    );
-    ensure!(
-        remote.api_url.trim_end_matches('/') == options.connection.api_url.trim_end_matches('/'),
-        "linked Studio API URL differs from the selected connection"
-    );
-
     let client = StudioApiClient::connect(&options.connection).await?;
     let capabilities = client.capabilities().await?;
     ensure_cli_compatible(&capabilities)?;
@@ -2400,6 +2449,12 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         "Studio does not support {}",
         spec.schema()
     );
+    let mut state = crate::local_project::read_local_state(&root)?;
+    if state.remote.is_none() {
+        find_accessible_project(&client, project_id).await?;
+    }
+    ensure_or_recover_remote_link(&root, &options.connection, project_id)?;
+    state = crate::local_project::read_local_state(&root)?;
 
     let upload_manifest = compile_versioned_authoring_spec(&root, &spec, Uuid::nil())?;
     let issues = studio_core::validate_versioned_manifest(&upload_manifest);
@@ -4127,6 +4182,42 @@ mod tests {
 
         let loopback = validate_api_url("http://127.0.0.1:8080", true).unwrap();
         validate_connection_binding(&loopback, &official_auth, Some("e2e-author")).unwrap();
+    }
+
+    #[test]
+    fn missing_local_state_recovers_a_remote_link_without_changing_the_project_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_id = Uuid::now_v7();
+        crate::init_project_with_id(directory.path(), "Recovered", project_id).unwrap();
+        let state_path = directory
+            .path()
+            .join(crate::local_project::LOCAL_STATE_DIRECTORY)
+            .join(crate::local_project::LOCAL_STATE_FILE_NAME);
+        if state_path.exists() {
+            std::fs::remove_file(&state_path).unwrap();
+        }
+        let connection = RemoteConnectionOptions {
+            api_url: "https://studio.reporch.com/".into(),
+            auth: NativeAuthOptions {
+                issuer: DEFAULT_OIDC_ISSUER.into(),
+                client_id: "test".into(),
+                allow_insecure_http: false,
+            },
+            dev_subject: None,
+        };
+
+        ensure_or_recover_remote_link(directory.path(), &connection, project_id).unwrap();
+
+        let state = crate::local_project::read_local_state(directory.path()).unwrap();
+        let remote = state.remote.unwrap();
+        assert_eq!(remote.project_id, project_id);
+        assert_eq!(remote.api_url, "https://studio.reporch.com");
+        assert_eq!(
+            read_versioned_authoring_spec(directory.path())
+                .unwrap()
+                .project_id(),
+            project_id
+        );
     }
 
     #[test]

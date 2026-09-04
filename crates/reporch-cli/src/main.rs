@@ -909,19 +909,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 )
             }
             ProjectCommand::Show(connection) => {
-                let root = reporch_cli::local_project::discover_project(Path::new("."))?;
-                let state = reporch_cli::local_project::read_local_state(&root)?;
-                let project_id = state
-                    .remote
-                    .as_ref()
-                    .context("project is not linked; run reporch project link")?
-                    .project_id;
-                let projects = studio_remote::list_projects_operation(&connection).await?;
-                let project = projects
-                    .items
-                    .into_iter()
-                    .find(|project| project.id == project_id)
-                    .context("linked Studio project is no longer accessible")?;
+                let project = studio_remote::show_local_project_operation(&connection).await?;
                 output.emit("project show", &project, &project.title)
             }
             ProjectCommand::Open {
