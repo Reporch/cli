@@ -20,6 +20,7 @@ const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const RUNTIME_SECURITY_INSPECTION_TIMEOUT: Duration = Duration::from_secs(8);
 const RUNTIME_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_DIAGNOSTIC_OUTPUT_LIMIT: usize = 64 * 1024;
+const NATIVE_OUTPUT_CAPTURE_LIMIT_BYTES: u64 = 4 * 1_048_576;
 pub fn configure_remote_fallback(allowed: bool, no_input: bool, profile: Option<&str>) {
     crate::remote_consent::configure(allowed, no_input, profile);
 }
@@ -91,9 +92,6 @@ pub async fn plan(options: &LocalSandboxOptions) -> Result<LocalSandboxPlan> {
     if options.runtime == OciRuntime::Auto {
         let entry = crate::toolchain::resolve_for_image(&options.image)?;
         let inputs = inventory_native_inputs(&project_directory, &options.command)?;
-        if options.output_kib > 4_096 {
-            bail!("native runtime output must be at most 4096 KiB per stream");
-        }
         return Ok(LocalSandboxPlan {
             schema: "reporch.local-sandbox-plan.v1",
             runtime: "reporch_vm".into(),
@@ -216,6 +214,12 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
     let toolchain = reporch_runtime_host::install_toolchain(toolchain_id).await?;
 
     let job_id = Uuid::now_v7();
+    // Protocol v2 returns output in a single bounded result frame. Retain up
+    // to its safe capture ceiling, while preserving the authored limit on the
+    // plan. If a workload reaches this lower transport ceiling we fail with a
+    // clear local-runtime limitation instead of misclassifying it as the
+    // problem's authored output limit.
+    let native_output_limit = native_output_limit_bytes(plan.output_limit_bytes);
     let job = GuestJobV1 {
         schema: reporch_runtime_core::JOB_SCHEMA.into(),
         protocol_version: reporch_runtime_core::PROTOCOL_VERSION,
@@ -234,8 +238,8 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
             memory_mib: plan.memory_mib,
             cpu_millis: plan.cpu_millis,
             pids: 64,
-            stdout_bytes: plan.output_limit_bytes,
-            stderr_bytes: plan.output_limit_bytes,
+            stdout_bytes: native_output_limit,
+            stderr_bytes: native_output_limit,
             artifact_bytes: 256 * 1_048_576,
         },
     };
@@ -253,6 +257,15 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
     } else {
         result.termination
     };
+    if termination == GuestTerminationV2::OutputLimit
+        && plan.output_limit_bytes > native_output_limit
+    {
+        return Err(RuntimeError::OutputCaptureExceeded {
+            authored_kib: plan.output_limit_bytes.div_ceil(1_024),
+            capture_kib: native_output_limit.div_ceil(1_024),
+        }
+        .into());
+    }
     let stdout = decode_guest_output(result.stdout.encoding, &result.stdout.data)?;
     let stderr = decode_guest_output(result.stderr.encoding, &result.stderr.data)?;
     Ok(LocalSandboxResult {
@@ -266,6 +279,10 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         stdout_bytes: stdout,
     })
+}
+
+fn native_output_limit_bytes(authored_limit: u64) -> u64 {
+    authored_limit.min(NATIVE_OUTPUT_CAPTURE_LIMIT_BYTES)
 }
 
 fn runtime_fallback_eligible(error: &anyhow::Error) -> bool {
@@ -951,6 +968,15 @@ mod tests {
         assert_eq!(plan.inputs[0].size, 10);
         assert!(plan.inputs[0].sha256.starts_with("sha256:"));
         assert!(plan.container_name.is_empty());
+    }
+
+    #[test]
+    fn native_capture_ceiling_does_not_reject_larger_authored_limits() {
+        assert_eq!(native_output_limit_bytes(2 * 1_048_576), 2 * 1_048_576);
+        assert_eq!(
+            native_output_limit_bytes(64 * 1_048_576),
+            NATIVE_OUTPUT_CAPTURE_LIMIT_BYTES
+        );
     }
 
     #[tokio::test]
