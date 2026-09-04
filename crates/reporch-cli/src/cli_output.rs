@@ -304,7 +304,10 @@ fn classify_error(error: &Error) -> ClassifiedError {
                 reporch_runtime_core::RuntimeError::RemoteQuotaExceeded => {
                     ExitCode::PermissionDenied
                 }
-                reporch_runtime_core::RuntimeError::ExecutionTimedOut => ExitCode::DomainFailure,
+                reporch_runtime_core::RuntimeError::ExecutionTimedOut
+                | reporch_runtime_core::RuntimeError::OutputCaptureExceeded { .. } => {
+                    ExitCode::DomainFailure
+                }
                 _ => ExitCode::InfrastructureFailure,
             },
             error_code: runtime.code().into(),
@@ -477,6 +480,16 @@ mod tests {
         assert_eq!(classified.exit_code, ExitCode::InfrastructureFailure);
         assert_eq!(classified.error_code, "runtime.service_unavailable");
         assert!(classified.retryable);
+
+        let capture =
+            anyhow::Error::new(reporch_runtime_core::RuntimeError::OutputCaptureExceeded {
+                authored_kib: 65_536,
+                capture_kib: 4_096,
+            });
+        let classified = classify_error(&capture);
+        assert_eq!(classified.exit_code, ExitCode::DomainFailure);
+        assert_eq!(classified.error_code, "runtime.output_capture_exceeded");
+        assert!(!classified.retryable);
     }
 
     #[test]

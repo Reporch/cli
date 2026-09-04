@@ -1498,7 +1498,7 @@ fn concurrent_authoring_commands_do_not_lose_successful_updates() {
 }
 
 #[test]
-fn migrate_does_not_treat_a_generated_v2_manifest_as_legacy_input() {
+fn migrate_recovers_authoring_yaml_from_a_generated_v2_manifest_without_legacy_backup() {
     let project = tempfile::tempdir().unwrap();
     assert!(init(project.path(), "standard").status.success());
     fs::remove_file(project.path().join("reporch.yaml")).unwrap();
@@ -1516,8 +1516,12 @@ fn migrate_does_not_treat_a_generated_v2_manifest_as_legacy_input() {
         .unwrap();
     assert!(migrated.status.success(), "{migrated:?}");
     let value: Value = serde_json::from_slice(&migrated.stdout).unwrap();
-    assert_eq!(value["data"]["migrated"], false, "{value:#}");
-    assert!(!project.path().join("reporch.yaml").exists());
+    assert_eq!(value["data"]["migrated"], true, "{value:#}");
+    let authoring = fs::read(project.path().join("reporch.yaml")).unwrap();
+    assert!(matches!(
+        reporch_format::parse_versioned_authoring_spec(&authoring).unwrap(),
+        reporch_format::VersionedAuthoringSpec::V2(_)
+    ));
     assert!(!project.path().join("reporch.problem.pre-1.0.json").exists());
 }
 

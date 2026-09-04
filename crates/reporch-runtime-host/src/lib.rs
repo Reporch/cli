@@ -3,18 +3,22 @@
 #[cfg(target_os = "macos")]
 mod apple_backend;
 mod host_version;
+#[cfg(test)]
+mod runtime_bundle_cache_tests;
+#[cfg(test)]
+mod toolchain_cache_tests;
 #[cfg(windows)]
 mod windows_identity;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -300,6 +304,9 @@ impl VerifiedRuntimeBundleV1 {
 pub async fn verified_bundle() -> Result<VerifiedRuntimeBundleV1> {
     let root = runtime_root()?;
     let installation = read_installation(&root)?.ok_or(RuntimeError::BootstrapIncomplete)?;
+    if let Some(cached) = cached_verified_runtime_bundle(&root, &installation)? {
+        return Ok(cached);
+    }
     let verification_root = root.clone();
     let verification = installation.clone();
     let manifest = tokio::task::spawn_blocking(move || {
@@ -308,11 +315,13 @@ pub async fn verified_bundle() -> Result<VerifiedRuntimeBundleV1> {
     .await
     .context("join runtime bundle verification")??;
     let directory = bundle_directory(&root, installation.sequence, &installation.version);
-    Ok(VerifiedRuntimeBundleV1 {
+    let verified = VerifiedRuntimeBundleV1 {
         installation,
         manifest,
         directory,
-    })
+    };
+    cache_verified_runtime_bundle(&root, &verified)?;
+    Ok(verified)
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +330,262 @@ pub struct VerifiedToolchainBundleV2 {
     pub entry: ToolchainEntryV2,
     pub bundle: ToolchainBundleV2,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegularFileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    read_only: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+impl RegularFileFingerprint {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect cached toolchain file {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "cached toolchain path is not a regular file: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            read_only: metadata.permissions().readonly(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            uid: metadata.uid(),
+            #[cfg(unix)]
+            gid: metadata.gid(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryFingerprint {
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+impl DirectoryFingerprint {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect cached runtime directory {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "cached runtime path is not a directory: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Self {
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            uid: metadata.uid(),
+            #[cfg(unix)]
+            gid: metadata.gid(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedRuntimeCacheEntry {
+    bundle: VerifiedRuntimeBundleV1,
+    expires_at: chrono::DateTime<Utc>,
+    directory: DirectoryFingerprint,
+    files: Vec<(PathBuf, RegularFileFingerprint)>,
+}
+
+static VERIFIED_RUNTIME_CACHE: OnceLock<Mutex<HashMap<PathBuf, VerifiedRuntimeCacheEntry>>> =
+    OnceLock::new();
+
+fn verified_runtime_cache() -> &'static Mutex<HashMap<PathBuf, VerifiedRuntimeCacheEntry>> {
+    VERIFIED_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_verified_runtime_bundle(
+    root: &Path,
+    installation: &RuntimeInstallationV1,
+) -> Result<Option<VerifiedRuntimeBundleV1>> {
+    let cached = verified_runtime_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified runtime cache lock was poisoned"))?
+        .get(root)
+        .cloned();
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    let unchanged = cached.expires_at > Utc::now()
+        && cached.bundle.installation == *installation
+        && DirectoryFingerprint::read(&cached.bundle.directory)
+            .ok()
+            .as_ref()
+            == Some(&cached.directory)
+        && cached.files.iter().all(|(path, expected)| {
+            RegularFileFingerprint::read(path).ok().as_ref() == Some(expected)
+        });
+    if unchanged {
+        return Ok(Some(cached.bundle));
+    }
+    verified_runtime_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified runtime cache lock was poisoned"))?
+        .remove(root);
+    Ok(None)
+}
+
+fn cache_verified_runtime_bundle(root: &Path, bundle: &VerifiedRuntimeBundleV1) -> Result<()> {
+    let mut paths = vec![
+        root.join("current.json"),
+        bundle.directory.join("manifest.json"),
+        bundle.directory.join("manifest.json.minisig"),
+        bundle.directory.join(".complete"),
+    ];
+    paths.extend(
+        bundle
+            .manifest
+            .artifacts
+            .iter()
+            .map(|artifact| bundle.directory.join(&artifact.file_name)),
+    );
+    let files = paths
+        .into_iter()
+        .map(|path| Ok((path.clone(), RegularFileFingerprint::read(&path)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let entry = VerifiedRuntimeCacheEntry {
+        bundle: bundle.clone(),
+        expires_at: bundle.manifest.expires_at,
+        directory: DirectoryFingerprint::read(&bundle.directory)?,
+        files,
+    };
+    verified_runtime_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified runtime cache lock was poisoned"))?
+        .insert(root.to_path_buf(), entry);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedToolchainCacheEntry {
+    bundle: VerifiedToolchainBundleV2,
+    expires_at: chrono::DateTime<Utc>,
+    state: RegularFileFingerprint,
+    index: RegularFileFingerprint,
+    signature: RegularFileFingerprint,
+    image: RegularFileFingerprint,
+}
+
+type VerifiedToolchainCacheKey = (PathBuf, String, HostTarget);
+
+static VERIFIED_TOOLCHAIN_CACHE: OnceLock<
+    Mutex<HashMap<VerifiedToolchainCacheKey, VerifiedToolchainCacheEntry>>,
+> = OnceLock::new();
+
+fn verified_toolchain_cache()
+-> &'static Mutex<HashMap<VerifiedToolchainCacheKey, VerifiedToolchainCacheEntry>> {
+    VERIFIED_TOOLCHAIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_verified_toolchain(
+    root: &Path,
+    id: &str,
+    target: HostTarget,
+) -> Result<Option<VerifiedToolchainBundleV2>> {
+    let key = (root.to_path_buf(), id.to_owned(), target);
+    let cached = verified_toolchain_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified toolchain cache lock was poisoned"))?
+        .get(&key)
+        .cloned();
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    let state_path = toolchain_state_path(root, id);
+    let directory = cached
+        .bundle
+        .path
+        .parent()
+        .context("cached toolchain image has no parent")?;
+    let unchanged = cached.expires_at > Utc::now()
+        && RegularFileFingerprint::read(&state_path).ok().as_ref() == Some(&cached.state)
+        && RegularFileFingerprint::read(&directory.join("index.json"))
+            .ok()
+            .as_ref()
+            == Some(&cached.index)
+        && RegularFileFingerprint::read(&directory.join("index.json.minisig"))
+            .ok()
+            .as_ref()
+            == Some(&cached.signature)
+        && RegularFileFingerprint::read(&cached.bundle.path)
+            .ok()
+            .as_ref()
+            == Some(&cached.image);
+    if unchanged {
+        return Ok(Some(cached.bundle));
+    }
+    verified_toolchain_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified toolchain cache lock was poisoned"))?
+        .remove(&key);
+    Ok(None)
+}
+
+fn cache_verified_toolchain(
+    root: &Path,
+    id: &str,
+    target: HostTarget,
+    bundle: &VerifiedToolchainBundleV2,
+    expires_at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let directory = bundle
+        .path
+        .parent()
+        .context("verified toolchain image has no parent")?;
+    let entry = VerifiedToolchainCacheEntry {
+        bundle: bundle.clone(),
+        expires_at,
+        state: RegularFileFingerprint::read(&toolchain_state_path(root, id))?,
+        index: RegularFileFingerprint::read(&directory.join("index.json"))?,
+        signature: RegularFileFingerprint::read(&directory.join("index.json.minisig"))?,
+        image: RegularFileFingerprint::read(&bundle.path)?,
+    };
+    verified_toolchain_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified toolchain cache lock was poisoned"))?
+        .insert((root.to_path_buf(), id.to_owned(), target), entry);
+    Ok(())
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -333,6 +598,10 @@ struct ToolchainIndexStateV2 {
 
 pub async fn install_toolchain(id: &str) -> Result<VerifiedToolchainBundleV2> {
     validate_toolchain_id(id)?;
+    if let Ok(installed) = verified_toolchain(id).await {
+        repair_toolchain_read_access(&installed)?;
+        return verified_toolchain(id).await;
+    }
     #[cfg(any(target_os = "linux", windows))]
     if probe_runtime_service().await {
         request_service_toolchain_install(id).await?;
@@ -350,6 +619,9 @@ pub async fn install_toolchain_direct(id: &str) -> Result<VerifiedToolchainBundl
     let root = runtime_root.join("toolchains");
     ensure_runtime_root_is_narrow(&root)?;
     create_private_directory(&root)?;
+    if let Some(installed) = reuse_installed_toolchain(&root, id, target)? {
+        return Ok(installed);
+    }
     let base = toolchain_channel_url()?;
     let client = runtime_download_client()?;
     let index_url = base
@@ -567,11 +839,27 @@ pub async fn verified_toolchain(id: &str) -> Result<VerifiedToolchainBundleV2> {
     verified_toolchain_at(&runtime_root()?.join("toolchains"), id, target)
 }
 
+fn reuse_installed_toolchain(
+    root: &Path,
+    id: &str,
+    target: HostTarget,
+) -> Result<Option<VerifiedToolchainBundleV2>> {
+    let installed = match verified_toolchain_at(root, id, target) {
+        Ok(installed) => installed,
+        Err(_) => return Ok(None),
+    };
+    repair_toolchain_read_access(&installed)?;
+    verified_toolchain_at(root, id, target).map(Some)
+}
+
 fn verified_toolchain_at(
     root: &Path,
     id: &str,
     target: HostTarget,
 ) -> Result<VerifiedToolchainBundleV2> {
+    if let Some(cached) = cached_verified_toolchain(root, id, target)? {
+        return Ok(cached);
+    }
     let state_path = toolchain_state_path(root, id);
     let installation_bytes =
         read_bounded_regular(&state_path, 64 * 1024, "toolchain installation state")?;
@@ -634,12 +922,14 @@ fn verified_toolchain_at(
         hash_regular_file(&path, bundle.size)? == bundle.sha256,
         "installed toolchain image digest changed"
     );
-    Ok(VerifiedToolchainBundleV2 {
+    let verified = VerifiedToolchainBundleV2 {
         installation,
         entry: entry.clone(),
         bundle: bundle.clone(),
         path,
-    })
+    };
+    cache_verified_toolchain(root, id, target, &verified, index.expires_at)?;
+    Ok(verified)
 }
 
 fn enforce_toolchain_index_monotonicity(root: &Path, sequence: u64, digest: &str) -> Result<()> {

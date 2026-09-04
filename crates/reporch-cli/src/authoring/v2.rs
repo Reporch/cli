@@ -1,8 +1,10 @@
+use std::fmt::Write as _;
 use std::fs;
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use base64::Engine as _;
 use studio_core::{
     CheckerSpec, CheckerUnitSpecV2, GeneratedCaseRefV2, GeneratorMatrixStrategyV2,
     GeneratorRecipeSpecV2, GeneratorSpecV2, HarnessKindV2, HarnessProfileSpecV2, HarnessSpecV2,
@@ -13,6 +15,13 @@ use studio_core::{
 use uuid::Uuid;
 
 use super::*;
+
+#[derive(Debug, serde::Serialize)]
+struct RemovalResult<'a, T: serde::Serialize> {
+    remaining: &'a T,
+    inventory_removed: Vec<String>,
+    files_preserved: Vec<String>,
+}
 
 pub(super) fn is_active_project() -> Result<bool> {
     reporch_cli::local_project_v2::is_v2_project(Path::new("."))
@@ -95,6 +104,7 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
         StatementCommand::Check => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
             let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            reporch_cli::local_project_v2::validate_statement_documents(&root, &spec)?;
             for (locale, path) in &spec.statements {
                 let file = spec
                     .files
@@ -119,6 +129,7 @@ pub(super) fn statement(options: StatementOptions, output: &CliOutput) -> Result
         } => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
             let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+            reporch_cli::local_project_v2::validate_statement_documents(&root, &spec)?;
             let locale = locale.unwrap_or(spec.default_locale);
             let source = spec
                 .statements
@@ -170,16 +181,21 @@ fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
         !no_input && std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "test guide requires an interactive terminal; use test case add in CI"
     );
-    let name = prompt("Test name", "sample-1")?;
-    let input = prompt("Input file", "tests/1.in")?;
-    let answer = prompt("Answer file (blank for none)", "tests/1.ans")?;
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let name = prompt(
+        "Test name",
+        &next_test_case_name(spec.testing.tests.iter().map(|test| test.name.as_str())),
+    )?;
+    let input = prompt("Input data (single line)", "")?;
+    let answer = prompt("Expected output (single line; blank for none)", "")?;
     test_case(
         TestCaseCommand::Add(TestCaseAddOptions {
             name,
-            input: Some(PathBuf::from(input)),
-            input_text: None,
-            answer: (!answer.is_empty()).then(|| PathBuf::from(answer)),
-            answer_text: None,
+            input: None,
+            input_text: Some(guided_test_text(&input)),
+            answer: None,
+            answer_text: (!answer.is_empty()).then(|| guided_test_text(&answer)),
             groups: vec![],
             generated_by: None,
             seed: None,
@@ -209,6 +225,17 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
                 reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
                     ensure_unique_test_name(spec, &options.name, None)?;
                     let group_ids = resolve_group_ids(spec, &options.groups)?;
+                    if answer.is_some() {
+                        ensure_unique_test_input(
+                            root,
+                            &input,
+                            &options.name,
+                            spec.testing
+                                .tests
+                                .iter()
+                                .map(|test| (test.name.as_str(), test.input_file.as_str())),
+                        )?;
+                    }
                     let generated = if let Some(generator_name) = &options.generated_by {
                         let seed = options
                             .seed
@@ -291,19 +318,20 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
+                    let test_id = find_test(spec, &options.selector)?.id;
                     let group_ids = if options.groups.is_empty() {
                         None
                     } else {
                         Some(resolve_group_ids(spec, &options.groups)?)
                     };
                     if let Some(name) = &options.name {
-                        ensure_unique_test_name(spec, name, Some(options.id))?;
+                        ensure_unique_test_name(spec, name, Some(test_id))?;
                     }
                     let test = spec
                         .testing
                         .tests
                         .iter_mut()
-                        .find(|test| test.id == options.id)
+                        .find(|test| test.id == test_id)
                         .context("test case was not found")?;
                     if let Some(name) = &options.name {
                         test.name = normalize_name(name)?;
@@ -317,13 +345,24 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test case update",
                 &spec.testing.tests,
-                &format!("Updated test case {}", options.id),
+                &format!("Updated test case {}", options.selector),
             )
         }
-        TestCaseCommand::Remove { id } => {
+        TestCaseCommand::Remove { selector } => {
+            let mut inventory_removed = Vec::new();
+            let mut files_preserved = Vec::new();
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
-                |_root, spec| {
+                |root, spec| {
+                    let id = find_test(spec, &selector)?.id;
+                    let test = spec
+                        .testing
+                        .tests
+                        .iter()
+                        .find(|test| test.id == id)
+                        .context("test case was not found")?;
+                    files_preserved.push(test.input_file.clone());
+                    files_preserved.extend(test.answer_file.iter().cloned());
                     let before = spec.testing.tests.len();
                     spec.testing.tests.retain(|test| test.id != id);
                     ensure!(
@@ -333,13 +372,25 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
                     for submission in &mut spec.output_submissions {
                         submission.outputs.remove(&id);
                     }
+                    inventory_removed =
+                        reporch_cli::local_project_v2::prune_unreferenced_file_declarations(
+                            root,
+                            spec,
+                            files_preserved.clone(),
+                        )?;
                     Ok(())
                 },
             )?;
+            files_preserved.sort();
+            files_preserved.dedup();
             output.emit(
                 "test case remove",
-                &spec.testing.tests,
-                &format!("Removed test case {id}"),
+                &RemovalResult {
+                    remaining: &spec.testing.tests,
+                    inventory_removed,
+                    files_preserved,
+                },
+                &format!("Removed test case {selector}"),
             )
         }
     }
@@ -375,6 +426,17 @@ fn import_test_cases(options: TestCaseImportOptions, output: &CliOutput) -> Resu
                 .context("test input has a non-Unicode file name")?;
             let name = normalize_name(stem)?;
             ensure_unique_test_name(spec, &name, None)?;
+            if answer.is_some() {
+                ensure_unique_test_input(
+                    root,
+                    &input,
+                    &name,
+                    spec.testing
+                        .tests
+                        .iter()
+                        .map(|test| (test.name.as_str(), test.input_file.as_str())),
+                )?;
+            }
             reporch_cli::local_project_v2::declare_project_file(
                 root,
                 spec,
@@ -426,6 +488,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestGroupCommand::Add(options) => {
+            super::validate_group_points(options.points)?;
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -452,6 +515,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
                             ScoreAggregationV2::AllOrNothing
                         },
                     });
+                    ensure_v2_group_dependencies_acyclic(&spec.testing.groups)?;
                     Ok(())
                 },
             )?;
@@ -467,6 +531,9 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestGroupCommand::Update(options) => {
+            if let Some(points) = options.points {
+                super::validate_group_points(points)?;
+            }
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -493,6 +560,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
                     if let Some(depends_on) = depends_on {
                         group.depends_on = depends_on;
                     }
+                    ensure_v2_group_dependencies_acyclic(&spec.testing.groups)?;
                     Ok(())
                 },
             )?;
@@ -779,10 +847,14 @@ pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> 
             )
         }
         GeneratorCommand::Remove { id } => {
+            let mut inventory_removed = Vec::new();
+            let mut files_preserved = Vec::new();
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
-                |_root, spec| {
-                    let generator_id = find_generator(spec, &id)?.program.id;
+                |root, spec| {
+                    let generator = find_generator(spec, &id)?;
+                    let generator_id = generator.program.id;
+                    files_preserved.push(generator.program.source_path.clone());
                     ensure!(
                         !spec.testing.tests.iter().any(|test| test
                             .generated
@@ -806,12 +878,22 @@ pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> 
                         before != spec.testing.generators.len(),
                         "generator was not found"
                     );
+                    inventory_removed =
+                        reporch_cli::local_project_v2::prune_unreferenced_file_declarations(
+                            root,
+                            spec,
+                            files_preserved.clone(),
+                        )?;
                     Ok(())
                 },
             )?;
             output.emit(
                 "generator remove",
-                &spec.testing.generators,
+                &RemovalResult {
+                    remaining: &spec.testing.generators,
+                    inventory_removed,
+                    files_preserved,
+                },
                 &format!("Removed generator {id}"),
             )
         }
@@ -960,7 +1042,9 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                         },
                     )
                     .await?;
-                    let actual_valid = result.exit_code == 0;
+                    let exited =
+                        result.termination == reporch_runtime_core::GuestTerminationV2::Exited;
+                    let actual_valid = exited && result.exit_code == 0;
                     cases.push(ProgramUnitResult {
                         program: validator.name.clone(),
                         name: unit.name.clone(),
@@ -969,10 +1053,16 @@ pub(super) async fn validator(options: ValidatorOptions, output: &CliOutput) -> 
                         } else {
                             "invalid"
                         },
-                        actual: if actual_valid { "valid" } else { "invalid" },
-                        passed: actual_valid == unit.expected_valid,
+                        actual: if exited {
+                            if actual_valid { "valid" } else { "invalid" }
+                        } else {
+                            termination_name(result.termination)
+                        },
+                        passed: exited && actual_valid == unit.expected_valid,
                         exit_code: result.exit_code,
+                        termination: result.termination,
                         duration_ms: result.duration_ms,
+                        stdout: result.stdout,
                         stderr: result.stderr,
                     });
                 }
@@ -1036,10 +1126,15 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                 CheckerKind::Exact => CheckerSpec::Exact,
                 CheckerKind::Token => CheckerSpec::Token,
                 CheckerKind::CaseInsensitive => CheckerSpec::CaseInsensitive,
-                CheckerKind::Floating => CheckerSpec::Floating {
-                    absolute_error: absolute_error.context("--absolute-error is required")?,
-                    relative_error: relative_error.context("--relative-error is required")?,
-                },
+                CheckerKind::Floating => {
+                    let absolute_error = absolute_error.context("--absolute-error is required")?;
+                    let relative_error = relative_error.context("--relative-error is required")?;
+                    super::validate_floating_tolerances(&absolute_error, &relative_error)?;
+                    CheckerSpec::Floating {
+                        absolute_error,
+                        relative_error,
+                    }
+                }
                 CheckerKind::Custom => CheckerSpec::Custom {
                     source_path: source.clone().context("--source is required")?,
                     language: language.clone().context("--language is required")?,
@@ -1127,7 +1222,7 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
             let mut cases = Vec::new();
             for unit in units {
                 output.progress("checker run", &format!("Checking unit {}", unit.name));
-                let (actual_accepted, exit_code, duration_ms, stderr) =
+                let (actual, passed, exit_code, termination, duration_ms, stdout, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
@@ -1145,24 +1240,58 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                             &run_options,
                         )
                         .await?;
+                        let exited = result.execution.termination
+                            == reporch_runtime_core::GuestTerminationV2::Exited;
+                        let actual = if exited {
+                            match result.verdict {
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
+                                    "accepted"
+                                }
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
+                                    "rejected"
+                                }
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                                    "judge_error"
+                                }
+                            }
+                        } else {
+                            termination_name(result.execution.termination)
+                        };
+                        let passed = exited && match result.verdict {
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
+                                unit.expected_accepted
+                            }
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
+                                !unit.expected_accepted
+                            }
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                                false
+                            }
+                        };
                         (
-                            result.verdict
-                                == reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted,
+                            actual,
+                            passed,
                             result.execution.exit_code,
+                            result.execution.termination,
                             result.execution.duration_ms,
+                            result.execution.stdout,
                             result.execution.stderr,
                         )
                     } else {
                         let answer = read_project_bytes(&root, &unit.answer_file)?;
                         let actual = read_project_bytes(&root, &unit.output_file)?;
+                        let accepted = reporch_cli::authoring_runtime::standard_checker_matches(
+                            &spec.testing.checker.checker,
+                            &answer,
+                            &actual,
+                        )?;
                         (
-                            reporch_cli::authoring_runtime::standard_checker_matches(
-                                &spec.testing.checker.checker,
-                                &answer,
-                                &actual,
-                            )?,
+                            if accepted { "accepted" } else { "rejected" },
+                            accepted == unit.expected_accepted,
                             0,
+                            reporch_runtime_core::GuestTerminationV2::Exited,
                             0,
+                            String::new(),
                             String::new(),
                         )
                     };
@@ -1174,14 +1303,12 @@ pub(super) async fn checker(options: CheckerOptions, output: &CliOutput) -> Resu
                     } else {
                         "rejected"
                     },
-                    actual: if actual_accepted {
-                        "accepted"
-                    } else {
-                        "rejected"
-                    },
-                    passed: actual_accepted == unit.expected_accepted,
+                    actual,
+                    passed,
                     exit_code,
+                    termination,
                     duration_ms,
+                    stdout,
                     stderr,
                 });
             }
@@ -1240,6 +1367,8 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                             });
                     validate_solution_role(expected_verdict, role)?;
                     ensure_reference_is_available(spec, role, None)?;
+                    let group_expectations =
+                        resolve_group_expectations(spec, &options.group_expectations)?;
                     spec.testing.solutions.push(SolutionSpecV2 {
                         program: ProgramSpecV2 {
                             id: Uuid::now_v7(),
@@ -1251,7 +1380,7 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                         role,
                         expected_verdict,
                         expected_score: expected_score.clone(),
-                        group_expectations: Vec::new(),
+                        group_expectations,
                         tags: Vec::new(),
                         notes: String::new(),
                     });
@@ -1293,11 +1422,24 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                     };
                     validate_solution_role(expected_verdict, role)?;
                     ensure_reference_is_available(spec, role, Some(solution_index))?;
+                    let group_expectations = if options.clear_group_expectations {
+                        Some(Vec::new())
+                    } else if options.group_expectations.is_empty() {
+                        None
+                    } else {
+                        Some(resolve_group_expectations(
+                            spec,
+                            &options.group_expectations,
+                        )?)
+                    };
 
                     let solution = &mut spec.testing.solutions[solution_index];
                     solution.expected_verdict = expected_verdict;
                     solution.role = role;
                     solution.expected_score = expected_score;
+                    if let Some(group_expectations) = group_expectations {
+                        solution.group_expectations = group_expectations;
+                    }
                     Ok(())
                 },
             )?;
@@ -1308,10 +1450,14 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
             )
         }
         SolutionCommand::Remove { name } => {
+            let mut inventory_removed = Vec::new();
+            let mut files_preserved = Vec::new();
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
-                |_root, spec| {
-                    let solution_id = find_solution(spec, &name)?.program.id;
+                |root, spec| {
+                    let solution = find_solution(spec, &name)?;
+                    let solution_id = solution.program.id;
+                    files_preserved.push(solution.program.source_path.clone());
                     ensure!(
                         !spec.testing.stress_suites.iter().any(|suite| {
                             suite.oracle_solution_id == solution_id
@@ -1336,16 +1482,66 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                         before != spec.testing.solutions.len(),
                         "solution was not found"
                     );
+                    inventory_removed =
+                        reporch_cli::local_project_v2::prune_unreferenced_file_declarations(
+                            root,
+                            spec,
+                            files_preserved.clone(),
+                        )?;
                     Ok(())
                 },
             )?;
             output.emit(
                 "solution remove",
-                &spec.testing.solutions,
+                &RemovalResult {
+                    remaining: &spec.testing.solutions,
+                    inventory_removed,
+                    files_preserved,
+                },
                 &format!("Removed solution {name}"),
             )
         }
     }
+}
+
+fn resolve_group_expectations(
+    spec: &reporch_format::AuthoringSpecV2,
+    requested: &[GroupExpectationInput],
+) -> Result<Vec<studio_core::GroupSolutionExpectationV2>> {
+    let mut resolved = Vec::with_capacity(requested.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for expectation in requested {
+        let parsed = Uuid::parse_str(&expectation.group).ok();
+        let group = spec
+            .testing
+            .groups
+            .iter()
+            .find(|group| group.name == expectation.group || parsed == Some(group.id))
+            .with_context(|| {
+                format!(
+                    "group was not found: {}; list groups with `reporch test group list --format json`",
+                    expectation.group
+                )
+            })?;
+        ensure!(
+            seen.insert(group.id),
+            "duplicate group expectation: {}",
+            expectation.group
+        );
+        let verdict = expectation.verdict.into();
+        let score = score_range_for_verdict(
+            expectation.minimum_score,
+            expectation.maximum_score,
+            verdict,
+        )?;
+        resolved.push(studio_core::GroupSolutionExpectationV2 {
+            group_id: group.id,
+            verdict,
+            score,
+        });
+    }
+    resolved.sort_by_key(|expectation| expectation.group_id);
+    Ok(resolved)
 }
 
 fn emit_solutions(command: &'static str, output: &CliOutput) -> Result<()> {
@@ -1558,6 +1754,9 @@ struct StressCandidateResult {
     passed: bool,
 }
 
+type StressMismatch = (u64, Vec<u8>, Vec<u8>, Vec<u8>);
+type StressMismatchMap = std::collections::BTreeMap<Uuid, StressMismatch>;
+
 pub(super) async fn stress(options: StressOptions, output: &CliOutput) -> Result<()> {
     match options.command {
         StressCommand::List => {
@@ -1720,8 +1919,23 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
     let scratch = tempfile::Builder::new()
         .prefix("run-")
         .tempdir_in(&scratch_parent)?;
-    let mut first_mismatch =
-        std::collections::BTreeMap::<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>::new();
+    if let Some(first_mismatch) = try_run_stress_batch(
+        &root,
+        scratch.path(),
+        &suite,
+        generator,
+        recipe,
+        oracle,
+        &candidates,
+        &spec.testing.checker.checker,
+        &run_options,
+        output,
+    )
+    .await?
+    {
+        return emit_stress_results(&root, &suite, &candidates, first_mismatch, output);
+    }
+    let mut first_mismatch = StressMismatchMap::new();
     let mut last_progress = std::time::Instant::now();
     for ordinal in 0..suite.cases {
         let seed = suite
@@ -1811,6 +2025,16 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
             last_progress = std::time::Instant::now();
         }
     }
+    emit_stress_results(&root, &suite, &candidates, first_mismatch, output)
+}
+
+fn emit_stress_results(
+    root: &Path,
+    suite: &StressSuiteSpecV2,
+    candidates: &[&SolutionSpecV2],
+    mut first_mismatch: StressMismatchMap,
+    output: &CliOutput,
+) -> Result<()> {
     let mut results = Vec::new();
     for candidate in candidates {
         let mismatch = first_mismatch.remove(&candidate.program.id);
@@ -1820,10 +2044,10 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
         let (counterexample_seed, input_path, counterexample_sha256) =
             if let Some((seed, input, oracle, actual)) = mismatch {
                 let base = format!("stress-failures/{}-{seed}", suite.name);
-                write_project_bytes_once_or_same(&root, &format!("{base}.in"), &input)?;
-                write_project_bytes_once_or_same(&root, &format!("{base}.oracle"), &oracle)?;
+                write_project_bytes_once_or_same(root, &format!("{base}.in"), &input)?;
+                write_project_bytes_once_or_same(root, &format!("{base}.oracle"), &oracle)?;
                 write_project_bytes_once_or_same(
-                    &root,
+                    root,
                     &format!("{base}.{}.out", candidate.program.name),
                     &actual,
                 )?;
@@ -1858,6 +2082,348 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
             results.len()
         ),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_run_stress_batch(
+    root: &Path,
+    scratch: &Path,
+    suite: &StressSuiteSpecV2,
+    generator: &GeneratorSpecV2,
+    recipe: &GeneratorRecipeSpecV2,
+    oracle: &SolutionSpecV2,
+    candidates: &[&SolutionSpecV2],
+    checker: &CheckerSpec,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+    output: &CliOutput,
+) -> Result<Option<StressMismatchMap>> {
+    if options.runtime != reporch_cli::local_sandbox::OciRuntime::Auto
+        && std::env::var_os("REPORCH_DEBUG_ENABLE_STRESS_BATCH").is_none()
+    {
+        return Ok(None);
+    }
+    if suite.minimize_failure
+        || matches!(
+            checker,
+            CheckerSpec::Custom { .. } | CheckerSpec::Floating { .. }
+        )
+    {
+        return Ok(None);
+    }
+    let language = reporch_cli::toolchain::resolve_for_language(
+        options.toolchain_id.as_deref(),
+        &generator.program.language,
+    )?
+    .language;
+    if matches!(language.as_str(), "java" | "csharp") {
+        return Ok(None);
+    }
+    for program in
+        std::iter::once(&oracle.program).chain(candidates.iter().map(|value| &value.program))
+    {
+        let candidate_language = reporch_cli::toolchain::resolve_for_language(
+            options.toolchain_id.as_deref(),
+            &program.language,
+        )?
+        .language;
+        if candidate_language != language {
+            return Ok(None);
+        }
+    }
+    let jobs_per_seed = 3_u64.saturating_add(candidates.len() as u64);
+    let total_timeout_ms = suite
+        .timeout_ms
+        .saturating_mul(u64::from(suite.cases))
+        .saturating_mul(jobs_per_seed)
+        .saturating_add(30_000);
+    if total_timeout_ms > 600_000 || candidates.len() + 3 > 256 {
+        return Ok(None);
+    }
+
+    let script_path = scratch.join("batch.sh");
+    let mut script = String::from("#!/bin/sh\nset -eu\n");
+    script.push_str("generator_src=$1\noracle_src=$2\n");
+    for index in 0..candidates.len() {
+        writeln!(&mut script, "candidate_{index}_src=${}", index + 3)?;
+    }
+    let mut generator_arguments = generator.program.arguments.clone();
+    generator_arguments.extend(recipe.argument_template.iter().cloned());
+    let (generator_setup, generator_command) = stress_program_shell(
+        &language,
+        "generator",
+        "$generator_src",
+        &generator_arguments,
+    )?;
+    let (oracle_setup, oracle_command) = stress_program_shell(
+        &language,
+        "oracle",
+        "$oracle_src",
+        &oracle.program.arguments,
+    )?;
+    script.push_str(&generator_setup);
+    script.push_str(&oracle_setup);
+    let mut candidate_commands = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        let label = format!("candidate_{index}");
+        let source = format!("$candidate_{index}_src");
+        let (setup, command) =
+            stress_program_shell(&language, &label, &source, &candidate.program.arguments)?;
+        script.push_str(&setup);
+        candidate_commands.push(command);
+    }
+    writeln!(&mut script, "seed={}", suite.seed_start)?;
+    script.push_str("ordinal=0\n");
+    writeln!(
+        &mut script,
+        "while [ \"$ordinal\" -lt {} ]; do",
+        suite.cases
+    )?;
+    script.push_str("  input=/run/reporch/stress-input\n  repeat=/run/reporch/stress-repeat\n  oracle=/run/reporch/stress-oracle\n");
+    let generator_with_seed = format!("{generator_command} \"$seed\"");
+    append_checked_stress_command(
+        &mut script,
+        &generator_with_seed,
+        suite.timeout_ms,
+        "$input",
+        None,
+        90,
+    )?;
+    append_checked_stress_command(
+        &mut script,
+        &generator_with_seed,
+        suite.timeout_ms,
+        "$repeat",
+        None,
+        91,
+    )?;
+    script.push_str("  cmp -s \"$input\" \"$repeat\" || exit 92\n");
+    append_checked_stress_command(
+        &mut script,
+        &oracle_command,
+        suite.timeout_ms,
+        "$oracle",
+        Some("$input"),
+        93,
+    )?;
+    for (index, command) in candidate_commands.iter().enumerate() {
+        writeln!(
+            &mut script,
+            "  if [ ! -e /run/reporch/found-{index} ]; then"
+        )?;
+        writeln!(
+            &mut script,
+            "    candidate=/run/reporch/stress-candidate-{index}"
+        )?;
+        script.push_str("    set +e\n");
+        writeln!(
+            &mut script,
+            "    {} < \"$input\" > \"$candidate\" 2>/run/reporch/candidate.err",
+            timed_stress_command(command, suite.timeout_ms)
+        )?;
+        script.push_str("    status=$?\n    set -e\n    mismatch=0\n");
+        script.push_str("    if [ \"$status\" -ne 0 ]; then mismatch=1; fi\n");
+        writeln!(
+            &mut script,
+            "    if [ \"$mismatch\" -eq 0 ] && ! ( {} ); then mismatch=1; fi",
+            stress_compare_shell(checker, index)
+        )?;
+        script.push_str("    if [ \"$mismatch\" -eq 1 ]; then\n");
+        writeln!(&mut script, "      printf 'M\\t{index}\\t%s\\t' \"$seed\"")?;
+        script.push_str("      base64 < \"$input\" | tr -d '\\n'\n      printf '\\t'\n      base64 < \"$oracle\" | tr -d '\\n'\n      printf '\\t'\n      base64 < \"$candidate\" | tr -d '\\n'\n      printf '\\n'\n");
+        writeln!(&mut script, "      : > /run/reporch/found-{index}")?;
+        script.push_str("    fi\n  fi\n");
+    }
+    script.push_str("  ordinal=$((ordinal + 1))\n  seed=$((seed + 1))\ndone\nprintf 'D\\n'\n");
+
+    let mut file = fs::File::create(&script_path)?;
+    file.write_all(script.as_bytes())?;
+    file.sync_all()?;
+    let relative_script = project_relative(root, &script_path)?;
+    let mut command = vec!["bash".to_owned(), format!("/workspace/{relative_script}")];
+    command.push(format!("/workspace/{}", generator.program.source_path));
+    command.push(format!("/workspace/{}", oracle.program.source_path));
+    command.extend(
+        candidates
+            .iter()
+            .map(|candidate| format!("/workspace/{}", candidate.program.source_path)),
+    );
+    let mut batch_options = options.clone();
+    batch_options.timeout = std::time::Duration::from_millis(total_timeout_ms);
+    output.progress(
+        "stress run",
+        &format!(
+            "Stress suite {}: running {} seed(s) in one VM",
+            suite.name, suite.cases
+        ),
+    );
+    let result = reporch_cli::authoring_runtime::run_toolchain_command(
+        root,
+        &language,
+        command,
+        &batch_options,
+    )
+    .await?;
+    if result.termination != reporch_runtime_core::GuestTerminationV2::Exited
+        || result.exit_code != 0
+    {
+        return Err(crate::cli_output::domain_error(
+            if result.termination == reporch_runtime_core::GuestTerminationV2::TimedOut {
+                "runtime.execution_timed_out"
+            } else {
+                "runtime.execution_failed"
+            },
+            format!(
+                "batched stress runtime ended as {:?} with exit code {}",
+                result.termination, result.exit_code
+            ),
+            &result,
+        ));
+    }
+    let mut mismatches = std::collections::BTreeMap::new();
+    let mut completed = false;
+    for line in result.stdout.lines() {
+        if line == "D" {
+            completed = true;
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 6 && fields[0] == "M",
+            "invalid batched stress result frame"
+        );
+        let index = fields[1]
+            .parse::<usize>()
+            .context("parse batched stress candidate index")?;
+        let candidate = candidates
+            .get(index)
+            .context("batched stress candidate index is out of range")?;
+        let seed = fields[2]
+            .parse::<u64>()
+            .context("parse batched stress seed")?;
+        let decode = |value: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .context("decode batched stress artifact")
+        };
+        mismatches.entry(candidate.program.id).or_insert((
+            seed,
+            decode(fields[3])?,
+            decode(fields[4])?,
+            decode(fields[5])?,
+        ));
+    }
+    ensure!(completed, "batched stress result is incomplete");
+    output.progress(
+        "stress run",
+        &format!(
+            "Stress suite {}: {}/{} seed(s) checked",
+            suite.name, suite.cases, suite.cases
+        ),
+    );
+    Ok(Some(mismatches))
+}
+
+fn stress_program_shell(
+    language: &str,
+    label: &str,
+    source_variable: &str,
+    arguments: &[String],
+) -> Result<(String, String)> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suffix = if arguments.is_empty() {
+        String::new()
+    } else {
+        format!(" {arguments}")
+    };
+    match language {
+        "python" => Ok((
+            String::new(),
+            format!("python3 \"{source_variable}\"{suffix}"),
+        )),
+        "pypy" => Ok((
+            String::new(),
+            format!("pypy3 \"{source_variable}\"{suffix}"),
+        )),
+        "javascript" => Ok((String::new(), format!("node \"{source_variable}\"{suffix}"))),
+        "php" => Ok((String::new(), format!("php \"{source_variable}\"{suffix}"))),
+        "r" => Ok((
+            String::new(),
+            format!("Rscript \"{source_variable}\"{suffix}"),
+        )),
+        "bash" => Ok((String::new(), format!("bash \"{source_variable}\"{suffix}"))),
+        "c" => Ok((
+            format!("cc -std=c17 -O2 -pipe \"{source_variable}\" -o /run/reporch/{label}\n"),
+            format!("/run/reporch/{label}{suffix}"),
+        )),
+        "cpp" => Ok((
+            format!("c++ -std=c++20 -O2 -pipe \"{source_variable}\" -o /run/reporch/{label}\n"),
+            format!("/run/reporch/{label}{suffix}"),
+        )),
+        "rust" => Ok((
+            format!("rustc --edition=2024 -O \"{source_variable}\" -o /run/reporch/{label}\n"),
+            format!("/run/reporch/{label}{suffix}"),
+        )),
+        "swift" => Ok((
+            format!("swiftc -O \"{source_variable}\" -o /run/reporch/{label}\n"),
+            format!("/run/reporch/{label}{suffix}"),
+        )),
+        _ => anyhow::bail!("language is not supported by batched stress execution: {language}"),
+    }
+}
+
+fn append_checked_stress_command(
+    script: &mut String,
+    command: &str,
+    timeout_ms: u64,
+    output_path: &str,
+    input_path: Option<&str>,
+    failure_exit: i32,
+) -> Result<()> {
+    script.push_str("  set +e\n");
+    let input = input_path
+        .map(|path| format!(" < \"{path}\""))
+        .unwrap_or_default();
+    writeln!(
+        script,
+        "  {}{} > \"{}\" 2>/run/reporch/stress.err",
+        timed_stress_command(command, timeout_ms),
+        input,
+        output_path
+    )?;
+    script.push_str("  status=$?\n  set -e\n");
+    writeln!(
+        script,
+        "  if [ \"$status\" -ne 0 ]; then cat /run/reporch/stress.err >&2; exit {failure_exit}; fi"
+    )?;
+    Ok(())
+}
+
+fn timed_stress_command(command: &str, timeout_ms: u64) -> String {
+    format!(
+        "timeout --signal=KILL --kill-after=1s {:.3}s {command}",
+        timeout_ms as f64 / 1_000.0
+    )
+}
+
+fn stress_compare_shell(checker: &CheckerSpec, index: usize) -> String {
+    match checker {
+        CheckerSpec::Exact => format!("cmp -s \"$oracle\" /run/reporch/stress-candidate-{index}"),
+        CheckerSpec::Token => format!(
+            "awk '{{for(i=1;i<=NF;i++) print $i}}' \"$oracle\" > /run/reporch/oracle.tokens && awk '{{for(i=1;i<=NF;i++) print $i}}' /run/reporch/stress-candidate-{index} > /run/reporch/candidate.tokens && cmp -s /run/reporch/oracle.tokens /run/reporch/candidate.tokens"
+        ),
+        CheckerSpec::CaseInsensitive => format!(
+            "awk '{{for(i=1;i<=NF;i++) print tolower($i)}}' \"$oracle\" > /run/reporch/oracle.tokens && awk '{{for(i=1;i<=NF;i++) print tolower($i)}}' /run/reporch/stress-candidate-{index} > /run/reporch/candidate.tokens && cmp -s /run/reporch/oracle.tokens /run/reporch/candidate.tokens"
+        ),
+        CheckerSpec::Floating { .. } | CheckerSpec::Custom { .. } => "false".into(),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 async fn run_solution(
@@ -2102,7 +2668,10 @@ async fn run_interactor(
         .context("no interactor is configured")?;
     let solution = find_runtime_solution(&spec, &options.solution)?;
     let test = find_test(&spec, &options.test)?;
-    let run_options = options.runtime.into_run_options(output);
+    let mut run_options = options.runtime.into_run_options(output);
+    run_options.timeout = run_options
+        .timeout
+        .min(Duration::from_millis(spec.testing.limits.time_ms.max(1)));
     let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
         run_options.toolchain_id.as_deref(),
         &interactive.interactor.language,
@@ -2122,6 +2691,7 @@ async fn run_interactor(
             interactor_source_path: &interactive.interactor.source_path,
             language: &interactive.interactor.language,
             input_path: &test.input_file,
+            idle_timeout: Duration::from_millis(interactive.idle_timeout_ms),
             options: &run_options,
         },
     )
@@ -2130,32 +2700,31 @@ async fn run_interactor(
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
     }
-    let expected_accepted = solution.expected_verdict == studio_core::ExpectedVerdict::Accepted;
+    let actual_verdict = interactive_execution_verdict(&result);
+    let transcript_value = transcript.then(|| result.stdout.clone());
     let report = RuntimeProgramReport {
         solution: solution.program.name.clone(),
         test_id: test.id,
-        expected: if expected_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        actual: if result.exit_code == 0 {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        passed: (result.exit_code == 0) == expected_accepted,
+        expected: verdict_name(solution.expected_verdict),
+        actual: observed_verdict_name(actual_verdict),
+        passed: actual_verdict == Some(solution.expected_verdict),
         exit_code: result.exit_code,
+        termination: result.termination,
         duration_ms: result.duration_ms,
-        transcript: transcript.then_some(result.stdout),
+        stdout: result.stdout,
+        transcript: transcript_value,
         stderr: result.stderr,
     };
-    ensure!(
-        report.passed,
-        "interactive validation did not pass: expected {}, got {}",
-        report.expected,
-        report.actual
-    );
+    if !report.passed {
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            format!(
+                "interactive validation did not pass: expected {}, got {}",
+                report.expected, report.actual
+            ),
+            &report,
+        ));
+    }
     output.emit(
         if transcript {
             "interactor transcript"
@@ -2457,7 +3026,9 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         },
     )
     .await?;
-    let actual_accepted = if result.exit_code == 0 {
+    let checker_accepted = if result.termination == reporch_runtime_core::GuestTerminationV2::Exited
+        && result.exit_code == 0
+    {
         checker_accepts_bytes(
             &root,
             &spec.testing.checker.checker,
@@ -2474,32 +3045,31 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
     }
-    let expected_accepted = solution.expected_verdict == studio_core::ExpectedVerdict::Accepted;
+    let actual_verdict =
+        program_execution_verdict(&result, checker_accepted, &solution.program.language);
     let report = RuntimeProgramReport {
         solution: solution.program.name.clone(),
         test_id: test.id,
-        expected: if expected_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        actual: if actual_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        passed: actual_accepted == expected_accepted,
+        expected: verdict_name(solution.expected_verdict),
+        actual: observed_verdict_name(actual_verdict),
+        passed: actual_verdict == Some(solution.expected_verdict),
         exit_code: result.exit_code,
+        termination: result.termination,
         duration_ms: result.duration_ms,
+        stdout: result.stdout,
         transcript: None,
         stderr: result.stderr,
     };
-    ensure!(
-        report.passed,
-        "grader validation did not pass: expected {}, got {}",
-        report.expected,
-        report.actual
-    );
+    if !report.passed {
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            format!(
+                "grader validation did not pass: expected {}, got {}",
+                report.expected, report.actual
+            ),
+            &report,
+        ));
+    }
     output.emit(
         "grader run",
         &report,
@@ -2790,6 +3360,28 @@ fn resolve_group_ids(
         .iter()
         .map(|name| Ok(find_group(spec, name)?.id))
         .collect()
+}
+
+fn ensure_v2_group_dependencies_acyclic(groups: &[TestGroupSpecV2]) -> Result<()> {
+    let mut resolved = std::collections::BTreeSet::new();
+    while resolved.len() < groups.len() {
+        let before = resolved.len();
+        for group in groups {
+            if !resolved.contains(&group.id)
+                && group
+                    .depends_on
+                    .iter()
+                    .all(|dependency| resolved.contains(dependency))
+            {
+                resolved.insert(group.id);
+            }
+        }
+        ensure!(
+            resolved.len() > before,
+            "test group dependency graph cannot contain a cycle"
+        );
+    }
+    Ok(())
 }
 
 fn find_group<'a>(

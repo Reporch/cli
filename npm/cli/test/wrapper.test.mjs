@@ -218,6 +218,35 @@ test("recovers an omitted optional package once and reuses the verified cache", 
   assert.equal(requests, 1);
 });
 
+test("recovers when an installed platform package is missing its binary", async () => {
+  const root = mkdtempSync(join(tmpdir(), "reporch-cli-missing-binary-"));
+  const installedPackage = join(root, "installed", "package.json");
+  mkdirSync(dirname(installedPackage), { recursive: true });
+  writeFileSync(installedPackage, "{}\n");
+  const contents = Buffer.from("recovered native binary\n");
+  const packageName = "@reporch/cli-linux-x64-gnu";
+  const checksums = { [packageName]: sha256File(writeFixture(root, contents)) };
+  const tarball = npmTarballEntries(runtimePayloadEntries(contents));
+  let requests = 0;
+  const binary = await resolveOrRecoverBinary({
+    platform: "linux",
+    arch: "x64",
+    resolvePackage: () => installedPackage,
+    checksums,
+    fetchImpl: async () => {
+      requests += 1;
+      return new Response(tarball, {
+        status: 200,
+        headers: { "content-length": String(tarball.length) }
+      });
+    },
+    cacheDirectory: join(root, "cache")
+  });
+
+  assert.deepEqual(readFileSync(binary), contents);
+  assert.equal(requests, 1);
+});
+
 function writeFixture(root, contents) {
   const path = join(root, "expected-binary");
   writeFileSync(path, contents);

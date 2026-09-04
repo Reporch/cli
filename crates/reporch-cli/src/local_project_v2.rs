@@ -243,6 +243,7 @@ pub fn compile_authoring_spec(
     commit_id: Uuid,
 ) -> Result<ReleaseManifestV2> {
     let root = ensure_real_directory(directory)?;
+    validate_statement_documents(&root, spec)?;
     let files = spec
         .files
         .iter()
@@ -261,6 +262,44 @@ pub fn compile_authoring_spec(
         .collect::<Result<Vec<_>>>()?;
     spec.materialize(commit_id, files)
         .context("materialize immutable v2 release manifest")
+}
+
+pub fn validate_statement_documents(directory: &Path, spec: &AuthoringSpecV2) -> Result<()> {
+    let root = ensure_real_directory(directory)?;
+    for path in spec.statements.values().chain(spec.tutorials.values()) {
+        let declared = spec
+            .files
+            .iter()
+            .find(|file| file.path == *path)
+            .with_context(|| format!("Markdown document is not declared: {path}"))?;
+        ensure!(
+            declared.media_type == "text/markdown" && !declared.executable,
+            "Markdown document must be non-executable text/markdown: {path}"
+        );
+        hash_regular_project_file(&root, path)?;
+        let bytes = read_bounded_regular_file(&root.join(path), MAX_AUTHORING_SPEC_BYTES as u64)?;
+        let markdown = std::str::from_utf8(&bytes)
+            .with_context(|| format!("Markdown document is not UTF-8: {path}"))?;
+        let assets = studio_core::statement_image_paths(markdown).map_err(|issues| {
+            anyhow::anyhow!(
+                "statement Markdown is unsafe in {path}: {}",
+                issues
+                    .iter()
+                    .map(|issue| issue.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })?;
+        for asset in assets {
+            ensure!(
+                spec.files.iter().any(|file| file.path == asset),
+                "statement image asset is not declared: {asset}; add it to the project before checking or rendering"
+            );
+            hash_regular_project_file(&root, &asset)
+                .with_context(|| format!("statement image asset is missing or unsafe: {asset}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Build the complete structured and Markdown-asset reference graph for V2.
@@ -355,6 +394,29 @@ pub fn referenced_project_paths(root: &Path, spec: &AuthoringSpecV2) -> Result<B
         .collect()
 }
 
+/// Remove selected inventory entries that became unreachable after a structural mutation.
+/// The files themselves are deliberately preserved on disk for recovery and source-control use.
+pub fn prune_unreferenced_file_declarations(
+    root: &Path,
+    spec: &mut AuthoringSpecV2,
+    candidates: impl IntoIterator<Item = String>,
+) -> Result<Vec<String>> {
+    let references = referenced_project_paths(root, spec)?;
+    let candidates = candidates
+        .into_iter()
+        .map(|path| studio_core::normalize_relative_path(&path))
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    let mut removed = spec
+        .files
+        .iter()
+        .filter(|file| candidates.contains(&file.path) && !references.contains(&file.path))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    spec.files.retain(|file| !removed.contains(&file.path));
+    removed.sort();
+    Ok(removed)
+}
+
 /// Remove unreferenced inventory entries under the authoring lock.
 ///
 /// Optional physical deletion is implemented as a recoverable atomic rename
@@ -393,19 +455,30 @@ pub fn prune_project(
         .join("prune-trash")
         .join(operation_id.to_string());
     let mut moved = Vec::<(PathBuf, PathBuf)>::new();
+    let mut trashable = Vec::new();
+    let mut preserved = Vec::new();
     if delete_files {
-        let trash_parent = trash_root
-            .parent()
-            .context("prune trash directory has no parent")?;
-        ensure_private_lock_directory(trash_parent)?;
-        fs::create_dir(&trash_root)
-            .with_context(|| format!("create recoverable prune trash {}", trash_root.display()))?;
         for path in &candidates {
             // Hashing performs the canonical containment, regular-file and
-            // symlink-ancestor checks before any rename occurs.
-            let _ = hash_regular_project_file(&root, path)?;
+            // symlink-ancestor checks before any rename occurs. Unsafe,
+            // missing, or non-regular paths leave the physical entry alone;
+            // only their stale inventory declaration is removed.
+            if hash_regular_project_file(&root, path).is_ok() {
+                trashable.push(path.clone());
+            } else {
+                preserved.push(path.clone());
+            }
         }
-        for path in &candidates {
+        if !trashable.is_empty() {
+            let trash_parent = trash_root
+                .parent()
+                .context("prune trash directory has no parent")?;
+            ensure_private_lock_directory(trash_parent)?;
+            fs::create_dir(&trash_root).with_context(|| {
+                format!("create recoverable prune trash {}", trash_root.display())
+            })?;
+        }
+        for path in &trashable {
             let source = root.join(path);
             let destination = trash_root.join(path);
             if let Some(parent) = destination.parent() {
@@ -442,12 +515,12 @@ pub fn prune_project(
         applied: true,
         inventory_removed: candidates.clone(),
         files_preserved: if delete_files {
-            Vec::new()
+            preserved
         } else {
             candidates.clone()
         },
-        files_trashed: if delete_files { candidates } else { Vec::new() },
-        trash_directory: delete_files.then_some(trash_root),
+        files_trashed: if delete_files { trashable } else { Vec::new() },
+        trash_directory: (!moved.is_empty()).then_some(trash_root),
     })
 }
 
@@ -688,13 +761,20 @@ pub fn migrate_project(directory: &Path) -> Result<MigrationOutcomeV2> {
         if schema == studio_core::RELEASE_MANIFEST_SCHEMA_V2 {
             let manifest: ReleaseManifestV2 = serde_json::from_slice(&legacy_bytes)?;
             manifest.validate_references()?;
+            let recovered = AuthoringSpecV2::from_manifest(&manifest);
+            let rebuilt = compile_authoring_spec(&root, &recovered, manifest.commit_id)?;
+            ensure!(
+                rebuilt == manifest,
+                "generated v2 manifest cannot be recovered losslessly into {AUTHORING_FILE_NAME}"
+            );
+            write_authoring_spec_create_new(&root, &recovered)?;
             return Ok(MigrationOutcomeV2 {
                 schema: "reporch.migration-result.v2",
                 directory: root,
                 authoring_file: authoring_path,
                 backup_files,
                 project_id: manifest.project_id,
-                migrated: false,
+                migrated: true,
             });
         } else {
             let outcome = crate::local_project::migrate_legacy_project(&root)?;
@@ -815,6 +895,26 @@ mod tests {
     }
 
     #[test]
+    fn project_migration_recovers_missing_yaml_from_a_v2_generated_manifest() {
+        let temporary = tempfile::tempdir().unwrap();
+        write_minimal_v1(temporary.path());
+        let spec = migrate_v1_authoring_file(temporary.path()).unwrap();
+        let manifest = compile_authoring_spec(temporary.path(), &spec, Uuid::now_v7()).unwrap();
+        fs::write(
+            temporary.path().join(LEGACY_MANIFEST_FILE_NAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(temporary.path().join(AUTHORING_FILE_NAME)).unwrap();
+
+        let outcome = migrate_project(temporary.path()).unwrap();
+        assert!(outcome.migrated);
+        assert!(outcome.authoring_file.is_file());
+        assert_eq!(read_authoring_spec(temporary.path()).unwrap(), spec);
+        assert!(!migrate_project(temporary.path()).unwrap().migrated);
+    }
+
+    #[test]
     fn freshly_initialized_v2_project_can_be_linked_without_v1_parsing() {
         let temporary = tempfile::tempdir().unwrap();
         let local_id = Uuid::now_v7();
@@ -882,6 +982,46 @@ mod tests {
         assert_eq!(
             fs::read(trash.join("unused.txt")).unwrap(),
             b"preserve me\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_prune_removes_stale_symlink_inventory_without_touching_the_link() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        write_minimal_v1(temporary.path());
+        migrate_v1_authoring_file(temporary.path()).unwrap();
+        symlink(outside.path(), temporary.path().join("unused-link")).unwrap();
+        update_authoring_spec(temporary.path(), |_root, spec| {
+            spec.files.push(AuthoringFileV2 {
+                path: "unused-link".into(),
+                media_type: "application/octet-stream".into(),
+                executable: false,
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let removed = prune_project(temporary.path(), true, true).unwrap();
+        assert_eq!(removed.inventory_removed, vec!["unused-link"]);
+        assert_eq!(removed.files_preserved, vec!["unused-link"]);
+        assert!(removed.files_trashed.is_empty());
+        assert!(removed.trash_directory.is_none());
+        assert!(
+            fs::symlink_metadata(temporary.path().join("unused-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !read_authoring_spec(temporary.path())
+                .unwrap()
+                .files
+                .iter()
+                .any(|file| file.path == "unused-link")
         );
     }
 }

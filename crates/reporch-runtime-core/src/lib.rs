@@ -501,6 +501,10 @@ pub enum RuntimeError {
     GuestUnresponsive,
     #[error("runtime workload exceeded its configured timeout")]
     ExecutionTimedOut,
+    #[error(
+        "local VM output capture exceeded {capture_kib} KiB before the authored {authored_kib} KiB limit"
+    )]
+    OutputCaptureExceeded { authored_kib: u64, capture_kib: u64 },
     #[error("runtime protocol is incompatible")]
     ProtocolIncompatible,
     #[error("runtime cleanup failed: {0}")]
@@ -521,6 +525,7 @@ impl RuntimeError {
             Self::GuestBootFailed(_) => "runtime.guest_boot_failed",
             Self::GuestUnresponsive => "runtime.guest_unresponsive",
             Self::ExecutionTimedOut => "runtime.execution_timed_out",
+            Self::OutputCaptureExceeded { .. } => "runtime.output_capture_exceeded",
             Self::ProtocolIncompatible => "runtime.protocol_incompatible",
             Self::CleanupFailed(_) => "runtime.cleanup_failed",
             Self::RemoteFallbackNotAllowed => "runtime.remote_fallback_not_allowed",

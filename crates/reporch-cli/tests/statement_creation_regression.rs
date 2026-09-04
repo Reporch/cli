@@ -37,6 +37,8 @@ fn statement_add_safely_creates_a_missing_markdown_file() {
 
     let statement = fs::read_to_string(project.join("statements/ko-KR.md")).unwrap();
     assert!(statement.starts_with("# 두 수의 합\n"), "{statement}");
+    assert!(statement.contains("*Locale: ko-KR*"), "{statement}");
+    assert!(!statement.contains("<!--"), "{statement}");
     let checked = reporch()
         .current_dir(&project)
         .arg("check")

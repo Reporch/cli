@@ -824,6 +824,20 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Grader(options) => authoring::grader(options, output).await,
         Command::Output(options) => authoring::output_submission(options, output).await,
         Command::Verify(options) => {
+            if options.local {
+                let silent = CliOutput::new(OutputFormat::Human, true, ColorMode::Never);
+                check_project(&silent)?;
+                return authoring::verify_local(
+                    options.local_timeout_seconds,
+                    match options.runtime {
+                        studio_remote::LocalVerifyRuntime::Auto => authoring::RuntimeKind::Auto,
+                        studio_remote::LocalVerifyRuntime::Podman => authoring::RuntimeKind::Podman,
+                        studio_remote::LocalVerifyRuntime::Docker => authoring::RuntimeKind::Docker,
+                    },
+                    output,
+                )
+                .await;
+            }
             let validation = studio_remote::validate_operation(&options).await?;
             if validation.detail.as_ref().is_some_and(|detail| {
                 detail.status != studio_contracts::ValidationRunStatus::Passed
@@ -858,11 +872,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 AuthDevicesCommand::List(connection) => {
                     let sessions =
                         studio_remote::list_device_sessions_operation(&connection).await?;
-                    output.emit(
-                        "auth devices list",
-                        &sessions,
-                        &format!("{} device session(s)", sessions.items.len()),
-                    )
+                    let human = human_item_list("device session", &sessions.items)?;
+                    output.emit("auth devices list", &sessions, &human)
                 }
                 AuthDevicesCommand::Revoke {
                     connection,
@@ -902,26 +913,11 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ProjectCommand::List(connection) => {
                 let projects = studio_remote::list_projects_operation(&connection).await?;
-                output.emit(
-                    "project list",
-                    &projects,
-                    &format!("{} project(s)", projects.items.len()),
-                )
+                let human = human_item_list("project", &projects.items)?;
+                output.emit("project list", &projects, &human)
             }
             ProjectCommand::Show(connection) => {
-                let root = reporch_cli::local_project::discover_project(Path::new("."))?;
-                let state = reporch_cli::local_project::read_local_state(&root)?;
-                let project_id = state
-                    .remote
-                    .as_ref()
-                    .context("project is not linked; run reporch project link")?
-                    .project_id;
-                let projects = studio_remote::list_projects_operation(&connection).await?;
-                let project = projects
-                    .items
-                    .into_iter()
-                    .find(|project| project.id == project_id)
-                    .context("linked Studio project is no longer accessible")?;
+                let project = studio_remote::show_local_project_operation(&connection).await?;
                 output.emit("project show", &project, &project.title)
             }
             ProjectCommand::Open {
@@ -1040,19 +1036,13 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Member { command } => match command {
             MemberCommand::Search(options) => {
                 let identities = studio_remote::search_members_operation(&options).await?;
-                output.emit(
-                    "member search",
-                    &identities,
-                    &format!("{} matching account(s)", identities.items.len()),
-                )
+                let human = human_item_list("matching account", &identities.items)?;
+                output.emit("member search", &identities, &human)
             }
             MemberCommand::List(options) => {
                 let members = studio_remote::list_members_operation(&options).await?;
-                output.emit(
-                    "member list",
-                    &members,
-                    &format!("{} member(s)", members.items.len()),
-                )
+                let human = human_item_list("member", &members.items)?;
+                output.emit("member list", &members, &human)
             }
             MemberCommand::Add(options) => {
                 let member = studio_remote::upsert_member_operation(&options).await?;
@@ -1199,11 +1189,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ReleaseCommand::List(options) => {
                 let releases = studio_remote::list_releases_operation(&options).await?;
-                output.emit(
-                    "release list",
-                    &releases,
-                    &format!("{} release(s)", releases.items.len()),
-                )
+                let human = human_item_list("release", &releases.items)?;
+                output.emit("release list", &releases, &human)
             }
             ReleaseCommand::Show(options) => {
                 let release = studio_remote::show_release_operation(&options).await?;
@@ -1248,11 +1235,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Validation { command } => match command {
             ValidationCommand::List(options) => {
                 let validations = studio_remote::list_validations_operation(&options).await?;
-                output.emit(
-                    "validation list",
-                    &validations,
-                    &format!("{} validation(s)", validations.items.len()),
-                )
+                let human = human_item_list("validation", &validations.items)?;
+                output.emit("validation list", &validations, &human)
             }
             ValidationCommand::Show(options) => {
                 let validation = studio_remote::validation_show_operation(&options).await?;
@@ -1311,11 +1295,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Waiver { command } => match command {
             WaiverCommand::List(options) => {
                 let waivers = studio_remote::list_waivers_operation(&options).await?;
-                output.emit(
-                    "waiver list",
-                    &waivers,
-                    &format!("{} waiver(s)", waivers.items.len()),
-                )
+                let human = human_item_list("waiver", &waivers.items)?;
+                output.emit("waiver list", &waivers, &human)
             }
             WaiverCommand::Create(options) => {
                 let waiver = studio_remote::create_waiver_operation(&options).await?;
@@ -1337,11 +1318,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Revision { command } => match command {
             RevisionCommand::List(options) => {
                 let revisions = studio_remote::list_revisions_operation(&options).await?;
-                output.emit(
-                    "revision list",
-                    &revisions,
-                    &format!("{} revision(s)", revisions.items.len()),
-                )
+                let human = human_item_list("revision", &revisions.items)?;
+                output.emit("revision list", &revisions, &human)
             }
             RevisionCommand::Show(options) => {
                 let revision = studio_remote::show_revision_operation(&options).await?;
@@ -1383,11 +1361,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ReviewCommand::List(options) => {
                 let reviews = studio_remote::list_reviews_operation(&options).await?;
-                output.emit(
-                    "review list",
-                    &reviews,
-                    &format!("{} review(s)", reviews.items.len()),
-                )
+                let human = human_item_list("review", &reviews.items)?;
+                output.emit("review list", &reviews, &human)
             }
             ReviewCommand::Request(options) => {
                 let request = studio_remote::request_review_pool_operation(&options).await?;
@@ -1399,11 +1374,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ReviewCommand::Inbox(options) => {
                 let inbox = studio_remote::list_review_pool_inbox_operation(&options).await?;
-                output.emit(
-                    "review inbox",
-                    &inbox,
-                    &format!("{} claimable review(s)", inbox.items.len()),
-                )
+                let human = human_item_list("claimable review", &inbox.items)?;
+                output.emit("review inbox", &inbox, &human)
             }
             ReviewCommand::Show(options) => {
                 let review = studio_remote::show_review_operation(&options).await?;
@@ -1498,11 +1470,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             SandboxCommand::Run(options) => {
                 let plan = reporch_cli::local_sandbox::plan(&options.into_local()).await?;
                 let result = reporch_cli::local_sandbox::execute(&plan).await?;
-                if result.exit_code == 0 {
-                    output.emit("sandbox run", &result, "Local sandbox command passed")
-                } else {
-                    bail!("sandbox command exited with {}", result.exit_code)
-                }
+                emit_sandbox_result(result, output)
             }
         },
         Command::Toolchain { command } => match command {
@@ -1571,6 +1539,85 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
         },
         Command::QualificationSelfTest => qualification_self_test().await,
+    }
+}
+
+fn emit_sandbox_result(
+    result: reporch_cli::local_sandbox::LocalSandboxResult,
+    output: &CliOutput,
+) -> Result<()> {
+    match result.termination {
+        reporch_runtime_core::GuestTerminationV2::Exited if result.exit_code == 0 => {
+            output.emit("sandbox run", &result, "Local sandbox command passed")
+        }
+        reporch_runtime_core::GuestTerminationV2::TimedOut => Err(cli_output::domain_error(
+            "runtime.execution_timed_out",
+            "sandbox workload exceeded its configured timeout",
+            &result,
+        )),
+        reporch_runtime_core::GuestTerminationV2::OutputLimit => Err(cli_output::domain_error(
+            "runtime.output_limit_exceeded",
+            "sandbox workload exceeded its configured output limit",
+            &result,
+        )),
+        _ => Err(cli_output::domain_error(
+            "runtime.execution_failed",
+            format!(
+                "sandbox workload ended as {:?} with exit code {}",
+                result.termination, result.exit_code
+            ),
+            &result,
+        )),
+    }
+}
+
+#[cfg(test)]
+mod sandbox_result_regression_tests {
+    use super::*;
+
+    fn result(
+        termination: reporch_runtime_core::GuestTerminationV2,
+        exit_code: i32,
+    ) -> reporch_cli::local_sandbox::LocalSandboxResult {
+        reporch_cli::local_sandbox::LocalSandboxResult {
+            schema: "reporch.local-sandbox-result.v2",
+            runtime: "reporch_vm".into(),
+            image: "toolchain@sha256:test".into(),
+            exit_code,
+            termination,
+            duration_ms: 10,
+            stdout: "visible output".into(),
+            stderr: "visible diagnostic".into(),
+            stdout_bytes: b"visible output".to_vec(),
+        }
+    }
+
+    #[test]
+    fn nonzero_and_timeout_results_are_domain_failures_with_preserved_diagnostics() {
+        let output = CliOutput::new(OutputFormat::Human, true, ColorMode::Never);
+        for (termination, exit_code) in [
+            (reporch_runtime_core::GuestTerminationV2::Exited, 2),
+            (reporch_runtime_core::GuestTerminationV2::Signalled, 128),
+            (reporch_runtime_core::GuestTerminationV2::TimedOut, 124),
+            (reporch_runtime_core::GuestTerminationV2::OutputLimit, 125),
+        ] {
+            let error = emit_sandbox_result(result(termination, exit_code), &output).unwrap_err();
+            assert_eq!(
+                output.emit_error("sandbox run", &error),
+                cli_output::ExitCode::DomainFailure
+            );
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("sandbox workload"), "{rendered}");
+        }
+
+        let serialized = serde_json::to_value(result(
+            reporch_runtime_core::GuestTerminationV2::Signalled,
+            128,
+        ))
+        .unwrap();
+        assert_eq!(serialized["termination"], "signalled");
+        assert_eq!(serialized["stdout"], "visible output");
+        assert_eq!(serialized["stderr"], "visible diagnostic");
     }
 }
 
@@ -1660,6 +1707,92 @@ fn runtime_status_human(status: &reporch_runtime_core::RuntimeStatusV1) -> Strin
         status.backend,
         env!("CARGO_PKG_VERSION"),
     )
+}
+
+fn human_item_list<T: serde::Serialize>(singular: &str, items: &[T]) -> Result<String> {
+    if items.is_empty() {
+        return Ok(format!("No {singular}s."));
+    }
+    const DISPLAY_FIELDS: &[&str] = &[
+        "title",
+        "display_name",
+        "username",
+        "name",
+        "id",
+        "member",
+        "role",
+        "status",
+        "sequence",
+        "project_id",
+        "commit_id",
+        "client_id",
+        "language",
+        "issue_code",
+        "last_used_at",
+        "expires_at",
+    ];
+    let mut lines = vec![format!("{} {singular}(s):", items.len())];
+    for item in items {
+        let value = serde_json::to_value(item).context("serialize human list item")?;
+        let object = value
+            .as_object()
+            .context("human list item must serialize as an object")?;
+        let fields = DISPLAY_FIELDS
+            .iter()
+            .filter_map(|key| {
+                let value = object.get(*key)?;
+                (!value.is_null()).then(|| format!("{key}={}", human_json_value(value)))
+            })
+            .take(6)
+            .collect::<Vec<_>>();
+        ensure!(
+            !fields.is_empty(),
+            "human list item has no displayable identity"
+        );
+        lines.push(format!("- {}", fields.join(" · ")));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn human_json_value(value: &serde_json::Value) -> String {
+    let rendered = value.as_str().map_or_else(
+        || serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".into()),
+        str::to_owned,
+    );
+    rendered
+        .chars()
+        .flat_map(|character| {
+            if character.is_control() {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod human_list_tests {
+    use super::*;
+
+    #[test]
+    fn human_lists_expose_ids_needed_by_follow_up_commands() {
+        let items = vec![serde_json::json!({
+            "id": "019f-example",
+            "title": "A + B",
+            "status": "passed",
+        })];
+        let rendered = human_item_list("project", &items).unwrap();
+        assert!(rendered.contains("title=A + B"), "{rendered}");
+        assert!(rendered.contains("id=019f-example"), "{rendered}");
+        assert!(rendered.contains("status=passed"), "{rendered}");
+    }
+
+    #[test]
+    fn empty_human_lists_have_an_explicit_empty_state() {
+        let items = Vec::<serde_json::Value>::new();
+        assert_eq!(human_item_list("release", &items).unwrap(), "No releases.");
+    }
 }
 
 fn command_skips_runtime_bootstrap(command: &Command) -> bool {
@@ -1786,7 +1919,8 @@ fn check_project(output: &CliOutput) -> Result<()> {
     if reporch_cli::local_project_v2::is_v2_project(&root)? {
         let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
         let manifest =
-            reporch_cli::local_project_v2::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+            reporch_cli::local_project_v2::compile_authoring_spec(&root, &spec, Uuid::nil())
+                .map_err(check_manifest_compile_error)?;
         let versioned = VersionedReleaseManifest::V2(Box::new(manifest.clone()));
         let issues = validate_versioned_manifest(&versioned);
         let digest = manifest.digest()?;
@@ -1798,6 +1932,11 @@ fn check_project(output: &CliOutput) -> Result<()> {
         ));
         let interactor_count = usize::from(manifest.execution.interactive.is_some());
         let harness_count = usize::from(manifest.execution.harness.is_some());
+        let next_step = if issues.is_empty() {
+            "reporch verify"
+        } else {
+            "reporch check"
+        };
         let data = serde_json::json!({
             "schema": "reporch.check-result.v1",
             "authoring_schema": spec.schema,
@@ -1818,7 +1957,7 @@ fn check_project(output: &CliOutput) -> Result<()> {
                 "interactors": interactor_count,
                 "grader_or_library_harnesses": harness_count,
             },
-            "next_step": "reporch verify",
+            "next_step": next_step,
         });
         if !issues.is_empty() {
             return Err(cli_output::domain_error(
@@ -1839,7 +1978,8 @@ fn check_project(output: &CliOutput) -> Result<()> {
         );
     }
     let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
-    let manifest = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())?;
+    let manifest = reporch_cli::local_project::compile_authoring_spec(&root, &spec, Uuid::nil())
+        .map_err(check_manifest_compile_error)?;
     let versioned = VersionedReleaseManifest::V1(Box::new(manifest.clone()));
     let issues = validate_versioned_manifest(&versioned);
     let digest = manifest.digest()?;
@@ -1852,6 +1992,11 @@ fn check_project(output: &CliOutput) -> Result<()> {
     ));
     let interactor_count = usize::from(manifest.judging.interactor_path.is_some());
     let grader_count = usize::from(manifest.judging.grader_path.is_some());
+    let next_step = if issues.is_empty() {
+        "reporch verify"
+    } else {
+        "reporch check"
+    };
     let data = serde_json::json!({
         "schema": "reporch.check-result.v1",
         "project_id": spec.project_id,
@@ -1870,7 +2015,7 @@ fn check_project(output: &CliOutput) -> Result<()> {
             "interactors": interactor_count,
             "graders": grader_count,
         },
-        "next_step": "reporch verify",
+        "next_step": next_step,
     });
     if !issues.is_empty() {
         return Err(cli_output::domain_error(
@@ -1903,6 +2048,33 @@ fn check_failure_message(issues: &[ValidationIssue]) -> String {
         "\nInspect the current structure with `reporch test group list`, `reporch test case list`, and `reporch solution matrix`, then run `reporch check` again.",
     );
     message
+}
+
+fn check_manifest_compile_error(error: anyhow::Error) -> anyhow::Error {
+    let message = format!("{error:#}");
+    if !message.contains("inspect project file") && !message.contains("read project file") {
+        return error;
+    }
+    cli_output::domain_error(
+        "check.failed",
+        format!(
+            "static check could not read a declared project file: {message}\nRestore or update the referenced file. If it is only a stale inventory entry, run `reporch project prune --apply`, then run `reporch check` again."
+        ),
+        serde_json::json!({
+            "schema": "reporch.check-result.v1",
+            "valid": false,
+            "issues": [{
+                "code": "files.missing_or_unreadable",
+                "message": message,
+            }],
+            "recovery_commands": [
+                "reporch project prune --apply",
+                "reporch test case list --format json",
+                "reporch check",
+            ],
+            "next_step": "reporch project prune --apply",
+        }),
+    )
 }
 
 fn local_project_status(directory: &Path) -> Result<reporch_cli::local_project::ProjectStatusV1> {
@@ -2127,6 +2299,9 @@ async fn submit_project(options: SubmitOptions, output: &CliOutput) -> Result<()
         connection: options.connection.clone(),
         project_id: Some(push.commit.project_id),
         commit_id: Some(push.commit.id),
+        local: false,
+        runtime: studio_remote::LocalVerifyRuntime::Auto,
+        local_timeout_seconds: 30,
         idempotency_key: Some(format!("validation-{}", push.commit.id)),
         wait: true,
         timeout_seconds: options.timeout_seconds,

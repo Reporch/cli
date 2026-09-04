@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use reporch_runtime_core::{
-    ContentObjectV1, GuestJobV1, GuestOperationV1, GuestOutputEncodingV1, ResourceLimitsV1,
-    RuntimeAvailability, RuntimeError,
+    ContentObjectV1, GuestJobV1, GuestOperationV1, GuestOutputEncodingV1, GuestTerminationV2,
+    ResourceLimitsV1, RuntimeAvailability, RuntimeError,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -20,6 +20,7 @@ const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const RUNTIME_SECURITY_INSPECTION_TIMEOUT: Duration = Duration::from_secs(8);
 const RUNTIME_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_DIAGNOSTIC_OUTPUT_LIMIT: usize = 64 * 1024;
+const NATIVE_OUTPUT_CAPTURE_LIMIT_BYTES: u64 = 4 * 1_048_576;
 pub fn configure_remote_fallback(allowed: bool, no_input: bool, profile: Option<&str>) {
     crate::remote_consent::configure(allowed, no_input, profile);
 }
@@ -76,6 +77,7 @@ pub struct LocalSandboxResult {
     pub runtime: String,
     pub image: String,
     pub exit_code: i32,
+    pub termination: GuestTerminationV2,
     pub duration_ms: u128,
     pub stdout: String,
     pub stderr: String,
@@ -90,9 +92,6 @@ pub async fn plan(options: &LocalSandboxOptions) -> Result<LocalSandboxPlan> {
     if options.runtime == OciRuntime::Auto {
         let entry = crate::toolchain::resolve_for_image(&options.image)?;
         let inputs = inventory_native_inputs(&project_directory, &options.command)?;
-        if options.output_kib > 4_096 {
-            bail!("native runtime output must be at most 4096 KiB per stream");
-        }
         return Ok(LocalSandboxPlan {
             schema: "reporch.local-sandbox-plan.v1",
             runtime: "reporch_vm".into(),
@@ -162,31 +161,37 @@ pub async fn execute(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
     let stderr_task = tokio::spawn(read_bounded(stderr, output_limit));
     let status =
         match tokio::time::timeout(Duration::from_secs(plan.timeout_seconds), child.wait()).await {
-            Ok(result) => result.context("wait for local sandbox")?,
+            Ok(result) => Some(result.context("wait for local sandbox")?),
             Err(_) => {
                 kill_process_tree(&mut child).await;
                 remove_exact_container(runtime_executable, &plan.container_name).await;
-                return Err(RuntimeError::ServiceUnavailable(format!(
-                    "local sandbox exceeded {} seconds",
-                    plan.timeout_seconds
-                ))
-                .into());
+                None
             }
         };
     let (stdout, stdout_truncated) = stdout_task.await.context("join stdout reader")??;
     let (stderr, stderr_truncated) = stderr_task.await.context("join stderr reader")??;
-    if stdout_truncated || stderr_truncated {
-        bail!(
-            "local sandbox output exceeded {} bytes per stream",
-            output_limit
-        );
-    }
+    let termination = if status.is_none() {
+        GuestTerminationV2::TimedOut
+    } else if stdout_truncated || stderr_truncated {
+        GuestTerminationV2::OutputLimit
+    } else if status.as_ref().and_then(ExitStatus::code).is_none() {
+        GuestTerminationV2::Signalled
+    } else {
+        GuestTerminationV2::Exited
+    };
+    let exit_code = match termination {
+        GuestTerminationV2::TimedOut => 124,
+        GuestTerminationV2::Signalled => 128,
+        GuestTerminationV2::OutputLimit => 125,
+        _ => status.as_ref().and_then(ExitStatus::code).unwrap_or(1),
+    };
     let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
     Ok(LocalSandboxResult {
-        schema: "reporch.local-sandbox-result.v1",
+        schema: "reporch.local-sandbox-result.v2",
         runtime: plan.runtime.clone(),
         image: plan.image.clone(),
-        exit_code: status.code().unwrap_or(128),
+        exit_code,
+        termination,
         duration_ms: started.elapsed().as_millis(),
         stdout: stdout_text,
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -209,6 +214,12 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
     let toolchain = reporch_runtime_host::install_toolchain(toolchain_id).await?;
 
     let job_id = Uuid::now_v7();
+    // Protocol v2 returns output in a single bounded result frame. Retain up
+    // to its safe capture ceiling, while preserving the authored limit on the
+    // plan. If a workload reaches this lower transport ceiling we fail with a
+    // clear local-runtime limitation instead of misclassifying it as the
+    // problem's authored output limit.
+    let native_output_limit = native_output_limit_bytes(plan.output_limit_bytes);
     let job = GuestJobV1 {
         schema: reporch_runtime_core::JOB_SCHEMA.into(),
         protocol_version: reporch_runtime_core::PROTOCOL_VERSION,
@@ -227,8 +238,8 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
             memory_mib: plan.memory_mib,
             cpu_millis: plan.cpu_millis,
             pids: 64,
-            stdout_bytes: plan.output_limit_bytes,
-            stderr_bytes: plan.output_limit_bytes,
+            stdout_bytes: native_output_limit,
+            stderr_bytes: native_output_limit,
             artifact_bytes: 256 * 1_048_576,
         },
     };
@@ -241,27 +252,37 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
         }
         Err(error) => return Err(error),
     };
-    if result.termination == reporch_runtime_core::GuestTerminationV2::TimedOut {
-        return Err(RuntimeError::ExecutionTimedOut.into());
-    }
-    if result.stdout.truncated || result.stderr.truncated {
-        bail!(
-            "local sandbox output exceeded {} bytes per stream",
-            plan.output_limit_bytes
-        );
+    let termination = if result.stdout.truncated || result.stderr.truncated {
+        GuestTerminationV2::OutputLimit
+    } else {
+        result.termination
+    };
+    if termination == GuestTerminationV2::OutputLimit
+        && plan.output_limit_bytes > native_output_limit
+    {
+        return Err(RuntimeError::OutputCaptureExceeded {
+            authored_kib: plan.output_limit_bytes.div_ceil(1_024),
+            capture_kib: native_output_limit.div_ceil(1_024),
+        }
+        .into());
     }
     let stdout = decode_guest_output(result.stdout.encoding, &result.stdout.data)?;
     let stderr = decode_guest_output(result.stderr.encoding, &result.stderr.data)?;
     Ok(LocalSandboxResult {
-        schema: "reporch.local-sandbox-result.v1",
+        schema: "reporch.local-sandbox-result.v2",
         runtime: plan.runtime.clone(),
         image: plan.image.clone(),
         exit_code: result.exit_code,
+        termination,
         duration_ms: result.duration_ms.into(),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         stdout_bytes: stdout,
     })
+}
+
+fn native_output_limit_bytes(authored_limit: u64) -> u64 {
+    authored_limit.min(NATIVE_OUTPUT_CAPTURE_LIMIT_BYTES)
 }
 
 fn runtime_fallback_eligible(error: &anyhow::Error) -> bool {
@@ -309,10 +330,15 @@ async fn execute_remote_preview(plan: &LocalSandboxPlan) -> Result<LocalSandboxR
     let stdout = result.output.unwrap_or_default().into_bytes();
     let stderr = result.error_code.unwrap_or_default();
     Ok(LocalSandboxResult {
-        schema: "reporch.local-sandbox-result.v1",
+        schema: "reporch.local-sandbox-result.v2",
         runtime: "studio_remote".into(),
         image: plan.image.clone(),
         exit_code: if succeeded { 0 } else { 1 },
+        termination: if succeeded {
+            GuestTerminationV2::Exited
+        } else {
+            GuestTerminationV2::InternalError
+        },
         duration_ms: started.elapsed().as_millis(),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr,
@@ -942,6 +968,15 @@ mod tests {
         assert_eq!(plan.inputs[0].size, 10);
         assert!(plan.inputs[0].sha256.starts_with("sha256:"));
         assert!(plan.container_name.is_empty());
+    }
+
+    #[test]
+    fn native_capture_ceiling_does_not_reject_larger_authored_limits() {
+        assert_eq!(native_output_limit_bytes(2 * 1_048_576), 2 * 1_048_576);
+        assert_eq!(
+            native_output_limit_bytes(64 * 1_048_576),
+            NATIVE_OUTPUT_CAPTURE_LIMIT_BYTES
+        );
     }
 
     #[tokio::test]

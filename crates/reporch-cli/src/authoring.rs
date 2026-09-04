@@ -13,6 +13,7 @@ use studio_core::{
 };
 use uuid::Uuid;
 
+mod local_verify_batch;
 mod v2;
 
 use crate::cli_output::CliOutput;
@@ -85,7 +86,11 @@ enum TestCaseCommand {
     Add(TestCaseAddOptions),
     Import(TestCaseImportOptions),
     Update(TestCaseUpdateOptions),
-    Remove { id: Uuid },
+    Remove {
+        /// Test name, UUID, or declared input path.
+        #[arg(value_name = "NAME|UUID|PATH")]
+        selector: String,
+    },
 }
 
 #[derive(Debug, ClapArgs)]
@@ -126,7 +131,9 @@ struct TestCaseImportOptions {
 
 #[derive(Debug, ClapArgs)]
 struct TestCaseUpdateOptions {
-    id: Uuid,
+    /// Test name, UUID, or declared input path.
+    #[arg(value_name = "NAME|UUID|PATH")]
+    selector: String,
     #[arg(long)]
     name: Option<String>,
     #[arg(long = "group")]
@@ -594,7 +601,7 @@ struct RuntimeOptions {
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
-enum RuntimeKind {
+pub(crate) enum RuntimeKind {
     #[default]
     Auto,
     /// Deprecated explicit compatibility backend.
@@ -630,6 +637,637 @@ impl RuntimeOptions {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct LocalVerifyReport {
+    schema: &'static str,
+    evidence: &'static str,
+    passed: bool,
+    generator_checks: Vec<LocalGeneratorCheck>,
+    validator_units: usize,
+    checker_units: usize,
+    solutions: Vec<LocalSolutionCheck>,
+    output_submissions: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalGeneratorCheck {
+    generator: String,
+    recipe: String,
+    seed: u64,
+    expected_sha256: Option<String>,
+    actual_sha256: String,
+    passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalSolutionCheck {
+    solution: String,
+    expected: &'static str,
+    actual: &'static str,
+    score: f64,
+    passed: bool,
+    group_expectations: Vec<LocalGroupSolutionCheck>,
+    cases: Vec<LocalSolutionCase>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalGroupSolutionCheck {
+    group_id: Uuid,
+    group: String,
+    expected: &'static str,
+    actual: &'static str,
+    score: f64,
+    passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalSolutionCase {
+    test_id: Uuid,
+    test: String,
+    actual: &'static str,
+    accepted: bool,
+    exit_code: i32,
+    termination: reporch_runtime_core::GuestTerminationV2,
+    duration_ms: u128,
+    stdout: String,
+    stderr: String,
+}
+
+pub async fn verify_local(
+    timeout_seconds: u64,
+    runtime_kind: RuntimeKind,
+    output: &CliOutput,
+) -> Result<()> {
+    ensure!(
+        (1..=600).contains(&timeout_seconds),
+        "local verification timeout must be between 1 and 600 seconds"
+    );
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = if reporch_cli::local_project_v2::is_v2_project(&root)? {
+        reporch_cli::local_project_v2::read_authoring_spec(&root)?
+    } else {
+        let legacy = reporch_cli::local_project::read_authoring_spec(&root)?;
+        reporch_format::AuthoringSpecV2::migrate_v1(&legacy)
+            .context("migrate the legacy authoring model for local verification")?
+    };
+    let silent = CliOutput::new(
+        crate::cli_output::OutputFormat::Human,
+        true,
+        crate::cli_output::ColorMode::Never,
+    );
+    let runtime = RuntimeOptions {
+        toolchain: None,
+        runtime: runtime_kind,
+        timeout_seconds,
+        memory_mib: spec.testing.limits.memory_mib,
+        cpus: 1.0,
+        output_kib: spec.testing.limits.output_kib,
+    };
+    let mut run_options = runtime.clone().into_run_options(output);
+    run_options.timeout = Duration::from_millis(
+        spec.testing
+            .limits
+            .time_ms
+            .max(1)
+            .min(timeout_seconds.saturating_mul(1_000)),
+    );
+
+    let batch = local_verify_batch::try_verify(&root, &spec, &run_options, output).await?;
+    let (generator_checks, validator_units, checker_units, solutions, output_submissions) =
+        if let Some(batch) = batch {
+            (
+                batch.generator_checks,
+                batch.validator_units,
+                batch.checker_units,
+                batch.solutions,
+                0,
+            )
+        } else {
+            let generator_checks = verify_generators(&root, &spec, &run_options).await?;
+            if !spec.testing.validators.unit_tests.is_empty() {
+                v2::validator(
+                    ValidatorOptions {
+                        command: ValidatorCommand::Run {
+                            name: None,
+                            runtime: runtime.clone(),
+                        },
+                    },
+                    &silent,
+                )
+                .await?;
+            }
+            if !spec.testing.checker.unit_tests.is_empty() {
+                v2::checker(
+                    CheckerOptions {
+                        command: CheckerCommand::Run {
+                            name: None,
+                            runtime: runtime.clone(),
+                        },
+                    },
+                    &silent,
+                )
+                .await?;
+            }
+            let (solutions, output_submissions) =
+                if spec.problem_type == studio_core::ProblemType::OutputOnly {
+                    v2::output_submission(
+                        OutputOptions {
+                            command: OutputCommand::Test {
+                                name: None,
+                                runtime: runtime.clone(),
+                            },
+                        },
+                        &silent,
+                    )
+                    .await?;
+                    (Vec::new(), spec.output_submissions.len())
+                } else {
+                    (verify_solution_matrix(&root, &spec, &run_options).await?, 0)
+                };
+            (
+                generator_checks,
+                spec.testing.validators.unit_tests.len(),
+                spec.testing.checker.unit_tests.len(),
+                solutions,
+                output_submissions,
+            )
+        };
+    let report = LocalVerifyReport {
+        schema: "reporch.local-verification.v1",
+        evidence: "local_preflight_only",
+        passed: generator_checks.iter().all(|check| check.passed)
+            && solutions.iter().all(|solution| solution.passed),
+        generator_checks,
+        validator_units,
+        checker_units,
+        solutions,
+        output_submissions,
+    };
+    if !report.passed {
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            "local verification did not match the declared expectations",
+            &report,
+        ));
+    }
+    output.emit(
+        "verify",
+        &report,
+        "Local verification passed. This is a preflight only; run `reporch verify` for official Studio evidence.",
+    )
+}
+
+async fn verify_generators(
+    root: &Path,
+    spec: &reporch_format::AuthoringSpecV2,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<Vec<LocalGeneratorCheck>> {
+    let mut checks = Vec::new();
+    let mut covered = std::collections::BTreeSet::new();
+    for test in &spec.testing.tests {
+        let Some(generated) = &test.generated else {
+            continue;
+        };
+        let generator = spec
+            .testing
+            .generators
+            .iter()
+            .find(|generator| generator.program.id == generated.generator_id)
+            .context("generated test references a missing generator")?;
+        let recipe = generator
+            .recipes
+            .iter()
+            .find(|recipe| recipe.id == generated.recipe_id)
+            .context("generated test references a missing recipe")?;
+        let bytes = materialize_generator(
+            root,
+            &legacy_program_v2(&generator.program),
+            &recipe.argument_template,
+            Some(generated.seed),
+            options,
+        )
+        .await?;
+        let expected = read_project_bytes(root, &test.input_file)?;
+        let expected_sha256 = hex::encode(Sha256::digest(&expected));
+        let actual_sha256 = hex::encode(Sha256::digest(&bytes));
+        checks.push(LocalGeneratorCheck {
+            generator: generator.program.name.clone(),
+            recipe: recipe.name.clone(),
+            seed: generated.seed,
+            expected_sha256: Some(expected_sha256.clone()),
+            actual_sha256: actual_sha256.clone(),
+            passed: expected_sha256 == actual_sha256,
+        });
+        covered.insert((generator.program.id, recipe.id));
+    }
+    for generator in &spec.testing.generators {
+        for recipe in &generator.recipes {
+            if covered.contains(&(generator.program.id, recipe.id)) {
+                continue;
+            }
+            let bytes = materialize_generator(
+                root,
+                &legacy_program_v2(&generator.program),
+                &recipe.argument_template,
+                Some(recipe.seed_start),
+                options,
+            )
+            .await?;
+            checks.push(LocalGeneratorCheck {
+                generator: generator.program.name.clone(),
+                recipe: recipe.name.clone(),
+                seed: recipe.seed_start,
+                expected_sha256: None,
+                actual_sha256: hex::encode(Sha256::digest(&bytes)),
+                passed: true,
+            });
+        }
+    }
+    Ok(checks)
+}
+
+async fn verify_solution_matrix(
+    root: &Path,
+    spec: &reporch_format::AuthoringSpecV2,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<Vec<LocalSolutionCheck>> {
+    let mut reports = Vec::new();
+    for solution in &spec.testing.solutions {
+        let mut cases = Vec::new();
+        for test in &spec.testing.tests {
+            let result = execute_solution_case(root, spec, solution, test, options).await?;
+            let actual_verdict = if spec.problem_type == studio_core::ProblemType::Interactive {
+                interactive_execution_verdict(&result)
+            } else {
+                let checker_accepted = if result.termination
+                    == reporch_runtime_core::GuestTerminationV2::Exited
+                    && result.exit_code == 0
+                {
+                    let answer = test.answer_file.as_deref().with_context(|| {
+                        format!("test {} has no answer for solution verification", test.name)
+                    })?;
+                    checker_accepts_bytes(
+                        root,
+                        &spec.testing.checker.checker,
+                        &test.input_file,
+                        answer,
+                        &result.stdout_bytes,
+                        options,
+                    )
+                    .await?
+                } else {
+                    false
+                };
+                program_execution_verdict(&result, checker_accepted, &solution.program.language)
+            };
+            cases.push(LocalSolutionCase {
+                test_id: test.id,
+                test: test.name.clone(),
+                actual: observed_verdict_name(actual_verdict),
+                accepted: actual_verdict == Some(ExpectedVerdict::Accepted),
+                exit_code: result.exit_code,
+                termination: result.termination,
+                duration_ms: result.duration_ms,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            });
+        }
+        let score = score_v2(&spec.testing.groups, &spec.testing.tests, &cases)?;
+        let actual =
+            aggregate_solution_verdict(&cases, score, total_score_v2(&spec.testing.groups));
+        let score_matches = solution
+            .expected_score
+            .as_ref()
+            .is_none_or(|range| score >= range.minimum && score <= range.maximum);
+        let group_expectations = group_solution_checks(spec, solution, &cases)?;
+        reports.push(LocalSolutionCheck {
+            solution: solution.program.name.clone(),
+            expected: verdict_name(solution.expected_verdict),
+            actual: observed_verdict_name(actual),
+            score,
+            passed: actual == Some(solution.expected_verdict)
+                && score_matches
+                && group_expectations.iter().all(|group| group.passed),
+            group_expectations,
+            cases,
+        });
+    }
+    Ok(reports)
+}
+
+fn legacy_program_v2(program: &studio_core::ProgramSpecV2) -> ProgramSpec {
+    ProgramSpec {
+        id: program.name.clone(),
+        source_path: program.source_path.clone(),
+        language: program.language.clone(),
+        arguments: program.arguments.clone(),
+    }
+}
+
+async fn execute_solution_case(
+    root: &Path,
+    spec: &reporch_format::AuthoringSpecV2,
+    solution: &studio_core::SolutionSpecV2,
+    test: &studio_core::TestCaseSpecV2,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+) -> Result<reporch_cli::local_sandbox::LocalSandboxResult> {
+    match spec.problem_type {
+        studio_core::ProblemType::Interactive => {
+            let interactive = spec
+                .execution
+                .interactive
+                .as_ref()
+                .context("interactive problem has no interactor")?;
+            let interactor_toolchain = reporch_cli::toolchain::resolve_for_language(
+                options.toolchain_id.as_deref(),
+                &interactive.interactor.language,
+            )?;
+            let solution_toolchain = reporch_cli::toolchain::resolve_for_language(
+                options.toolchain_id.as_deref(),
+                &solution.program.language,
+            )?;
+            ensure!(
+                interactor_toolchain.language == solution_toolchain.language,
+                "local interactive pairing requires matching toolchain languages"
+            );
+            reporch_cli::authoring_runtime::run_interactive_pair(
+                &reporch_cli::authoring_runtime::InteractivePairRequest {
+                    project_directory: root,
+                    solver_source_path: &solution.program.source_path,
+                    interactor_source_path: &interactive.interactor.source_path,
+                    language: &interactive.interactor.language,
+                    input_path: &test.input_file,
+                    idle_timeout: Duration::from_millis(interactive.idle_timeout_ms),
+                    options,
+                },
+            )
+            .await
+        }
+        studio_core::ProblemType::Library | studio_core::ProblemType::Grader => {
+            let harness = spec
+                .execution
+                .harness
+                .as_ref()
+                .context("library/grader problem has no harness")?;
+            let profile = harness
+                .profiles
+                .get(&solution.program.language)
+                .or_else(|| harness.profiles.values().next())
+                .context("library/grader harness has no language profile")?;
+            ensure!(
+                reporch_cli::toolchain::resolve_for_language(None, &profile.language)?.language
+                    == reporch_cli::toolchain::resolve_for_language(
+                        None,
+                        &solution.program.language,
+                    )?
+                    .language,
+                "local grader linking requires matching C or C++ toolchains"
+            );
+            reporch_cli::authoring_runtime::run_linked_pair(
+                &reporch_cli::authoring_runtime::LinkedPairRequest {
+                    project_directory: root,
+                    first_source_path: &solution.program.source_path,
+                    second_source_path: &profile.source_path,
+                    language: &profile.language,
+                    stdin_path: &test.input_file,
+                    options,
+                },
+            )
+            .await
+        }
+        _ => {
+            reporch_cli::authoring_runtime::run_program(
+                &reporch_cli::authoring_runtime::ProgramRequest {
+                    project_directory: root,
+                    source_path: &solution.program.source_path,
+                    language: &solution.program.language,
+                    arguments: &solution.program.arguments,
+                    stdin_path: Some(&test.input_file),
+                    options,
+                },
+            )
+            .await
+        }
+    }
+}
+
+fn aggregate_solution_verdict(
+    cases: &[LocalSolutionCase],
+    score: f64,
+    total_score: f64,
+) -> Option<ExpectedVerdict> {
+    if cases.iter().any(|case| case.actual == "judge_error") {
+        return None;
+    }
+    if cases.iter().all(|case| case.accepted) {
+        return Some(ExpectedVerdict::Accepted);
+    }
+    for verdict in [
+        ExpectedVerdict::RuntimeError,
+        ExpectedVerdict::MemoryLimit,
+        ExpectedVerdict::TimeLimit,
+    ] {
+        if cases
+            .iter()
+            .any(|case| case.actual == verdict_name(verdict))
+        {
+            return Some(verdict);
+        }
+    }
+    if score > 0.0 && score < total_score {
+        Some(ExpectedVerdict::Partial)
+    } else {
+        Some(ExpectedVerdict::WrongAnswer)
+    }
+}
+
+fn group_solution_checks(
+    spec: &reporch_format::AuthoringSpecV2,
+    solution: &studio_core::SolutionSpecV2,
+    cases: &[LocalSolutionCase],
+) -> Result<Vec<LocalGroupSolutionCheck>> {
+    let accepted = cases
+        .iter()
+        .map(|case| (case.test_id, case.accepted))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut group_passes = std::collections::BTreeMap::<Uuid, bool>::new();
+    while group_passes.len() < spec.testing.groups.len() {
+        let before = group_passes.len();
+        for group in &spec.testing.groups {
+            if group_passes.contains_key(&group.id)
+                || group
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !group_passes.contains_key(dependency))
+            {
+                continue;
+            }
+            let dependencies_passed = group
+                .depends_on
+                .iter()
+                .all(|dependency| group_passes.get(dependency) == Some(&true));
+            let tests = spec
+                .testing
+                .tests
+                .iter()
+                .filter(|test| test.group_ids.contains(&group.id))
+                .collect::<Vec<_>>();
+            ensure!(
+                !tests.is_empty(),
+                "score group has no test cases: {}",
+                group.name
+            );
+            let tests_passed = tests
+                .iter()
+                .all(|test| accepted.get(&test.id) == Some(&true));
+            group_passes.insert(group.id, dependencies_passed && tests_passed);
+        }
+        ensure!(
+            group_passes.len() > before,
+            "score group dependencies contain a cycle or unknown group"
+        );
+    }
+
+    solution
+        .group_expectations
+        .iter()
+        .map(|expectation| {
+            let group = spec
+                .testing
+                .groups
+                .iter()
+                .find(|group| group.id == expectation.group_id)
+                .context("solution expectation references a missing group")?;
+            let group_cases = cases
+                .iter()
+                .filter(|case| {
+                    spec.testing
+                        .tests
+                        .iter()
+                        .any(|test| test.id == case.test_id && test.group_ids.contains(&group.id))
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                !group_cases.is_empty(),
+                "solution expectation group has no test cases: {}",
+                group.name
+            );
+            let effective_pass = group_passes.get(&group.id) == Some(&true);
+            let score = if effective_pass { group.points } else { 0.0 };
+            let actual = aggregate_group_verdict(&group_cases, effective_pass, score, group.points);
+            let score_matches = expectation
+                .score
+                .as_ref()
+                .is_none_or(|range| score >= range.minimum && score <= range.maximum);
+            Ok(LocalGroupSolutionCheck {
+                group_id: group.id,
+                group: group.name.clone(),
+                expected: verdict_name(expectation.verdict),
+                actual: observed_verdict_name(actual),
+                score,
+                passed: actual == Some(expectation.verdict) && score_matches,
+            })
+        })
+        .collect()
+}
+
+fn aggregate_group_verdict(
+    cases: &[&LocalSolutionCase],
+    effective_pass: bool,
+    score: f64,
+    total_score: f64,
+) -> Option<ExpectedVerdict> {
+    if cases.iter().any(|case| case.actual == "judge_error") {
+        return None;
+    }
+    if effective_pass && cases.iter().all(|case| case.accepted) {
+        return Some(ExpectedVerdict::Accepted);
+    }
+    for verdict in [
+        ExpectedVerdict::RuntimeError,
+        ExpectedVerdict::MemoryLimit,
+        ExpectedVerdict::TimeLimit,
+    ] {
+        if cases
+            .iter()
+            .any(|case| case.actual == verdict_name(verdict))
+        {
+            return Some(verdict);
+        }
+    }
+    if score > 0.0 && score < total_score {
+        Some(ExpectedVerdict::Partial)
+    } else {
+        Some(ExpectedVerdict::WrongAnswer)
+    }
+}
+
+fn total_score_v2(groups: &[studio_core::TestGroupSpecV2]) -> f64 {
+    if groups.is_empty() {
+        100.0
+    } else {
+        groups.iter().map(|group| group.points).sum()
+    }
+}
+
+fn score_v2(
+    groups: &[studio_core::TestGroupSpecV2],
+    tests: &[studio_core::TestCaseSpecV2],
+    cases: &[LocalSolutionCase],
+) -> Result<f64> {
+    if groups.is_empty() {
+        return Ok(if cases.iter().all(|case| case.accepted) {
+            100.0
+        } else {
+            0.0
+        });
+    }
+    let accepted = cases
+        .iter()
+        .map(|case| (case.test_id, case.accepted))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut resolved = std::collections::BTreeMap::<Uuid, bool>::new();
+    while resolved.len() < groups.len() {
+        let before = resolved.len();
+        for group in groups {
+            if resolved.contains_key(&group.id)
+                || group
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !resolved.contains_key(dependency))
+            {
+                continue;
+            }
+            let dependencies_passed = group
+                .depends_on
+                .iter()
+                .all(|dependency| resolved.get(dependency) == Some(&true));
+            let group_tests = tests
+                .iter()
+                .filter(|test| test.group_ids.contains(&group.id))
+                .collect::<Vec<_>>();
+            ensure!(
+                !group_tests.is_empty(),
+                "score group has no test cases: {}",
+                group.name
+            );
+            let tests_passed = group_tests
+                .iter()
+                .all(|test| accepted.get(&test.id) == Some(&true));
+            resolved.insert(group.id, dependencies_passed && tests_passed);
+        }
+        ensure!(
+            resolved.len() > before,
+            "score group dependencies contain a cycle or unknown group"
+        );
+    }
+    Ok(groups
+        .iter()
+        .filter(|group| resolved.get(&group.id) == Some(&true))
+        .map(|group| group.points)
+        .sum())
+}
+
 #[derive(Debug, Subcommand)]
 enum SolutionCommand {
     List,
@@ -656,6 +1294,13 @@ struct SolutionAddOptions {
     minimum_score: Option<f64>,
     #[arg(long)]
     maximum_score: Option<f64>,
+    /// Expected verdict for one group, for example `small=accepted` or `full=partial:20..40`.
+    #[arg(
+        long = "group-expectation",
+        value_name = "GROUP=VERDICT[:MIN..MAX]",
+        value_parser = parse_group_expectation
+    )]
+    group_expectations: Vec<GroupExpectationInput>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -669,6 +1314,25 @@ struct SolutionUpdateOptions {
     #[arg(long)]
     minimum_score: Option<f64>,
     #[arg(long)]
+    maximum_score: Option<f64>,
+    /// Replace group expectations; repeat for multiple groups.
+    #[arg(
+        long = "group-expectation",
+        value_name = "GROUP=VERDICT[:MIN..MAX]",
+        value_parser = parse_group_expectation,
+        conflicts_with = "clear_group_expectations"
+    )]
+    group_expectations: Vec<GroupExpectationInput>,
+    /// Remove every per-group expectation from this solution.
+    #[arg(long)]
+    clear_group_expectations: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GroupExpectationInput {
+    group: String,
+    verdict: Verdict,
+    minimum_score: Option<f64>,
     maximum_score: Option<f64>,
 }
 
@@ -793,6 +1457,7 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
         StatementCommand::Check => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
             let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
+            reporch_cli::local_project::validate_statement_documents(&root, &spec)?;
             for (locale, path) in &spec.statements {
                 let file = spec
                     .files
@@ -817,6 +1482,7 @@ pub fn statement(options: StatementOptions, output: &CliOutput) -> Result<()> {
         } => {
             let root = reporch_cli::local_project::discover_project(Path::new("."))?;
             let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
+            reporch_cli::local_project::validate_statement_documents(&root, &spec)?;
             let locale = locale.unwrap_or(spec.default_locale);
             let source = spec
                 .statements
@@ -893,16 +1559,21 @@ fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
         !no_input && std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "test guide requires an interactive terminal; use test case add in CI"
     );
-    let name = prompt("Test name", "sample-1")?;
-    let input = prompt("Input file", "tests/1.in")?;
-    let answer = prompt("Answer file (blank for none)", "tests/1.ans")?;
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
+    let name = prompt(
+        "Test name",
+        &next_test_case_name(spec.judging.tests.iter().map(|test| test.name.as_str())),
+    )?;
+    let input = prompt("Input data (single line)", "")?;
+    let answer = prompt("Expected output (single line; blank for none)", "")?;
     test_case(
         TestCaseCommand::Add(TestCaseAddOptions {
             name,
-            input: Some(PathBuf::from(input)),
-            input_text: None,
-            answer: (!answer.is_empty()).then(|| PathBuf::from(answer)),
-            answer_text: None,
+            input: None,
+            input_text: Some(guided_test_text(&input)),
+            answer: None,
+            answer_text: (!answer.is_empty()).then(|| guided_test_text(&answer)),
             groups: vec![],
             generated_by: None,
             seed: None,
@@ -931,6 +1602,17 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let updated = reporch_cli::local_project::update_authoring_spec(&root, |root, spec| {
                 ensure_unique_test_name(spec, &options.name, None)?;
                 ensure_groups_exist(spec, &options.groups)?;
+                if answer.is_some() {
+                    ensure_unique_test_input(
+                        root,
+                        &input,
+                        &options.name,
+                        spec.judging
+                            .tests
+                            .iter()
+                            .map(|test| (test.name.as_str(), test.input_file.as_str())),
+                    )?;
+                }
                 if let Some(generator) = &options.generated_by {
                     ensure!(
                         spec.judging
@@ -986,15 +1668,16 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
+                    let test_id = find_legacy_test(spec, &options.selector)?.id;
                     ensure_groups_exist(spec, &options.groups)?;
                     if let Some(name) = &options.name {
-                        ensure_unique_test_name(spec, name, Some(options.id))?;
+                        ensure_unique_test_name(spec, name, Some(test_id))?;
                     }
                     let test = spec
                         .judging
                         .tests
                         .iter_mut()
-                        .find(|test| test.id == options.id)
+                        .find(|test| test.id == test_id)
                         .context("test case was not found")?;
                     if let Some(name) = &options.name {
                         test.name = normalize_name(name)?;
@@ -1008,13 +1691,14 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test case update",
                 &spec.judging.tests,
-                &format!("Updated test case {}", options.id),
+                &format!("Updated test case {}", options.selector),
             )
         }
-        TestCaseCommand::Remove { id } => {
+        TestCaseCommand::Remove { selector } => {
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
+                    let id = find_legacy_test(spec, &selector)?.id;
                     let before = spec.judging.tests.len();
                     spec.judging.tests.retain(|test| test.id != id);
                     ensure!(
@@ -1030,7 +1714,7 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             output.emit(
                 "test case remove",
                 &spec.judging.tests,
-                &format!("Removed test case {id}"),
+                &format!("Removed test case {selector}"),
             )
         }
     }
@@ -1066,6 +1750,17 @@ fn import_test_cases(options: TestCaseImportOptions, output: &CliOutput) -> Resu
                 .context("test input has a non-Unicode file name")?;
             let name = normalize_name(stem)?;
             ensure_unique_test_name(spec, &name, None)?;
+            if answer.is_some() {
+                ensure_unique_test_input(
+                    root,
+                    &input,
+                    &name,
+                    spec.judging
+                        .tests
+                        .iter()
+                        .map(|test| (test.name.as_str(), test.input_file.as_str())),
+                )?;
+            }
             reporch_cli::local_project::declare_project_file(
                 root,
                 spec,
@@ -1116,6 +1811,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestGroupCommand::Add(options) => {
+            validate_group_points(options.points)?;
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -1136,6 +1832,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
                         depends_on: options.depends_on.clone(),
                         feedback_policy: studio_core::GroupFeedbackPolicyV1::Complete,
                     });
+                    ensure_v1_group_dependencies_acyclic(&spec.judging.groups)?;
                     Ok(())
                 },
             )?;
@@ -1151,6 +1848,9 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestGroupCommand::Update(options) => {
+            if let Some(points) = options.points {
+                validate_group_points(points)?;
+            }
             let spec = reporch_cli::local_project::update_authoring_spec(
                 Path::new("."),
                 |_root, spec| {
@@ -1171,6 +1871,7 @@ fn test_group(command: TestGroupCommand, output: &CliOutput) -> Result<()> {
                     if !options.depends_on.is_empty() {
                         group.depends_on.clone_from(&options.depends_on);
                     }
+                    ensure_v1_group_dependencies_acyclic(&spec.judging.groups)?;
                     Ok(())
                 },
             )?;
@@ -1614,7 +2315,9 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                         },
                     )
                     .await?;
-                    let actual_valid = result.exit_code == 0;
+                    let exited =
+                        result.termination == reporch_runtime_core::GuestTerminationV2::Exited;
+                    let actual_valid = exited && result.exit_code == 0;
                     cases.push(ProgramUnitResult {
                         program: validator.id.clone(),
                         name: unit.name.clone(),
@@ -1623,10 +2326,16 @@ pub async fn validator(options: ValidatorOptions, output: &CliOutput) -> Result<
                         } else {
                             "invalid"
                         },
-                        actual: if actual_valid { "valid" } else { "invalid" },
-                        passed: actual_valid == unit.expected_valid,
+                        actual: if exited {
+                            if actual_valid { "valid" } else { "invalid" }
+                        } else {
+                            termination_name(result.termination)
+                        },
+                        passed: exited && actual_valid == unit.expected_valid,
                         exit_code: result.exit_code,
+                        termination: result.termination,
                         duration_ms: result.duration_ms,
+                        stdout: result.stdout,
                         stderr: result.stderr,
                     });
                 }
@@ -1693,10 +2402,15 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                 CheckerKind::Exact => CheckerSpec::Exact,
                 CheckerKind::Token => CheckerSpec::Token,
                 CheckerKind::CaseInsensitive => CheckerSpec::CaseInsensitive,
-                CheckerKind::Floating => CheckerSpec::Floating {
-                    absolute_error: absolute_error.context("--absolute-error is required")?,
-                    relative_error: relative_error.context("--relative-error is required")?,
-                },
+                CheckerKind::Floating => {
+                    let absolute_error = absolute_error.context("--absolute-error is required")?;
+                    let relative_error = relative_error.context("--relative-error is required")?;
+                    validate_floating_tolerances(&absolute_error, &relative_error)?;
+                    CheckerSpec::Floating {
+                        absolute_error,
+                        relative_error,
+                    }
+                }
                 CheckerKind::Custom => CheckerSpec::Custom {
                     source_path: source.clone().context("--source is required")?,
                     language: language.clone().context("--language is required")?,
@@ -1769,7 +2483,7 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
             let mut cases = Vec::new();
             for unit in units {
                 output.progress("checker run", &format!("Checking unit {}", unit.name));
-                let (actual_accepted, exit_code, duration_ms, stderr) =
+                let (actual, passed, exit_code, termination, duration_ms, stdout, stderr) =
                     if let CheckerSpec::Custom {
                         source_path,
                         language,
@@ -1787,24 +2501,58 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                             &run_options,
                         )
                         .await?;
+                        let exited = result.execution.termination
+                            == reporch_runtime_core::GuestTerminationV2::Exited;
+                        let actual = if exited {
+                            match result.verdict {
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
+                                    "accepted"
+                                }
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
+                                    "rejected"
+                                }
+                                reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                                    "judge_error"
+                                }
+                            }
+                        } else {
+                            termination_name(result.execution.termination)
+                        };
+                        let passed = exited && match result.verdict {
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => {
+                                unit.expected_accepted
+                            }
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => {
+                                !unit.expected_accepted
+                            }
+                            reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                                false
+                            }
+                        };
                         (
-                            result.verdict
-                                == reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted,
+                            actual,
+                            passed,
                             result.execution.exit_code,
+                            result.execution.termination,
                             result.execution.duration_ms,
+                            result.execution.stdout,
                             result.execution.stderr,
                         )
                     } else {
                         let answer = read_project_bytes(&root, &unit.answer_file)?;
                         let actual = read_project_bytes(&root, &unit.output_file)?;
+                        let accepted = reporch_cli::authoring_runtime::standard_checker_matches(
+                            &spec.judging.checker,
+                            &answer,
+                            &actual,
+                        )?;
                         (
-                            reporch_cli::authoring_runtime::standard_checker_matches(
-                                &spec.judging.checker,
-                                &answer,
-                                &actual,
-                            )?,
+                            if accepted { "accepted" } else { "rejected" },
+                            accepted == unit.expected_accepted,
                             0,
+                            reporch_runtime_core::GuestTerminationV2::Exited,
                             0,
+                            String::new(),
                             String::new(),
                         )
                     };
@@ -1816,14 +2564,12 @@ pub async fn checker(options: CheckerOptions, output: &CliOutput) -> Result<()> 
                     } else {
                         "rejected"
                     },
-                    actual: if actual_accepted {
-                        "accepted"
-                    } else {
-                        "rejected"
-                    },
-                    passed: actual_accepted == unit.expected_accepted,
+                    actual,
+                    passed,
                     exit_code,
+                    termination,
                     duration_ms,
+                    stdout,
                     stderr,
                 });
             }
@@ -2033,6 +2779,7 @@ async fn run_interactor(
             interactor_source_path: interactor_path,
             language: interactor_language,
             input_path: &test.input_file,
+            idle_timeout: run_options.timeout,
             options: &run_options,
         },
     )
@@ -2041,33 +2788,31 @@ async fn run_interactor(
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
     }
-    let expected_accepted = solution.expected_verdict == ExpectedVerdict::Accepted;
-    let passed = (result.exit_code == 0) == expected_accepted;
+    let actual_verdict = interactive_execution_verdict(&result);
+    let transcript_value = transcript.then(|| result.stdout.clone());
     let report = RuntimeProgramReport {
         solution: solution.name.clone(),
         test_id: test.id,
-        expected: if expected_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        actual: if result.exit_code == 0 {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        passed,
+        expected: verdict_name(solution.expected_verdict),
+        actual: observed_verdict_name(actual_verdict),
+        passed: actual_verdict == Some(solution.expected_verdict),
         exit_code: result.exit_code,
+        termination: result.termination,
         duration_ms: result.duration_ms,
-        transcript: transcript.then_some(result.stdout),
+        stdout: result.stdout,
+        transcript: transcript_value,
         stderr: result.stderr,
     };
-    ensure!(
-        report.passed,
-        "interactive validation did not pass: expected {}, got {}",
-        report.expected,
-        report.actual
-    );
+    if !report.passed {
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            format!(
+                "interactive validation did not pass: expected {}, got {}",
+                report.expected, report.actual
+            ),
+            &report,
+        ));
+    }
     output.emit(
         if transcript {
             "interactor transcript"
@@ -2119,7 +2864,9 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         },
     )
     .await?;
-    let actual_accepted = if result.exit_code == 0 {
+    let checker_accepted = if result.termination == reporch_runtime_core::GuestTerminationV2::Exited
+        && result.exit_code == 0
+    {
         checker_accepts_bytes(
             &root,
             &spec.judging.checker,
@@ -2136,32 +2883,30 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
     }
-    let expected_accepted = solution.expected_verdict == ExpectedVerdict::Accepted;
+    let actual_verdict = program_execution_verdict(&result, checker_accepted, &solution.language);
     let report = RuntimeProgramReport {
         solution: solution.name.clone(),
         test_id: test.id,
-        expected: if expected_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        actual: if actual_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        passed: actual_accepted == expected_accepted,
+        expected: verdict_name(solution.expected_verdict),
+        actual: observed_verdict_name(actual_verdict),
+        passed: actual_verdict == Some(solution.expected_verdict),
         exit_code: result.exit_code,
+        termination: result.termination,
         duration_ms: result.duration_ms,
+        stdout: result.stdout,
         transcript: None,
         stderr: result.stderr,
     };
-    ensure!(
-        report.passed,
-        "grader validation did not pass: expected {}, got {}",
-        report.expected,
-        report.actual
-    );
+    if !report.passed {
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            format!(
+                "grader validation did not pass: expected {}, got {}",
+                report.expected, report.actual
+            ),
+            &report,
+        ));
+    }
     output.emit(
         "grader run",
         &report,
@@ -2177,9 +2922,72 @@ struct RuntimeProgramReport {
     actual: &'static str,
     passed: bool,
     exit_code: i32,
+    termination: reporch_runtime_core::GuestTerminationV2,
     duration_ms: u128,
+    stdout: String,
     transcript: Option<String>,
     stderr: String,
+}
+
+fn program_execution_verdict(
+    result: &reporch_cli::local_sandbox::LocalSandboxResult,
+    checker_accepted: bool,
+    language: &str,
+) -> Option<ExpectedVerdict> {
+    if reporch_cli::authoring_runtime::compilation_failed(result) {
+        return None;
+    }
+    if reporch_cli::authoring_runtime::memory_limit_exceeded(
+        language,
+        result.exit_code,
+        result.termination,
+        &result.stderr,
+    ) {
+        return Some(ExpectedVerdict::MemoryLimit);
+    }
+    match result.termination {
+        reporch_runtime_core::GuestTerminationV2::Exited if result.exit_code == 0 => {
+            Some(if checker_accepted {
+                ExpectedVerdict::Accepted
+            } else {
+                ExpectedVerdict::WrongAnswer
+            })
+        }
+        reporch_runtime_core::GuestTerminationV2::Exited => Some(ExpectedVerdict::RuntimeError),
+        reporch_runtime_core::GuestTerminationV2::TimedOut => Some(ExpectedVerdict::TimeLimit),
+        reporch_runtime_core::GuestTerminationV2::Signalled
+        | reporch_runtime_core::GuestTerminationV2::OutputLimit => {
+            Some(ExpectedVerdict::RuntimeError)
+        }
+        reporch_runtime_core::GuestTerminationV2::InternalError => None,
+    }
+}
+
+fn interactive_execution_verdict(
+    result: &reporch_cli::local_sandbox::LocalSandboxResult,
+) -> Option<ExpectedVerdict> {
+    if reporch_cli::authoring_runtime::compilation_failed(result) {
+        return None;
+    }
+    match result.termination {
+        reporch_runtime_core::GuestTerminationV2::Exited if result.exit_code == 0 => {
+            Some(ExpectedVerdict::Accepted)
+        }
+        reporch_runtime_core::GuestTerminationV2::Exited if result.exit_code == 1 => {
+            Some(ExpectedVerdict::WrongAnswer)
+        }
+        reporch_runtime_core::GuestTerminationV2::Exited
+        | reporch_runtime_core::GuestTerminationV2::InternalError => None,
+        reporch_runtime_core::GuestTerminationV2::TimedOut => Some(ExpectedVerdict::TimeLimit),
+        reporch_runtime_core::GuestTerminationV2::Signalled
+        | reporch_runtime_core::GuestTerminationV2::OutputLimit => {
+            Some(ExpectedVerdict::RuntimeError)
+        }
+    }
+}
+
+fn observed_verdict_name(verdict: Option<ExpectedVerdict>) -> &'static str {
+    verdict.map(verdict_name).unwrap_or("judge_error")
 }
 
 fn set_runtime_program(
@@ -2639,7 +3447,9 @@ struct ProgramUnitResult {
     actual: &'static str,
     passed: bool,
     exit_code: i32,
+    termination: reporch_runtime_core::GuestTerminationV2,
     duration_ms: u128,
+    stdout: String,
     stderr: String,
 }
 
@@ -2652,6 +3462,28 @@ fn emit_unit_report(
         passed: cases.iter().all(|case| case.passed),
         cases,
     };
+    if report
+        .cases
+        .iter()
+        .any(|case| case.termination == reporch_runtime_core::GuestTerminationV2::TimedOut)
+    {
+        return Err(crate::cli_output::domain_error(
+            "runtime.execution_timed_out",
+            "a local validation workload exceeded its configured timeout",
+            &report,
+        ));
+    }
+    if report
+        .cases
+        .iter()
+        .any(|case| case.termination != reporch_runtime_core::GuestTerminationV2::Exited)
+    {
+        return Err(crate::cli_output::domain_error(
+            "runtime.execution_failed",
+            "a local validation workload did not exit normally",
+            &report,
+        ));
+    }
     if !report.passed {
         let failed = report
             .cases
@@ -2660,9 +3492,23 @@ fn emit_unit_report(
             .map(|case| format!("{}:{}", case.program, case.name))
             .collect::<Vec<_>>()
             .join(", ");
-        bail!("validation did not pass for {failed}");
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            format!("validation did not pass for {failed}"),
+            &report,
+        ));
     }
     output.emit(command, &report, "All configured unit cases passed")
+}
+
+fn termination_name(termination: reporch_runtime_core::GuestTerminationV2) -> &'static str {
+    match termination {
+        reporch_runtime_core::GuestTerminationV2::Exited => "exited",
+        reporch_runtime_core::GuestTerminationV2::TimedOut => "timed_out",
+        reporch_runtime_core::GuestTerminationV2::Signalled => "signalled",
+        reporch_runtime_core::GuestTerminationV2::OutputLimit => "output_limit",
+        reporch_runtime_core::GuestTerminationV2::InternalError => "internal_error",
+    }
 }
 
 fn find_legacy_solution<'a>(
@@ -2797,7 +3643,20 @@ async fn checker_accepts_path(
                 options,
             )
             .await?;
-            Ok(result.verdict == reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted)
+            match result.verdict {
+                reporch_cli::authoring_runtime::CustomCheckerVerdict::Accepted => Ok(true),
+                reporch_cli::authoring_runtime::CustomCheckerVerdict::WrongAnswer => Ok(false),
+                reporch_cli::authoring_runtime::CustomCheckerVerdict::JudgeError => {
+                    Err(crate::cli_output::domain_error(
+                        "checker.judge_error",
+                        format!(
+                            "custom checker failed with {:?} and exit code {}",
+                            result.execution.termination, result.execution.exit_code
+                        ),
+                        &result.execution,
+                    ))
+                }
+            }
         }
         _ => reporch_cli::authoring_runtime::standard_checker_matches(checker, &answer, &actual),
     }
@@ -2893,6 +3752,46 @@ fn read_project_bytes(root: &Path, path: &str) -> Result<Vec<u8>> {
     fs::read(canonical).with_context(|| format!("read project file {path}"))
 }
 
+fn ensure_unique_test_input<'a>(
+    root: &Path,
+    input_path: &str,
+    new_name: &str,
+    existing: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let input_digest = Sha256::digest(read_project_bytes(root, input_path)?);
+    for (existing_name, existing_path) in existing {
+        let duplicate = existing_path == input_path
+            || Sha256::digest(read_project_bytes(root, existing_path)?) == input_digest;
+        ensure!(
+            !duplicate,
+            "test input for {new_name} duplicates existing test {existing_name} ({existing_path}); use a different input or update the existing test"
+        );
+    }
+    Ok(())
+}
+
+fn next_test_case_name<'a>(tests: impl Iterator<Item = &'a str>) -> String {
+    let mut names = std::collections::BTreeSet::new();
+    for name in tests {
+        names.insert(name);
+    }
+    for index in 1_u64.. {
+        let name = format!("sample-{index}");
+        if !names.contains(name.as_str()) {
+            return name;
+        }
+    }
+    unreachable!("the test index space is finite only after exhausting u64")
+}
+
+fn guided_test_text(value: &str) -> String {
+    if value.is_empty() || value.ends_with('\n') {
+        value.to_owned()
+    } else {
+        format!("{value}\n")
+    }
+}
+
 fn write_project_bytes_atomic(root: &Path, path: &str, bytes: &[u8]) -> Result<()> {
     let normalized = studio_core::normalize_relative_path(path)?;
     let destination = root.join(&normalized);
@@ -2947,7 +3846,7 @@ fn materialize_statement_file(
                 .filter(|value| !value.is_empty())
                 .unwrap_or("Problem statement");
             let starter = format!(
-                "# {heading}\n\n<!-- Locale: {locale} -->\n\n## Description\n\nWrite the problem description here.\n\n## Input\n\nDescribe the input format.\n\n## Output\n\nDescribe the output format.\n"
+                "# {heading}\n\n*Locale: {locale}*\n\n## Description\n\nWrite the problem description here.\n\n## Input\n\nDescribe the input format.\n\n## Output\n\nDescribe the output format.\n"
             );
             write_project_bytes_atomic(root, relative, starter.as_bytes())?;
             Ok(Some(destination))
@@ -3044,6 +3943,48 @@ fn validate_group_id(id: &str) -> Result<()> {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
         "group ID must contain 1-64 letters, numbers, '-' or '_'"
+    );
+    Ok(())
+}
+
+fn validate_group_points(points: f64) -> Result<()> {
+    ensure!(
+        points.is_finite() && (0.0..=100.0).contains(&points),
+        "group points must be a finite value from 0 to 100"
+    );
+    Ok(())
+}
+
+fn ensure_v1_group_dependencies_acyclic(groups: &[TestGroupSpec]) -> Result<()> {
+    let mut resolved = std::collections::BTreeSet::new();
+    while resolved.len() < groups.len() {
+        let before = resolved.len();
+        for group in groups {
+            if !resolved.contains(&group.id)
+                && group
+                    .depends_on
+                    .iter()
+                    .all(|dependency| resolved.contains(dependency))
+            {
+                resolved.insert(group.id.clone());
+            }
+        }
+        ensure!(
+            resolved.len() > before,
+            "test group dependency graph cannot contain a cycle"
+        );
+    }
+    Ok(())
+}
+
+fn validate_floating_tolerances(absolute_error: &str, relative_error: &str) -> Result<()> {
+    let absolute = absolute_error.parse::<f64>().ok();
+    let relative = relative_error.parse::<f64>().ok();
+    ensure!(
+        absolute.is_some_and(|value| value.is_finite() && value >= 0.0)
+            && relative.is_some_and(|value| value.is_finite() && value >= 0.0)
+            && (absolute != Some(0.0) || relative != Some(0.0)),
+        "floating checker tolerances must be finite and non-negative, with at least one greater than zero"
     );
     Ok(())
 }
@@ -3155,6 +4096,62 @@ fn parse_output_mapping(value: &str) -> Result<(Uuid, String), String> {
         })?;
     let path = relative_string(Path::new(path)).map_err(|error| error.to_string())?;
     Ok((test_id, path))
+}
+
+fn parse_group_expectation(value: &str) -> Result<GroupExpectationInput, String> {
+    let (group, expectation) = value
+        .split_once('=')
+        .ok_or_else(|| "group expectation must use GROUP=VERDICT[:MIN..MAX]".to_owned())?;
+    let group = group.trim();
+    if group.is_empty() {
+        return Err("group expectation selector cannot be empty".into());
+    }
+    let (verdict, score) = expectation
+        .split_once(':')
+        .map_or((expectation, None), |(verdict, score)| {
+            (verdict, Some(score))
+        });
+    let verdict = match verdict.trim().replace('_', "-").as_str() {
+        "accepted" => Verdict::Accepted,
+        "wrong-answer" => Verdict::WrongAnswer,
+        "time-limit" => Verdict::TimeLimit,
+        "memory-limit" => Verdict::MemoryLimit,
+        "runtime-error" => Verdict::RuntimeError,
+        "partial" => Verdict::Partial,
+        _ => {
+            return Err(
+                "group verdict must be accepted, wrong-answer, time-limit, memory-limit, runtime-error, or partial"
+                    .into(),
+            );
+        }
+    };
+    let (minimum_score, maximum_score) = match score {
+        Some(score) => {
+            let (minimum, maximum) = score
+                .split_once("..")
+                .ok_or_else(|| "group score range must use MIN..MAX".to_owned())?;
+            let minimum = minimum
+                .parse::<f64>()
+                .map_err(|_| "group minimum score is invalid".to_owned())?;
+            let maximum = maximum
+                .parse::<f64>()
+                .map_err(|_| "group maximum score is invalid".to_owned())?;
+            (Some(minimum), Some(maximum))
+        }
+        None => (None, None),
+    };
+    if matches!(verdict, Verdict::Partial) != minimum_score.is_some() {
+        return Err(
+            "partial group expectations require :MIN..MAX; other verdicts cannot have a score range"
+                .into(),
+        );
+    }
+    Ok(GroupExpectationInput {
+        group: group.to_owned(),
+        verdict,
+        minimum_score,
+        maximum_score,
+    })
 }
 
 fn parse_runtime_output_path(value: &str) -> Result<PathBuf, String> {

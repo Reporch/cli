@@ -239,6 +239,20 @@ pub struct ValidateOptions {
     pub project_id: Option<Uuid>,
     #[arg(long)]
     pub commit_id: Option<Uuid>,
+    /// Run the complete local preflight matrix in the isolated Reporch VM.
+    /// Local results never become publication evidence.
+    #[arg(long)]
+    pub local: bool,
+    /// Local execution backend. Docker and Podman remain deprecated compatibility modes.
+    #[arg(long, value_enum, default_value_t = LocalVerifyRuntime::Auto)]
+    pub runtime: LocalVerifyRuntime,
+    /// Per-program timeout for --local verification.
+    #[arg(
+        long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..=600)
+    )]
+    pub local_timeout_seconds: u64,
     /// Reuse this value after an ambiguous network failure.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -246,6 +260,14 @@ pub struct ValidateOptions {
     pub wait: bool,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
     pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum LocalVerifyRuntime {
+    #[default]
+    Auto,
+    Podman,
+    Docker,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -1616,6 +1638,69 @@ pub async fn list_projects_operation(connection: &RemoteConnectionOptions) -> Re
     bail!("Studio project listing exceeded the 10,000-item native client bound")
 }
 
+pub async fn show_local_project_operation(
+    connection: &RemoteConnectionOptions,
+) -> Result<ProjectResponse> {
+    let root = crate::local_project::discover_project(Path::new("."))?;
+    let spec = read_versioned_authoring_spec(&root)?;
+    let client = StudioApiClient::connect(connection).await?;
+    let project = find_accessible_project(&client, spec.project_id()).await?;
+    ensure_or_recover_remote_link(&root, connection, spec.project_id())?;
+    Ok(project)
+}
+
+async fn find_accessible_project(
+    client: &StudioApiClient,
+    project_id: Uuid,
+) -> Result<ProjectResponse> {
+    let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = client.list_projects(cursor.as_deref()).await?;
+        if let Some(project) = page
+            .items
+            .into_iter()
+            .find(|project| project.id == project_id)
+        {
+            return Ok(project);
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            bail!("Studio project {project_id} is no longer accessible")
+        };
+        ensure!(
+            seen_cursors.insert(next_cursor.clone()),
+            "Studio returned a repeated project cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio project listing exceeded the 10,000-item native client bound")
+}
+
+fn ensure_or_recover_remote_link(
+    root: &Path,
+    connection: &RemoteConnectionOptions,
+    project_id: Uuid,
+) -> Result<()> {
+    let api_url = connection.api_url.trim_end_matches('/');
+    let mut state = crate::local_project::read_local_state(root)?;
+    if let Some(remote) = &state.remote {
+        ensure!(
+            remote.project_id == project_id,
+            "local link and reporch.yaml project IDs differ"
+        );
+        ensure!(
+            remote.api_url.trim_end_matches('/') == api_url,
+            "linked Studio API URL differs from the selected connection"
+        );
+        return Ok(());
+    }
+    state.remote = Some(crate::local_project::RemoteLinkV1 {
+        api_url: api_url.to_owned(),
+        project_id,
+    });
+    crate::local_project::write_local_state(root, &state).map(|_| ())
+}
+
 pub async fn capabilities_operation(
     connection: &RemoteConnectionOptions,
 ) -> Result<StudioCapabilitiesV1> {
@@ -2375,20 +2460,6 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
     }
     let spec = read_versioned_authoring_spec(&root)?;
     let project_id = spec.project_id();
-    let mut state = crate::local_project::read_local_state(&root)?;
-    let remote = state
-        .remote
-        .as_ref()
-        .context("project is not linked; run reporch project link")?;
-    ensure!(
-        remote.project_id == project_id,
-        "local link and reporch.yaml project IDs differ"
-    );
-    ensure!(
-        remote.api_url.trim_end_matches('/') == options.connection.api_url.trim_end_matches('/'),
-        "linked Studio API URL differs from the selected connection"
-    );
-
     let client = StudioApiClient::connect(&options.connection).await?;
     let capabilities = client.capabilities().await?;
     ensure_cli_compatible(&capabilities)?;
@@ -2400,6 +2471,12 @@ async fn push_authoring_operation(options: &PushOptions) -> Result<PushOperation
         "Studio does not support {}",
         spec.schema()
     );
+    let mut state = crate::local_project::read_local_state(&root)?;
+    if state.remote.is_none() {
+        find_accessible_project(&client, project_id).await?;
+    }
+    ensure_or_recover_remote_link(&root, &options.connection, project_id)?;
+    state = crate::local_project::read_local_state(&root)?;
 
     let upload_manifest = compile_versioned_authoring_spec(&root, &spec, Uuid::nil())?;
     let issues = studio_core::validate_versioned_manifest(&upload_manifest);
@@ -2663,6 +2740,10 @@ pub async fn push(options: &PushOptions) -> Result<()> {
 }
 
 pub async fn validate_operation(options: &ValidateOptions) -> Result<ValidationOperationResult> {
+    ensure!(
+        !options.local,
+        "--local verification must be dispatched through the CLI local verifier"
+    );
     validate_wait_timeout(options.timeout_seconds)?;
     let (project_id, commit_id, local_root) =
         resolve_local_candidate(options.project_id, options.commit_id)?;
@@ -3169,12 +3250,50 @@ pub async fn approve_review_operation(options: &ApproveReviewOptions) -> Result<
 }
 
 pub async fn list_waivers_operation(options: &WaiverScopeOptions) -> Result<WaiverPage> {
-    let (project_id, validation_id) =
-        resolve_local_validation(options.project_id, options.validation_run_id)?;
-    StudioApiClient::connect(&options.connection)
-        .await?
-        .list_waivers(project_id, validation_id)
-        .await
+    let project_id = resolve_local_project_id(options.project_id)?;
+    let client = StudioApiClient::connect(&options.connection).await?;
+    let validation_id = match options.validation_run_id {
+        Some(validation_id) => validation_id,
+        None if options.project_id.is_none() => resolve_local_validation(None, None)?.1,
+        None => latest_remote_validation_id(&client, project_id).await?,
+    };
+    client.list_waivers(project_id, validation_id).await
+}
+
+async fn latest_remote_validation_id(client: &StudioApiClient, project_id: Uuid) -> Result<Uuid> {
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut latest = None;
+    for _ in 0..100 {
+        let page = client.list_validations(project_id, cursor).await?;
+        ensure!(
+            page.items
+                .iter()
+                .all(|validation| validation.project_id == project_id),
+            "Studio returned a validation from another project"
+        );
+        for validation in page.items {
+            if latest.as_ref().is_none_or(
+                |current: &studio_contracts::ValidationRunSummaryResponse| {
+                    validation.created_at > current.created_at
+                        || validation.created_at == current.created_at && validation.id > current.id
+                },
+            ) {
+                latest = Some(validation);
+            }
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            return latest.map(|validation| validation.id).context(
+                "the project has no validation runs; pass --validation-run-id after running verify",
+            );
+        };
+        ensure!(
+            seen.insert(next_cursor),
+            "Studio returned a repeated validation cursor"
+        );
+        cursor = Some(next_cursor);
+    }
+    bail!("Studio validation listing exceeded the 10,000-item native client bound")
 }
 
 pub async fn create_waiver_operation(options: &CreateWaiverOptions) -> Result<WaiverResponse> {
@@ -3974,6 +4093,71 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[tokio::test]
+    async fn waiver_list_with_explicit_project_recovers_the_latest_remote_validation() {
+        use axum::{Json, Router, routing::get};
+
+        let project_id = Uuid::now_v7();
+        let older_id = Uuid::now_v7();
+        let latest_id = Uuid::now_v7();
+        let application = Router::new()
+            .route(
+                "/api/v1/projects/{project_id}/validations",
+                get(move || async move {
+                    Json(serde_json::json!({
+                        "items": [
+                            {
+                                "id": older_id,
+                                "project_id": project_id,
+                                "commit_id": Uuid::now_v7(),
+                                "status": "passed",
+                                "created_at": "2026-09-03T00:00:00Z",
+                                "updated_at": "2026-09-03T00:01:00Z"
+                            },
+                            {
+                                "id": latest_id,
+                                "project_id": project_id,
+                                "commit_id": Uuid::now_v7(),
+                                "status": "passed",
+                                "created_at": "2026-09-04T00:00:00Z",
+                                "updated_at": "2026-09-04T00:01:00Z"
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/validations/{validation_id}/waivers",
+                get(move |path: axum::extract::Path<(Uuid, Uuid)>| async move {
+                    assert_eq!(path.0.0, project_id);
+                    assert_eq!(path.0.1, latest_id);
+                    Json(serde_json::json!({ "items": [] }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, application).await.unwrap();
+        });
+        let options = WaiverScopeOptions {
+            connection: RemoteConnectionOptions {
+                api_url: format!("http://{address}"),
+                auth: NativeAuthOptions {
+                    issuer: "http://127.0.0.1/oauth".into(),
+                    client_id: "test".into(),
+                    allow_insecure_http: true,
+                },
+                dev_subject: Some("qa-author".into()),
+            },
+            project_id: Some(project_id),
+            validation_run_id: None,
+        };
+
+        let page = list_waivers_operation(&options).await.unwrap();
+        assert!(page.items.is_empty());
+        server.abort();
+    }
+
     #[test]
     fn studio_api_url_is_https_or_explicit_loopback_only() {
         assert_eq!(
@@ -4024,6 +4208,42 @@ mod tests {
 
         let loopback = validate_api_url("http://127.0.0.1:8080", true).unwrap();
         validate_connection_binding(&loopback, &official_auth, Some("e2e-author")).unwrap();
+    }
+
+    #[test]
+    fn missing_local_state_recovers_a_remote_link_without_changing_the_project_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_id = Uuid::now_v7();
+        crate::init_project_with_id(directory.path(), "Recovered", project_id).unwrap();
+        let state_path = directory
+            .path()
+            .join(crate::local_project::LOCAL_STATE_DIRECTORY)
+            .join(crate::local_project::LOCAL_STATE_FILE_NAME);
+        if state_path.exists() {
+            std::fs::remove_file(&state_path).unwrap();
+        }
+        let connection = RemoteConnectionOptions {
+            api_url: "https://studio.reporch.com/".into(),
+            auth: NativeAuthOptions {
+                issuer: DEFAULT_OIDC_ISSUER.into(),
+                client_id: "test".into(),
+                allow_insecure_http: false,
+            },
+            dev_subject: None,
+        };
+
+        ensure_or_recover_remote_link(directory.path(), &connection, project_id).unwrap();
+
+        let state = crate::local_project::read_local_state(directory.path()).unwrap();
+        let remote = state.remote.unwrap();
+        assert_eq!(remote.project_id, project_id);
+        assert_eq!(remote.api_url, "https://studio.reporch.com");
+        assert_eq!(
+            read_versioned_authoring_spec(directory.path())
+                .unwrap()
+                .project_id(),
+            project_id
+        );
     }
 
     #[test]
