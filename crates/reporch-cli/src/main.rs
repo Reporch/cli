@@ -1486,11 +1486,7 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             SandboxCommand::Run(options) => {
                 let plan = reporch_cli::local_sandbox::plan(&options.into_local()).await?;
                 let result = reporch_cli::local_sandbox::execute(&plan).await?;
-                if result.exit_code == 0 {
-                    output.emit("sandbox run", &result, "Local sandbox command passed")
-                } else {
-                    bail!("sandbox command exited with {}", result.exit_code)
-                }
+                emit_sandbox_result(result, output)
             }
         },
         Command::Toolchain { command } => match command {
@@ -1559,6 +1555,85 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
         },
         Command::QualificationSelfTest => qualification_self_test().await,
+    }
+}
+
+fn emit_sandbox_result(
+    result: reporch_cli::local_sandbox::LocalSandboxResult,
+    output: &CliOutput,
+) -> Result<()> {
+    match result.termination {
+        reporch_runtime_core::GuestTerminationV2::Exited if result.exit_code == 0 => {
+            output.emit("sandbox run", &result, "Local sandbox command passed")
+        }
+        reporch_runtime_core::GuestTerminationV2::TimedOut => Err(cli_output::domain_error(
+            "runtime.execution_timed_out",
+            "sandbox workload exceeded its configured timeout",
+            &result,
+        )),
+        reporch_runtime_core::GuestTerminationV2::OutputLimit => Err(cli_output::domain_error(
+            "runtime.output_limit_exceeded",
+            "sandbox workload exceeded its configured output limit",
+            &result,
+        )),
+        _ => Err(cli_output::domain_error(
+            "runtime.execution_failed",
+            format!(
+                "sandbox workload ended as {:?} with exit code {}",
+                result.termination, result.exit_code
+            ),
+            &result,
+        )),
+    }
+}
+
+#[cfg(test)]
+mod sandbox_result_regression_tests {
+    use super::*;
+
+    fn result(
+        termination: reporch_runtime_core::GuestTerminationV2,
+        exit_code: i32,
+    ) -> reporch_cli::local_sandbox::LocalSandboxResult {
+        reporch_cli::local_sandbox::LocalSandboxResult {
+            schema: "reporch.local-sandbox-result.v2",
+            runtime: "reporch_vm".into(),
+            image: "toolchain@sha256:test".into(),
+            exit_code,
+            termination,
+            duration_ms: 10,
+            stdout: "visible output".into(),
+            stderr: "visible diagnostic".into(),
+            stdout_bytes: b"visible output".to_vec(),
+        }
+    }
+
+    #[test]
+    fn nonzero_and_timeout_results_are_domain_failures_with_preserved_diagnostics() {
+        let output = CliOutput::new(OutputFormat::Human, true, ColorMode::Never);
+        for (termination, exit_code) in [
+            (reporch_runtime_core::GuestTerminationV2::Exited, 2),
+            (reporch_runtime_core::GuestTerminationV2::Signalled, 128),
+            (reporch_runtime_core::GuestTerminationV2::TimedOut, 124),
+            (reporch_runtime_core::GuestTerminationV2::OutputLimit, 125),
+        ] {
+            let error = emit_sandbox_result(result(termination, exit_code), &output).unwrap_err();
+            assert_eq!(
+                output.emit_error("sandbox run", &error),
+                cli_output::ExitCode::DomainFailure
+            );
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("sandbox workload"), "{rendered}");
+        }
+
+        let serialized = serde_json::to_value(result(
+            reporch_runtime_core::GuestTerminationV2::Signalled,
+            128,
+        ))
+        .unwrap();
+        assert_eq!(serialized["termination"], "signalled");
+        assert_eq!(serialized["stdout"], "visible output");
+        assert_eq!(serialized["stderr"], "visible diagnostic");
     }
 }
 

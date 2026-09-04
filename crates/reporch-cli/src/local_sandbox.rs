@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use reporch_runtime_core::{
-    ContentObjectV1, GuestJobV1, GuestOperationV1, GuestOutputEncodingV1, ResourceLimitsV1,
-    RuntimeAvailability, RuntimeError,
+    ContentObjectV1, GuestJobV1, GuestOperationV1, GuestOutputEncodingV1, GuestTerminationV2,
+    ResourceLimitsV1, RuntimeAvailability, RuntimeError,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -76,6 +76,7 @@ pub struct LocalSandboxResult {
     pub runtime: String,
     pub image: String,
     pub exit_code: i32,
+    pub termination: GuestTerminationV2,
     pub duration_ms: u128,
     pub stdout: String,
     pub stderr: String,
@@ -162,31 +163,37 @@ pub async fn execute(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
     let stderr_task = tokio::spawn(read_bounded(stderr, output_limit));
     let status =
         match tokio::time::timeout(Duration::from_secs(plan.timeout_seconds), child.wait()).await {
-            Ok(result) => result.context("wait for local sandbox")?,
+            Ok(result) => Some(result.context("wait for local sandbox")?),
             Err(_) => {
                 kill_process_tree(&mut child).await;
                 remove_exact_container(runtime_executable, &plan.container_name).await;
-                return Err(RuntimeError::ServiceUnavailable(format!(
-                    "local sandbox exceeded {} seconds",
-                    plan.timeout_seconds
-                ))
-                .into());
+                None
             }
         };
     let (stdout, stdout_truncated) = stdout_task.await.context("join stdout reader")??;
     let (stderr, stderr_truncated) = stderr_task.await.context("join stderr reader")??;
-    if stdout_truncated || stderr_truncated {
-        bail!(
-            "local sandbox output exceeded {} bytes per stream",
-            output_limit
-        );
-    }
+    let termination = if status.is_none() {
+        GuestTerminationV2::TimedOut
+    } else if stdout_truncated || stderr_truncated {
+        GuestTerminationV2::OutputLimit
+    } else if status.as_ref().and_then(ExitStatus::code).is_none() {
+        GuestTerminationV2::Signalled
+    } else {
+        GuestTerminationV2::Exited
+    };
+    let exit_code = match termination {
+        GuestTerminationV2::TimedOut => 124,
+        GuestTerminationV2::Signalled => 128,
+        GuestTerminationV2::OutputLimit => 125,
+        _ => status.as_ref().and_then(ExitStatus::code).unwrap_or(1),
+    };
     let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
     Ok(LocalSandboxResult {
-        schema: "reporch.local-sandbox-result.v1",
+        schema: "reporch.local-sandbox-result.v2",
         runtime: plan.runtime.clone(),
         image: plan.image.clone(),
-        exit_code: status.code().unwrap_or(128),
+        exit_code,
+        termination,
         duration_ms: started.elapsed().as_millis(),
         stdout: stdout_text,
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -241,22 +248,19 @@ async fn execute_native(plan: &LocalSandboxPlan) -> Result<LocalSandboxResult> {
         }
         Err(error) => return Err(error),
     };
-    if result.termination == reporch_runtime_core::GuestTerminationV2::TimedOut {
-        return Err(RuntimeError::ExecutionTimedOut.into());
-    }
-    if result.stdout.truncated || result.stderr.truncated {
-        bail!(
-            "local sandbox output exceeded {} bytes per stream",
-            plan.output_limit_bytes
-        );
-    }
+    let termination = if result.stdout.truncated || result.stderr.truncated {
+        GuestTerminationV2::OutputLimit
+    } else {
+        result.termination
+    };
     let stdout = decode_guest_output(result.stdout.encoding, &result.stdout.data)?;
     let stderr = decode_guest_output(result.stderr.encoding, &result.stderr.data)?;
     Ok(LocalSandboxResult {
-        schema: "reporch.local-sandbox-result.v1",
+        schema: "reporch.local-sandbox-result.v2",
         runtime: plan.runtime.clone(),
         image: plan.image.clone(),
         exit_code: result.exit_code,
+        termination,
         duration_ms: result.duration_ms.into(),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -309,10 +313,15 @@ async fn execute_remote_preview(plan: &LocalSandboxPlan) -> Result<LocalSandboxR
     let stdout = result.output.unwrap_or_default().into_bytes();
     let stderr = result.error_code.unwrap_or_default();
     Ok(LocalSandboxResult {
-        schema: "reporch.local-sandbox-result.v1",
+        schema: "reporch.local-sandbox-result.v2",
         runtime: "studio_remote".into(),
         image: plan.image.clone(),
         exit_code: if succeeded { 0 } else { 1 },
+        termination: if succeeded {
+            GuestTerminationV2::Exited
+        } else {
+            GuestTerminationV2::InternalError
+        },
         duration_ms: started.elapsed().as_millis(),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr,
