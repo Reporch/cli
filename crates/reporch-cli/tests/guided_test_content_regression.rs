@@ -51,7 +51,10 @@ mod macos {
         assert!(guided.status.success(), "{guided:?}");
         let transcript = String::from_utf8_lossy(&guided.stdout);
         assert!(transcript.contains("Test name [sample-2]"), "{transcript}");
-        assert!(transcript.contains("Input data (single line)"), "{transcript}");
+        assert!(
+            transcript.contains("Input data (single line)"),
+            "{transcript}"
+        );
 
         let listed = reporch()
             .args([
@@ -73,14 +76,8 @@ mod macos {
             .find(|test| test["name"] == "sample-2")
             .expect("the guide should add sample-2");
         let input = project.path().join(added["input_file"].as_str().unwrap());
-        let answer = project
-            .path()
-            .join(added["answer_file"].as_str().unwrap());
-        assert_eq!(
-            std::fs::read(input).unwrap(),
-            b"2 3\n",
-            "{transcript}"
-        );
+        let answer = project.path().join(added["answer_file"].as_str().unwrap());
+        assert_eq!(std::fs::read(input).unwrap(), b"2 3\n", "{transcript}");
         assert_eq!(std::fs::read(answer).unwrap(), b"5\n", "{transcript}");
     }
 }
