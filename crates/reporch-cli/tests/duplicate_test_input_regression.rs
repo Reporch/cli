@@ -32,11 +32,7 @@ fn test_case_add_rejects_same_path_and_same_digest_before_saving() {
     fs::write(project.path().join("tests/duplicate.ans"), b"3\n").unwrap();
     for (name, input, answer) in [
         ("same-path", "tests/1.in", "tests/1.ans"),
-        (
-            "same-digest",
-            "tests/duplicate.in",
-            "tests/duplicate.ans",
-        ),
+        ("same-digest", "tests/duplicate.in", "tests/duplicate.ans"),
     ] {
         let added = reporch()
             .args([
@@ -59,7 +55,10 @@ fn test_case_add_rejects_same_path_and_same_digest_before_saving() {
         assert_eq!(added.status.code(), Some(2), "{added:?}");
         let error: serde_json::Value = serde_json::from_slice(&added.stderr).unwrap();
         let message = error["message"].as_str().unwrap();
-        assert!(message.contains("duplicates existing test sample-1"), "{message}");
+        assert!(
+            message.contains("duplicates existing test sample-1"),
+            "{message}"
+        );
         assert!(message.contains("update the existing test"), "{message}");
     }
 

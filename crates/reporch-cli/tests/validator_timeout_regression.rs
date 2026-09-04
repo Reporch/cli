@@ -86,8 +86,5 @@ fn validator_timeout_is_a_domain_failure_even_when_invalid_was_expected() {
     assert_eq!(error["retryable"], false);
     assert_eq!(error["details"]["passed"], false);
     assert_eq!(error["details"]["cases"][0]["actual"], "timed_out");
-    assert_eq!(
-        error["details"]["cases"][0]["termination"],
-        "timed_out"
-    );
+    assert_eq!(error["details"]["cases"][0]["termination"], "timed_out");
 }
