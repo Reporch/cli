@@ -136,6 +136,11 @@ assert.match(
   /gh release edit "\$RELEASE_TAG" --repo "\$GH_REPO" --draft=false --prerelease/,
   "the checkout-free finalizer must address the repository explicitly"
 );
+assert.match(
+  release,
+  /preserve-stable-candidate:[\s\S]*?GH_REPO: \$\{\{ github\.repository \}\}[\s\S]*?gh release view "\$RELEASE_TAG" --repo "\$GH_REPO"/,
+  "the checkout-free stable-candidate verifier must address the repository explicitly"
+);
 assert.doesNotMatch(
   release,
   /gh release edit "\$RELEASE_TAG" --draft=false --latest/,

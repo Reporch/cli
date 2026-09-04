@@ -535,11 +535,12 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
     steps:
       - name: Keep stable candidate unlisted until explicit dist-tag promotion
         shell: bash
         run: |
           set -euo pipefail
-          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          test "$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq .isDraft)" = true
           echo "Exact 1.0 candidate qualified. npm candidate remains isolated; latest and the GitHub draft require explicit promotion."

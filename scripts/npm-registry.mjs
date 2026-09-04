@@ -3,11 +3,23 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const NOT_FOUND = /E404|not in this registry|No match found/i;
 
+export const NPM_REGISTRY_PROPAGATION_RETRY_DELAYS_MS = [
+  1_000,
+  2_000,
+  4_000,
+  8_000,
+  15_000,
+  30_000,
+  60_000,
+  60_000,
+  120_000
+];
+
 export async function waitForExpectedIntegrity({
   lookup,
   spec,
   expectedIntegrity,
-  retryDelaysMs = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000],
+  retryDelaysMs = NPM_REGISTRY_PROPAGATION_RETRY_DELAYS_MS,
   wait = sleep
 }) {
   let lastError = "";
