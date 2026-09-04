@@ -79,32 +79,28 @@ pub async fn run_custom_checker(
     output_path: &str,
     options: &AuthoringRunOptions,
 ) -> Result<CustomCheckerResult> {
-    // Validate every project-backed argument before it reaches the guest. The
-    // returned VM paths are not required here because guest jobs start in the
-    // read-only /workspace directory.
+    // Resolve every project-backed argument to its guest path. Native jobs
+    // inventory only explicit `/workspace/...` command arguments, so passing
+    // the host-relative spelling would validate the file without actually
+    // staging it in the VM.
     let root = project_directory
         .canonicalize()
         .context("resolve checker project directory")?;
-    for path in [input_path, answer_path, output_path] {
-        let _ = checked_workspace_file(&root, path)?;
-    }
+    let input_path = checked_workspace_file(&root, input_path)?;
+    let answer_path = checked_workspace_file(&root, answer_path)?;
+    let output_guest_path = checked_workspace_file(&root, output_path)?;
     let (arguments, stdin_path) = match protocol {
         CheckerProtocolV1::Icpc202509 => (
             vec![
-                input_path.to_owned(),
-                answer_path.to_owned(),
+                input_path.clone(),
+                answer_path.clone(),
                 "/run/reporch".to_owned(),
             ],
             Some(output_path),
         ),
-        CheckerProtocolV1::ReporchLegacyV0 => (
-            vec![
-                input_path.to_owned(),
-                output_path.to_owned(),
-                answer_path.to_owned(),
-            ],
-            None,
-        ),
+        CheckerProtocolV1::ReporchLegacyV0 => {
+            (vec![input_path, output_guest_path, answer_path], None)
+        }
     };
     let execution = run_program(&ProgramRequest {
         project_directory: &root,
