@@ -872,10 +872,11 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
                 AuthDevicesCommand::List(connection) => {
                     let sessions =
                         studio_remote::list_device_sessions_operation(&connection).await?;
+                    let human = human_item_list("device session", &sessions.items)?;
                     output.emit(
                         "auth devices list",
                         &sessions,
-                        &format!("{} device session(s)", sessions.items.len()),
+                        &human,
                     )
                 }
                 AuthDevicesCommand::Revoke {
@@ -916,11 +917,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ProjectCommand::List(connection) => {
                 let projects = studio_remote::list_projects_operation(&connection).await?;
-                output.emit(
-                    "project list",
-                    &projects,
-                    &format!("{} project(s)", projects.items.len()),
-                )
+                let human = human_item_list("project", &projects.items)?;
+                output.emit("project list", &projects, &human)
             }
             ProjectCommand::Show(connection) => {
                 let project = studio_remote::show_local_project_operation(&connection).await?;
@@ -1042,19 +1040,13 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Member { command } => match command {
             MemberCommand::Search(options) => {
                 let identities = studio_remote::search_members_operation(&options).await?;
-                output.emit(
-                    "member search",
-                    &identities,
-                    &format!("{} matching account(s)", identities.items.len()),
-                )
+                let human = human_item_list("matching account", &identities.items)?;
+                output.emit("member search", &identities, &human)
             }
             MemberCommand::List(options) => {
                 let members = studio_remote::list_members_operation(&options).await?;
-                output.emit(
-                    "member list",
-                    &members,
-                    &format!("{} member(s)", members.items.len()),
-                )
+                let human = human_item_list("member", &members.items)?;
+                output.emit("member list", &members, &human)
             }
             MemberCommand::Add(options) => {
                 let member = studio_remote::upsert_member_operation(&options).await?;
@@ -1201,11 +1193,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ReleaseCommand::List(options) => {
                 let releases = studio_remote::list_releases_operation(&options).await?;
-                output.emit(
-                    "release list",
-                    &releases,
-                    &format!("{} release(s)", releases.items.len()),
-                )
+                let human = human_item_list("release", &releases.items)?;
+                output.emit("release list", &releases, &human)
             }
             ReleaseCommand::Show(options) => {
                 let release = studio_remote::show_release_operation(&options).await?;
@@ -1250,11 +1239,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Validation { command } => match command {
             ValidationCommand::List(options) => {
                 let validations = studio_remote::list_validations_operation(&options).await?;
-                output.emit(
-                    "validation list",
-                    &validations,
-                    &format!("{} validation(s)", validations.items.len()),
-                )
+                let human = human_item_list("validation", &validations.items)?;
+                output.emit("validation list", &validations, &human)
             }
             ValidationCommand::Show(options) => {
                 let validation = studio_remote::validation_show_operation(&options).await?;
@@ -1313,11 +1299,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Waiver { command } => match command {
             WaiverCommand::List(options) => {
                 let waivers = studio_remote::list_waivers_operation(&options).await?;
-                output.emit(
-                    "waiver list",
-                    &waivers,
-                    &format!("{} waiver(s)", waivers.items.len()),
-                )
+                let human = human_item_list("waiver", &waivers.items)?;
+                output.emit("waiver list", &waivers, &human)
             }
             WaiverCommand::Create(options) => {
                 let waiver = studio_remote::create_waiver_operation(&options).await?;
@@ -1339,11 +1322,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
         Command::Revision { command } => match command {
             RevisionCommand::List(options) => {
                 let revisions = studio_remote::list_revisions_operation(&options).await?;
-                output.emit(
-                    "revision list",
-                    &revisions,
-                    &format!("{} revision(s)", revisions.items.len()),
-                )
+                let human = human_item_list("revision", &revisions.items)?;
+                output.emit("revision list", &revisions, &human)
             }
             RevisionCommand::Show(options) => {
                 let revision = studio_remote::show_revision_operation(&options).await?;
@@ -1385,11 +1365,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ReviewCommand::List(options) => {
                 let reviews = studio_remote::list_reviews_operation(&options).await?;
-                output.emit(
-                    "review list",
-                    &reviews,
-                    &format!("{} review(s)", reviews.items.len()),
-                )
+                let human = human_item_list("review", &reviews.items)?;
+                output.emit("review list", &reviews, &human)
             }
             ReviewCommand::Request(options) => {
                 let request = studio_remote::request_review_pool_operation(&options).await?;
@@ -1401,11 +1378,8 @@ async fn run(arguments: Args, output: &CliOutput) -> Result<()> {
             }
             ReviewCommand::Inbox(options) => {
                 let inbox = studio_remote::list_review_pool_inbox_operation(&options).await?;
-                output.emit(
-                    "review inbox",
-                    &inbox,
-                    &format!("{} claimable review(s)", inbox.items.len()),
-                )
+                let human = human_item_list("claimable review", &inbox.items)?;
+                output.emit("review inbox", &inbox, &human)
             }
             ReviewCommand::Show(options) => {
                 let review = studio_remote::show_review_operation(&options).await?;
@@ -1737,6 +1711,89 @@ fn runtime_status_human(status: &reporch_runtime_core::RuntimeStatusV1) -> Strin
         status.backend,
         env!("CARGO_PKG_VERSION"),
     )
+}
+
+fn human_item_list<T: serde::Serialize>(singular: &str, items: &[T]) -> Result<String> {
+    if items.is_empty() {
+        return Ok(format!("No {singular}s."));
+    }
+    const DISPLAY_FIELDS: &[&str] = &[
+        "title",
+        "display_name",
+        "username",
+        "name",
+        "id",
+        "member",
+        "role",
+        "status",
+        "sequence",
+        "project_id",
+        "commit_id",
+        "client_id",
+        "language",
+        "issue_code",
+        "last_used_at",
+        "expires_at",
+    ];
+    let mut lines = vec![format!("{} {singular}(s):", items.len())];
+    for item in items {
+        let value = serde_json::to_value(item).context("serialize human list item")?;
+        let object = value
+            .as_object()
+            .context("human list item must serialize as an object")?;
+        let fields = DISPLAY_FIELDS
+            .iter()
+            .filter_map(|key| {
+                let value = object.get(*key)?;
+                (!value.is_null()).then(|| format!("{key}={}", human_json_value(value)))
+            })
+            .take(6)
+            .collect::<Vec<_>>();
+        ensure!(!fields.is_empty(), "human list item has no displayable identity");
+        lines.push(format!("- {}", fields.join(" · ")));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn human_json_value(value: &serde_json::Value) -> String {
+    let rendered = value.as_str().map_or_else(
+        || serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".into()),
+        str::to_owned,
+    );
+    rendered
+        .chars()
+        .flat_map(|character| {
+            if character.is_control() {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod human_list_tests {
+    use super::*;
+
+    #[test]
+    fn human_lists_expose_ids_needed_by_follow_up_commands() {
+        let items = vec![serde_json::json!({
+            "id": "019f-example",
+            "title": "A + B",
+            "status": "passed",
+        })];
+        let rendered = human_item_list("project", &items).unwrap();
+        assert!(rendered.contains("title=A + B"), "{rendered}");
+        assert!(rendered.contains("id=019f-example"), "{rendered}");
+        assert!(rendered.contains("status=passed"), "{rendered}");
+    }
+
+    #[test]
+    fn empty_human_lists_have_an_explicit_empty_state() {
+        let items = Vec::<serde_json::Value>::new();
+        assert_eq!(human_item_list("release", &items).unwrap(), "No releases.");
+    }
 }
 
 fn command_skips_runtime_bootstrap(command: &Command) -> bool {
