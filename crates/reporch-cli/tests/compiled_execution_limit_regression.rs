@@ -93,8 +93,19 @@ fn compiled_grader_applies_the_problem_limit_after_compilation() {
     let compile = command
         .find("c++ -std=c++20")
         .expect("the grader should compile inside the VM");
+    let watchdog = command
+        .find("timeout_watchdog_pid=$!")
+        .expect("the runtime watchdog should start after compilation");
     let execute = command
-        .find("timeout --kill-after=1s 1.000s /run/reporch/program")
-        .expect("the problem limit should wrap only the compiled program");
-    assert!(compile < execute, "{command}");
+        .find("timeout --kill-after=1s 1.000s")
+        .expect("the problem limit should wrap the compiled workload");
+    let program = execute
+        + command[execute..]
+            .find("/run/reporch/program")
+            .expect("the compiled program should be the timed workload");
+    assert!(
+        compile < watchdog && watchdog < execute && execute < program,
+        "{command}"
+    );
+    assert!(command.contains("status=124"), "{command}");
 }
