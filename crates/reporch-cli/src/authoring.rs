@@ -895,9 +895,18 @@ fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
         !no_input && std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "test guide requires an interactive terminal; use test case add in CI"
     );
-    let name = prompt("Test name", "sample-1")?;
-    let input = prompt("Input file", "tests/1.in")?;
-    let answer = prompt("Answer file (blank for none)", "tests/1.ans")?;
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project::read_authoring_spec(&root)?;
+    let defaults = next_test_case_defaults(spec.judging.tests.iter().map(|test| {
+        (
+            test.name.as_str(),
+            test.input_file.as_str(),
+            test.answer_file.as_deref(),
+        )
+    }));
+    let name = prompt("Test name", &defaults.0)?;
+    let input = prompt("Input file", &defaults.1)?;
+    let answer = prompt("Answer file (blank for none)", &defaults.2)?;
     test_case(
         TestCaseCommand::Add(TestCaseAddOptions {
             name,
@@ -932,6 +941,15 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let answer = materialized.answer.clone();
             let updated = reporch_cli::local_project::update_authoring_spec(&root, |root, spec| {
                 ensure_unique_test_name(spec, &options.name, None)?;
+                ensure_unique_test_input(
+                    root,
+                    &input,
+                    &options.name,
+                    spec.judging
+                        .tests
+                        .iter()
+                        .map(|test| (test.name.as_str(), test.input_file.as_str())),
+                )?;
                 ensure_groups_exist(spec, &options.groups)?;
                 if let Some(generator) = &options.generated_by {
                     ensure!(
@@ -1068,6 +1086,15 @@ fn import_test_cases(options: TestCaseImportOptions, output: &CliOutput) -> Resu
                 .context("test input has a non-Unicode file name")?;
             let name = normalize_name(stem)?;
             ensure_unique_test_name(spec, &name, None)?;
+            ensure_unique_test_input(
+                root,
+                &input,
+                &name,
+                spec.judging
+                    .tests
+                    .iter()
+                    .map(|test| (test.name.as_str(), test.input_file.as_str())),
+            )?;
             reporch_cli::local_project::declare_project_file(
                 root,
                 spec,
@@ -3041,6 +3068,50 @@ fn checked_project_file_path(root: &Path, path: &str) -> Result<PathBuf> {
 fn read_project_bytes(root: &Path, path: &str) -> Result<Vec<u8>> {
     let canonical = checked_project_file_path(root, path)?;
     fs::read(canonical).with_context(|| format!("read project file {path}"))
+}
+
+fn ensure_unique_test_input<'a>(
+    root: &Path,
+    input_path: &str,
+    new_name: &str,
+    existing: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let input_digest = Sha256::digest(read_project_bytes(root, input_path)?);
+    for (existing_name, existing_path) in existing {
+        let duplicate = existing_path == input_path
+            || Sha256::digest(read_project_bytes(root, existing_path)?) == input_digest;
+        ensure!(
+            !duplicate,
+            "test input for {new_name} duplicates existing test {existing_name} ({existing_path}); use a different input or update the existing test"
+        );
+    }
+    Ok(())
+}
+
+fn next_test_case_defaults<'a>(
+    tests: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+) -> (String, String, String) {
+    let mut names = std::collections::BTreeSet::new();
+    let mut paths = std::collections::BTreeSet::new();
+    for (name, input, answer) in tests {
+        names.insert(name);
+        paths.insert(input);
+        if let Some(answer) = answer {
+            paths.insert(answer);
+        }
+    }
+    for index in 1_u64.. {
+        let name = format!("sample-{index}");
+        let input = format!("tests/{index}.in");
+        let answer = format!("tests/{index}.ans");
+        if !names.contains(name.as_str())
+            && !paths.contains(input.as_str())
+            && !paths.contains(answer.as_str())
+        {
+            return (name, input, answer);
+        }
+    }
+    unreachable!("the test index space is finite only after exhausting u64")
 }
 
 fn write_project_bytes_atomic(root: &Path, path: &str, bytes: &[u8]) -> Result<()> {

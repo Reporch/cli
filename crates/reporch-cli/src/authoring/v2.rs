@@ -179,9 +179,18 @@ fn guided_test_case(output: &CliOutput, no_input: bool) -> Result<()> {
         !no_input && std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "test guide requires an interactive terminal; use test case add in CI"
     );
-    let name = prompt("Test name", "sample-1")?;
-    let input = prompt("Input file", "tests/1.in")?;
-    let answer = prompt("Answer file (blank for none)", "tests/1.ans")?;
+    let root = reporch_cli::local_project::discover_project(Path::new("."))?;
+    let spec = reporch_cli::local_project_v2::read_authoring_spec(&root)?;
+    let defaults = next_test_case_defaults(spec.testing.tests.iter().map(|test| {
+        (
+            test.name.as_str(),
+            test.input_file.as_str(),
+            test.answer_file.as_deref(),
+        )
+    }));
+    let name = prompt("Test name", &defaults.0)?;
+    let input = prompt("Input file", &defaults.1)?;
+    let answer = prompt("Answer file (blank for none)", &defaults.2)?;
     test_case(
         TestCaseCommand::Add(TestCaseAddOptions {
             name,
@@ -217,6 +226,15 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             let updated =
                 reporch_cli::local_project_v2::update_authoring_spec(&root, |root, spec| {
                     ensure_unique_test_name(spec, &options.name, None)?;
+                    ensure_unique_test_input(
+                        root,
+                        &input,
+                        &options.name,
+                        spec.testing
+                            .tests
+                            .iter()
+                            .map(|test| (test.name.as_str(), test.input_file.as_str())),
+                    )?;
                     let group_ids = resolve_group_ids(spec, &options.groups)?;
                     let generated = if let Some(generator_name) = &options.generated_by {
                         let seed = options
@@ -406,6 +424,15 @@ fn import_test_cases(options: TestCaseImportOptions, output: &CliOutput) -> Resu
                 .context("test input has a non-Unicode file name")?;
             let name = normalize_name(stem)?;
             ensure_unique_test_name(spec, &name, None)?;
+            ensure_unique_test_input(
+                root,
+                &input,
+                &name,
+                spec.testing
+                    .tests
+                    .iter()
+                    .map(|test| (test.name.as_str(), test.input_file.as_str())),
+            )?;
             reporch_cli::local_project_v2::declare_project_file(
                 root,
                 spec,
