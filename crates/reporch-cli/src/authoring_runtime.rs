@@ -595,7 +595,7 @@ fn csharp_command(source: &str, input: &str, timeout: Duration) -> Vec<String> {
 
 fn timeout_command(timeout: Duration) -> String {
     format!(
-        "timeout --signal=KILL --kill-after=1s {:.3}s",
+        "timeout --kill-after=1s {:.3}s",
         timeout.as_secs_f64()
     )
 }
@@ -714,5 +714,12 @@ mod checker_protocol_tests {
         assert!(script.contains("interactor_status\" -eq 43 ]; then exit 1"));
         assert!(script.ends_with("exit 2\n"));
         assert!(!script.contains("interactor_status\" -ne 0"));
+    }
+
+    #[test]
+    fn workload_timeout_preserves_the_distinct_124_exit_status() {
+        let command = timeout_command(Duration::from_secs(1));
+        assert_eq!(command, "timeout --kill-after=1s 1.000s");
+        assert!(!command.contains("--signal=KILL"));
     }
 }

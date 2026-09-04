@@ -94,7 +94,7 @@ fn compiled_grader_applies_the_problem_limit_after_compilation() {
         .find("c++ -std=c++20")
         .expect("the grader should compile inside the VM");
     let execute = command
-        .find("timeout --signal=KILL --kill-after=1s 1.000s /run/reporch/program")
+        .find("timeout --kill-after=1s 1.000s /run/reporch/program")
         .expect("the problem limit should wrap only the compiled program");
     assert!(compile < execute, "{command}");
 }
