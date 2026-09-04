@@ -223,6 +223,32 @@ pub async fn run_program(request: &ProgramRequest<'_>) -> Result<LocalSandboxRes
     crate::local_sandbox::execute(&plan).await
 }
 
+/// Run one trusted orchestration command inside a language toolchain VM.
+///
+/// Every project file needed by the command must be passed as an explicit
+/// `/workspace/...` argument so the native backend can inventory and stage it.
+pub async fn run_toolchain_command(
+    project_directory: &Path,
+    language: &str,
+    command: Vec<String>,
+    options: &AuthoringRunOptions,
+) -> Result<LocalSandboxResult> {
+    ensure!(
+        !command.is_empty()
+            && command.len() <= 256
+            && command
+                .iter()
+                .all(|argument| !argument.contains('\0') && argument.len() <= 4_096),
+        "toolchain command exceeds the local execution limits"
+    );
+    let root = project_directory
+        .canonicalize()
+        .context("resolve authoring project directory")?;
+    ensure!(root.is_dir(), "authoring project root is not a directory");
+    let entry = checked_installed_toolchain(language, options).await?;
+    execute_in_toolchain(root, command, entry.image, options).await
+}
+
 pub async fn run_linked_pair(request: &LinkedPairRequest<'_>) -> Result<LocalSandboxResult> {
     let root = request
         .project_directory

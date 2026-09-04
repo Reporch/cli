@@ -1,8 +1,10 @@
+use std::fmt::Write as _;
 use std::fs;
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use base64::Engine as _;
 use studio_core::{
     CheckerSpec, CheckerUnitSpecV2, GeneratedCaseRefV2, GeneratorMatrixStrategyV2,
     GeneratorRecipeSpecV2, GeneratorSpecV2, HarnessKindV2, HarnessProfileSpecV2, HarnessSpecV2,
@@ -1859,6 +1861,22 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
     let scratch = tempfile::Builder::new()
         .prefix("run-")
         .tempdir_in(&scratch_parent)?;
+    if let Some(first_mismatch) = try_run_stress_batch(
+        &root,
+        scratch.path(),
+        &suite,
+        generator,
+        recipe,
+        oracle,
+        &candidates,
+        &spec.testing.checker.checker,
+        &run_options,
+        output,
+    )
+    .await?
+    {
+        return emit_stress_results(&root, &suite, &candidates, first_mismatch, output);
+    }
     let mut first_mismatch =
         std::collections::BTreeMap::<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>::new();
     let mut last_progress = std::time::Instant::now();
@@ -1950,6 +1968,16 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
             last_progress = std::time::Instant::now();
         }
     }
+    emit_stress_results(&root, &suite, &candidates, first_mismatch, output)
+}
+
+fn emit_stress_results(
+    root: &Path,
+    suite: &StressSuiteSpecV2,
+    candidates: &[&SolutionSpecV2],
+    mut first_mismatch: std::collections::BTreeMap<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    output: &CliOutput,
+) -> Result<()> {
     let mut results = Vec::new();
     for candidate in candidates {
         let mismatch = first_mismatch.remove(&candidate.program.id);
@@ -1997,6 +2025,348 @@ async fn run_stress_suite(name: &str, runtime: RuntimeOptions, output: &CliOutpu
             results.len()
         ),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_run_stress_batch(
+    root: &Path,
+    scratch: &Path,
+    suite: &StressSuiteSpecV2,
+    generator: &GeneratorSpecV2,
+    recipe: &GeneratorRecipeSpecV2,
+    oracle: &SolutionSpecV2,
+    candidates: &[&SolutionSpecV2],
+    checker: &CheckerSpec,
+    options: &reporch_cli::authoring_runtime::AuthoringRunOptions,
+    output: &CliOutput,
+) -> Result<Option<std::collections::BTreeMap<Uuid, (u64, Vec<u8>, Vec<u8>, Vec<u8>)>>> {
+    if options.runtime != reporch_cli::local_sandbox::OciRuntime::Auto
+        && std::env::var_os("REPORCH_DEBUG_ENABLE_STRESS_BATCH").is_none()
+    {
+        return Ok(None);
+    }
+    if suite.minimize_failure
+        || matches!(
+            checker,
+            CheckerSpec::Custom { .. } | CheckerSpec::Floating { .. }
+        )
+    {
+        return Ok(None);
+    }
+    let language = reporch_cli::toolchain::resolve_for_language(
+        options.toolchain_id.as_deref(),
+        &generator.program.language,
+    )?
+    .language;
+    if matches!(language.as_str(), "java" | "csharp") {
+        return Ok(None);
+    }
+    for program in
+        std::iter::once(&oracle.program).chain(candidates.iter().map(|value| &value.program))
+    {
+        let candidate_language = reporch_cli::toolchain::resolve_for_language(
+            options.toolchain_id.as_deref(),
+            &program.language,
+        )?
+        .language;
+        if candidate_language != language {
+            return Ok(None);
+        }
+    }
+    let jobs_per_seed = 3_u64.saturating_add(candidates.len() as u64);
+    let total_timeout_ms = suite
+        .timeout_ms
+        .saturating_mul(u64::from(suite.cases))
+        .saturating_mul(jobs_per_seed)
+        .saturating_add(30_000);
+    if total_timeout_ms > 600_000 || candidates.len() + 3 > 256 {
+        return Ok(None);
+    }
+
+    let script_path = scratch.join("batch.sh");
+    let mut script = String::from("#!/bin/sh\nset -eu\n");
+    script.push_str("generator_src=$1\noracle_src=$2\n");
+    for index in 0..candidates.len() {
+        writeln!(&mut script, "candidate_{index}_src=${}", index + 3)?;
+    }
+    let mut generator_arguments = generator.program.arguments.clone();
+    generator_arguments.extend(recipe.argument_template.iter().cloned());
+    let (generator_setup, generator_command) = stress_program_shell(
+        &language,
+        "generator",
+        "$generator_src",
+        &generator_arguments,
+    )?;
+    let (oracle_setup, oracle_command) = stress_program_shell(
+        &language,
+        "oracle",
+        "$oracle_src",
+        &oracle.program.arguments,
+    )?;
+    script.push_str(&generator_setup);
+    script.push_str(&oracle_setup);
+    let mut candidate_commands = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        let label = format!("candidate_{index}");
+        let source = format!("$candidate_{index}_src");
+        let (setup, command) =
+            stress_program_shell(&language, &label, &source, &candidate.program.arguments)?;
+        script.push_str(&setup);
+        candidate_commands.push(command);
+    }
+    writeln!(&mut script, "seed={}", suite.seed_start)?;
+    script.push_str("ordinal=0\n");
+    writeln!(
+        &mut script,
+        "while [ \"$ordinal\" -lt {} ]; do",
+        suite.cases
+    )?;
+    script.push_str("  input=/run/reporch/stress-input\n  repeat=/run/reporch/stress-repeat\n  oracle=/run/reporch/stress-oracle\n");
+    let generator_with_seed = format!("{generator_command} \"$seed\"");
+    append_checked_stress_command(
+        &mut script,
+        &generator_with_seed,
+        suite.timeout_ms,
+        "$input",
+        None,
+        90,
+    )?;
+    append_checked_stress_command(
+        &mut script,
+        &generator_with_seed,
+        suite.timeout_ms,
+        "$repeat",
+        None,
+        91,
+    )?;
+    script.push_str("  cmp -s \"$input\" \"$repeat\" || exit 92\n");
+    append_checked_stress_command(
+        &mut script,
+        &oracle_command,
+        suite.timeout_ms,
+        "$oracle",
+        Some("$input"),
+        93,
+    )?;
+    for (index, command) in candidate_commands.iter().enumerate() {
+        writeln!(
+            &mut script,
+            "  if [ ! -e /run/reporch/found-{index} ]; then"
+        )?;
+        writeln!(
+            &mut script,
+            "    candidate=/run/reporch/stress-candidate-{index}"
+        )?;
+        script.push_str("    set +e\n");
+        writeln!(
+            &mut script,
+            "    {} < \"$input\" > \"$candidate\" 2>/run/reporch/candidate.err",
+            timed_stress_command(command, suite.timeout_ms)
+        )?;
+        script.push_str("    status=$?\n    set -e\n    mismatch=0\n");
+        script.push_str("    if [ \"$status\" -ne 0 ]; then mismatch=1; fi\n");
+        writeln!(
+            &mut script,
+            "    if [ \"$mismatch\" -eq 0 ] && ! {}; then mismatch=1; fi",
+            stress_compare_shell(checker, index)
+        )?;
+        script.push_str("    if [ \"$mismatch\" -eq 1 ]; then\n");
+        writeln!(&mut script, "      printf 'M\\t{index}\\t%s\\t' \"$seed\"")?;
+        script.push_str("      base64 < \"$input\" | tr -d '\\n'\n      printf '\\t'\n      base64 < \"$oracle\" | tr -d '\\n'\n      printf '\\t'\n      base64 < \"$candidate\" | tr -d '\\n'\n      printf '\\n'\n");
+        writeln!(&mut script, "      : > /run/reporch/found-{index}")?;
+        script.push_str("    fi\n  fi\n");
+    }
+    script.push_str("  ordinal=$((ordinal + 1))\n  seed=$((seed + 1))\ndone\nprintf 'D\\n'\n");
+
+    let mut file = fs::File::create(&script_path)?;
+    file.write_all(script.as_bytes())?;
+    file.sync_all()?;
+    let relative_script = project_relative(root, &script_path)?;
+    let mut command = vec!["bash".to_owned(), format!("/workspace/{relative_script}")];
+    command.push(format!("/workspace/{}", generator.program.source_path));
+    command.push(format!("/workspace/{}", oracle.program.source_path));
+    command.extend(
+        candidates
+            .iter()
+            .map(|candidate| format!("/workspace/{}", candidate.program.source_path)),
+    );
+    let mut batch_options = options.clone();
+    batch_options.timeout = std::time::Duration::from_millis(total_timeout_ms);
+    output.progress(
+        "stress run",
+        &format!(
+            "Stress suite {}: running {} seed(s) in one VM",
+            suite.name, suite.cases
+        ),
+    );
+    let result = reporch_cli::authoring_runtime::run_toolchain_command(
+        root,
+        &language,
+        command,
+        &batch_options,
+    )
+    .await?;
+    if result.termination != reporch_runtime_core::GuestTerminationV2::Exited
+        || result.exit_code != 0
+    {
+        return Err(crate::cli_output::domain_error(
+            if result.termination == reporch_runtime_core::GuestTerminationV2::TimedOut {
+                "runtime.execution_timed_out"
+            } else {
+                "runtime.execution_failed"
+            },
+            format!(
+                "batched stress runtime ended as {:?} with exit code {}",
+                result.termination, result.exit_code
+            ),
+            &result,
+        ));
+    }
+    let mut mismatches = std::collections::BTreeMap::new();
+    let mut completed = false;
+    for line in result.stdout.lines() {
+        if line == "D" {
+            completed = true;
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 6 && fields[0] == "M",
+            "invalid batched stress result frame"
+        );
+        let index = fields[1]
+            .parse::<usize>()
+            .context("parse batched stress candidate index")?;
+        let candidate = candidates
+            .get(index)
+            .context("batched stress candidate index is out of range")?;
+        let seed = fields[2]
+            .parse::<u64>()
+            .context("parse batched stress seed")?;
+        let decode = |value: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .context("decode batched stress artifact")
+        };
+        mismatches.entry(candidate.program.id).or_insert((
+            seed,
+            decode(fields[3])?,
+            decode(fields[4])?,
+            decode(fields[5])?,
+        ));
+    }
+    ensure!(completed, "batched stress result is incomplete");
+    output.progress(
+        "stress run",
+        &format!(
+            "Stress suite {}: {}/{} seed(s) checked",
+            suite.name, suite.cases, suite.cases
+        ),
+    );
+    Ok(Some(mismatches))
+}
+
+fn stress_program_shell(
+    language: &str,
+    label: &str,
+    source_variable: &str,
+    arguments: &[String],
+) -> Result<(String, String)> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suffix = if arguments.is_empty() {
+        String::new()
+    } else {
+        format!(" {arguments}")
+    };
+    match language {
+        "python" => Ok((
+            String::new(),
+            format!("python3 \"{source_variable}\"{suffix}"),
+        )),
+        "pypy" => Ok((
+            String::new(),
+            format!("pypy3 \"{source_variable}\"{suffix}"),
+        )),
+        "javascript" => Ok((String::new(), format!("node \"{source_variable}\"{suffix}"))),
+        "php" => Ok((String::new(), format!("php \"{source_variable}\"{suffix}"))),
+        "r" => Ok((
+            String::new(),
+            format!("Rscript \"{source_variable}\"{suffix}"),
+        )),
+        "bash" => Ok((String::new(), format!("bash \"{source_variable}\"{suffix}"))),
+        "c" => Ok((
+            format!("cc -std=c17 -O2 -pipe \"{source_variable}\" -o /run/reporch/{label}\n"),
+            format!("/run/reporch/{label}{suffix}"),
+        )),
+        "cpp" => Ok((
+            format!("c++ -std=c++20 -O2 -pipe \"{source_variable}\" -o /run/reporch/{label}\n"),
+            format!("/run/reporch/{label}{suffix}"),
+        )),
+        "rust" => Ok((
+            format!("rustc --edition=2024 -O \"{source_variable}\" -o /run/reporch/{label}\n"),
+            format!("/run/reporch/{label}{suffix}"),
+        )),
+        "swift" => Ok((
+            format!("swiftc -O \"{source_variable}\" -o /run/reporch/{label}\n"),
+            format!("/run/reporch/{label}{suffix}"),
+        )),
+        _ => anyhow::bail!("language is not supported by batched stress execution: {language}"),
+    }
+}
+
+fn append_checked_stress_command(
+    script: &mut String,
+    command: &str,
+    timeout_ms: u64,
+    output_path: &str,
+    input_path: Option<&str>,
+    failure_exit: i32,
+) -> Result<()> {
+    script.push_str("  set +e\n");
+    let input = input_path
+        .map(|path| format!(" < \"{path}\""))
+        .unwrap_or_default();
+    writeln!(
+        script,
+        "  {}{} > \"{}\" 2>/run/reporch/stress.err",
+        timed_stress_command(command, timeout_ms),
+        input,
+        output_path
+    )?;
+    script.push_str("  status=$?\n  set -e\n");
+    writeln!(
+        script,
+        "  if [ \"$status\" -ne 0 ]; then cat /run/reporch/stress.err >&2; exit {failure_exit}; fi"
+    )?;
+    Ok(())
+}
+
+fn timed_stress_command(command: &str, timeout_ms: u64) -> String {
+    format!(
+        "timeout --signal=KILL --kill-after=1s {:.3}s {command}",
+        timeout_ms as f64 / 1_000.0
+    )
+}
+
+fn stress_compare_shell(checker: &CheckerSpec, index: usize) -> String {
+    match checker {
+        CheckerSpec::Exact => format!("cmp -s \"$oracle\" /run/reporch/stress-candidate-{index}"),
+        CheckerSpec::Token => format!(
+            "awk '{{for(i=1;i<=NF;i++) print $i}}' \"$oracle\" > /run/reporch/oracle.tokens && awk '{{for(i=1;i<=NF;i++) print $i}}' /run/reporch/stress-candidate-{index} > /run/reporch/candidate.tokens && cmp -s /run/reporch/oracle.tokens /run/reporch/candidate.tokens"
+        ),
+        CheckerSpec::CaseInsensitive => format!(
+            "awk '{{for(i=1;i<=NF;i++) print tolower($i)}}' \"$oracle\" > /run/reporch/oracle.tokens && awk '{{for(i=1;i<=NF;i++) print tolower($i)}}' /run/reporch/stress-candidate-{index} > /run/reporch/candidate.tokens && cmp -s /run/reporch/oracle.tokens /run/reporch/candidate.tokens"
+        ),
+        CheckerSpec::Floating { .. } | CheckerSpec::Custom { .. } => "false".into(),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 async fn run_solution(
