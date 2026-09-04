@@ -2171,7 +2171,7 @@ async fn try_run_stress_batch(
         script.push_str("    if [ \"$status\" -ne 0 ]; then mismatch=1; fi\n");
         writeln!(
             &mut script,
-            "    if [ \"$mismatch\" -eq 0 ] && ! {}; then mismatch=1; fi",
+            "    if [ \"$mismatch\" -eq 0 ] && ! ( {} ); then mismatch=1; fi",
             stress_compare_shell(checker, index)
         )?;
         script.push_str("    if [ \"$mismatch\" -eq 1 ]; then\n");
