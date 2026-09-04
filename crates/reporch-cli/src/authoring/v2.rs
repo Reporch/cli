@@ -2236,42 +2236,35 @@ async fn run_interactor(
         },
     )
     .await?;
-    ensure!(
-        matches!(result.exit_code, 0 | 1),
-        "interactive judge failed with exit code {}: {}",
-        result.exit_code,
-        result.stderr
-    );
     if let Some(path) = options.output.as_deref() {
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
     }
-    let expected_accepted = solution.expected_verdict == studio_core::ExpectedVerdict::Accepted;
+    let actual_verdict = interactive_execution_verdict(&result);
+    let transcript_value = transcript.then(|| result.stdout.clone());
     let report = RuntimeProgramReport {
         solution: solution.program.name.clone(),
         test_id: test.id,
-        expected: if expected_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        actual: if result.exit_code == 0 {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        passed: (result.exit_code == 0) == expected_accepted,
+        expected: verdict_name(solution.expected_verdict),
+        actual: observed_verdict_name(actual_verdict),
+        passed: actual_verdict == Some(solution.expected_verdict),
         exit_code: result.exit_code,
+        termination: result.termination,
         duration_ms: result.duration_ms,
-        transcript: transcript.then_some(result.stdout),
+        stdout: result.stdout,
+        transcript: transcript_value,
         stderr: result.stderr,
     };
-    ensure!(
-        report.passed,
-        "interactive validation did not pass: expected {}, got {}",
-        report.expected,
-        report.actual
-    );
+    if !report.passed {
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            format!(
+                "interactive validation did not pass: expected {}, got {}",
+                report.expected, report.actual
+            ),
+            &report,
+        ));
+    }
     output.emit(
         if transcript {
             "interactor transcript"
@@ -2573,7 +2566,9 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         },
     )
     .await?;
-    let actual_accepted = if result.exit_code == 0 {
+    let checker_accepted = if result.termination == reporch_runtime_core::GuestTerminationV2::Exited
+        && result.exit_code == 0
+    {
         checker_accepts_bytes(
             &root,
             &spec.testing.checker.checker,
@@ -2590,32 +2585,30 @@ async fn run_grader(options: RuntimeProgramRunOptions, output: &CliOutput) -> Re
         let path = relative_string(path)?;
         write_project_bytes_atomic(&root, &path, &result.stdout_bytes)?;
     }
-    let expected_accepted = solution.expected_verdict == studio_core::ExpectedVerdict::Accepted;
+    let actual_verdict = program_execution_verdict(&result, checker_accepted);
     let report = RuntimeProgramReport {
         solution: solution.program.name.clone(),
         test_id: test.id,
-        expected: if expected_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        actual: if actual_accepted {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        passed: actual_accepted == expected_accepted,
+        expected: verdict_name(solution.expected_verdict),
+        actual: observed_verdict_name(actual_verdict),
+        passed: actual_verdict == Some(solution.expected_verdict),
         exit_code: result.exit_code,
+        termination: result.termination,
         duration_ms: result.duration_ms,
+        stdout: result.stdout,
         transcript: None,
         stderr: result.stderr,
     };
-    ensure!(
-        report.passed,
-        "grader validation did not pass: expected {}, got {}",
-        report.expected,
-        report.actual
-    );
+    if !report.passed {
+        return Err(crate::cli_output::domain_error(
+            "operation.failed",
+            format!(
+                "grader validation did not pass: expected {}, got {}",
+                report.expected, report.actual
+            ),
+            &report,
+        ));
+    }
     output.emit(
         "grader run",
         &report,
