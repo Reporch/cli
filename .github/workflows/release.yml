@@ -532,7 +532,10 @@ jobs:
     needs: [verify-source, qualify-published-artifacts]
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      # Draft releases are private to tokens without push access. This job
+      # performs no mutation, but it needs write scope to prove the exact
+      # qualified draft still exists before explicit stable promotion.
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}

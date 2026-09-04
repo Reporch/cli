@@ -141,6 +141,11 @@ assert.match(
   /preserve-stable-candidate:[\s\S]*?GH_REPO: \$\{\{ github\.repository \}\}[\s\S]*?gh release view "\$RELEASE_TAG" --repo "\$GH_REPO"/,
   "the checkout-free stable-candidate verifier must address the repository explicitly"
 );
+assert.match(
+  release,
+  /preserve-stable-candidate:[\s\S]*?permissions:\s*\n\s*#[^\n]*\n(?:\s*#[^\n]*\n)*\s*contents: write/,
+  "the stable-candidate verifier must be able to read private draft releases"
+);
 assert.doesNotMatch(
   release,
   /gh release edit "\$RELEASE_TAG" --draft=false --latest/,
