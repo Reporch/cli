@@ -14,6 +14,13 @@ use uuid::Uuid;
 
 use super::*;
 
+#[derive(Debug, serde::Serialize)]
+struct RemovalResult<'a, T: serde::Serialize> {
+    remaining: &'a T,
+    inventory_removed: Vec<String>,
+    files_preserved: Vec<String>,
+}
+
 pub(super) fn is_active_project() -> Result<bool> {
     reporch_cli::local_project_v2::is_v2_project(Path::new("."))
 }
@@ -323,9 +330,19 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
             )
         }
         TestCaseCommand::Remove { id } => {
+            let mut inventory_removed = Vec::new();
+            let mut files_preserved = Vec::new();
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
-                |_root, spec| {
+                |root, spec| {
+                    let test = spec
+                        .testing
+                        .tests
+                        .iter()
+                        .find(|test| test.id == id)
+                        .context("test case was not found")?;
+                    files_preserved.push(test.input_file.clone());
+                    files_preserved.extend(test.answer_file.iter().cloned());
                     let before = spec.testing.tests.len();
                     spec.testing.tests.retain(|test| test.id != id);
                     ensure!(
@@ -335,12 +352,24 @@ fn test_case(command: TestCaseCommand, output: &CliOutput) -> Result<()> {
                     for submission in &mut spec.output_submissions {
                         submission.outputs.remove(&id);
                     }
+                    inventory_removed =
+                        reporch_cli::local_project_v2::prune_unreferenced_file_declarations(
+                            root,
+                            spec,
+                            files_preserved.clone(),
+                        )?;
                     Ok(())
                 },
             )?;
+            files_preserved.sort();
+            files_preserved.dedup();
             output.emit(
                 "test case remove",
-                &spec.testing.tests,
+                &RemovalResult {
+                    remaining: &spec.testing.tests,
+                    inventory_removed,
+                    files_preserved,
+                },
                 &format!("Removed test case {id}"),
             )
         }
@@ -787,10 +816,14 @@ pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> 
             )
         }
         GeneratorCommand::Remove { id } => {
+            let mut inventory_removed = Vec::new();
+            let mut files_preserved = Vec::new();
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
-                |_root, spec| {
-                    let generator_id = find_generator(spec, &id)?.program.id;
+                |root, spec| {
+                    let generator = find_generator(spec, &id)?;
+                    let generator_id = generator.program.id;
+                    files_preserved.push(generator.program.source_path.clone());
                     ensure!(
                         !spec.testing.tests.iter().any(|test| test
                             .generated
@@ -814,12 +847,22 @@ pub(super) async fn generator(options: GeneratorOptions, output: &CliOutput) -> 
                         before != spec.testing.generators.len(),
                         "generator was not found"
                     );
+                    inventory_removed =
+                        reporch_cli::local_project_v2::prune_unreferenced_file_declarations(
+                            root,
+                            spec,
+                            files_preserved.clone(),
+                        )?;
                     Ok(())
                 },
             )?;
             output.emit(
                 "generator remove",
-                &spec.testing.generators,
+                &RemovalResult {
+                    remaining: &spec.testing.generators,
+                    inventory_removed,
+                    files_preserved,
+                },
                 &format!("Removed generator {id}"),
             )
         }
@@ -1321,10 +1364,14 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
             )
         }
         SolutionCommand::Remove { name } => {
+            let mut inventory_removed = Vec::new();
+            let mut files_preserved = Vec::new();
             let spec = reporch_cli::local_project_v2::update_authoring_spec(
                 Path::new("."),
-                |_root, spec| {
-                    let solution_id = find_solution(spec, &name)?.program.id;
+                |root, spec| {
+                    let solution = find_solution(spec, &name)?;
+                    let solution_id = solution.program.id;
+                    files_preserved.push(solution.program.source_path.clone());
                     ensure!(
                         !spec.testing.stress_suites.iter().any(|suite| {
                             suite.oracle_solution_id == solution_id
@@ -1349,12 +1396,22 @@ pub(super) fn solution(options: SolutionOptions, output: &CliOutput) -> Result<(
                         before != spec.testing.solutions.len(),
                         "solution was not found"
                     );
+                    inventory_removed =
+                        reporch_cli::local_project_v2::prune_unreferenced_file_declarations(
+                            root,
+                            spec,
+                            files_preserved.clone(),
+                        )?;
                     Ok(())
                 },
             )?;
             output.emit(
                 "solution remove",
-                &spec.testing.solutions,
+                &RemovalResult {
+                    remaining: &spec.testing.solutions,
+                    inventory_removed,
+                    files_preserved,
+                },
                 &format!("Removed solution {name}"),
             )
         }

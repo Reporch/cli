@@ -393,6 +393,29 @@ pub fn referenced_project_paths(root: &Path, spec: &AuthoringSpecV2) -> Result<B
         .collect()
 }
 
+/// Remove selected inventory entries that became unreachable after a structural mutation.
+/// The files themselves are deliberately preserved on disk for recovery and source-control use.
+pub fn prune_unreferenced_file_declarations(
+    root: &Path,
+    spec: &mut AuthoringSpecV2,
+    candidates: impl IntoIterator<Item = String>,
+) -> Result<Vec<String>> {
+    let references = referenced_project_paths(root, spec)?;
+    let candidates = candidates
+        .into_iter()
+        .map(|path| studio_core::normalize_relative_path(&path))
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    let mut removed = spec
+        .files
+        .iter()
+        .filter(|file| candidates.contains(&file.path) && !references.contains(&file.path))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    spec.files.retain(|file| !removed.contains(&file.path));
+    removed.sort();
+    Ok(removed)
+}
+
 /// Remove unreferenced inventory entries under the authoring lock.
 ///
 /// Optional physical deletion is implemented as a recoverable atomic rename
