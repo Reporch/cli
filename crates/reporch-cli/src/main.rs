@@ -1861,6 +1861,11 @@ fn check_project(output: &CliOutput) -> Result<()> {
         ));
         let interactor_count = usize::from(manifest.execution.interactive.is_some());
         let harness_count = usize::from(manifest.execution.harness.is_some());
+        let next_step = if issues.is_empty() {
+            "reporch verify"
+        } else {
+            "reporch check"
+        };
         let data = serde_json::json!({
             "schema": "reporch.check-result.v1",
             "authoring_schema": spec.schema,
@@ -1881,7 +1886,7 @@ fn check_project(output: &CliOutput) -> Result<()> {
                 "interactors": interactor_count,
                 "grader_or_library_harnesses": harness_count,
             },
-            "next_step": "reporch verify",
+            "next_step": next_step,
         });
         if !issues.is_empty() {
             return Err(cli_output::domain_error(
@@ -1915,6 +1920,11 @@ fn check_project(output: &CliOutput) -> Result<()> {
     ));
     let interactor_count = usize::from(manifest.judging.interactor_path.is_some());
     let grader_count = usize::from(manifest.judging.grader_path.is_some());
+    let next_step = if issues.is_empty() {
+        "reporch verify"
+    } else {
+        "reporch check"
+    };
     let data = serde_json::json!({
         "schema": "reporch.check-result.v1",
         "project_id": spec.project_id,
@@ -1933,7 +1943,7 @@ fn check_project(output: &CliOutput) -> Result<()> {
             "interactors": interactor_count,
             "graders": grader_count,
         },
-        "next_step": "reporch verify",
+        "next_step": next_step,
     });
     if !issues.is_empty() {
         return Err(cli_output::domain_error(
