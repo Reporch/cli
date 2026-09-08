@@ -83,7 +83,7 @@ windows = "0.62.2"
 windows-service = "0.8.1"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = "1"
-zstd = "=0.13.3"
+zstd = "=0.14.0"
 
 [profile.release]
 codegen-units = 1
