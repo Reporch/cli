@@ -160,7 +160,7 @@ jobs:
           node scripts/test-current-npm-package.mjs "${{ matrix.target }}" "${{ matrix.binary }}"
           mkdir -p "release-output/${{ matrix.target }}"
           cp "${{ matrix.binary }}" "release-output/${{ matrix.target }}/"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.target }}
           path: release-output
@@ -502,7 +502,7 @@ jobs:
           }
 
       - name: Preserve installed authentication evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: installed-auth-${{ matrix.target }}
           path: ${{ runner.temp }}/installed-auth-e2e.json
